@@ -4,7 +4,7 @@ Standalone, pre-production AE sidecar plugin and CEP panel. **Unsigned and not c
 
 **Capture unavailable:** `ae_capture` always returns `unsafe_state` on the current host path because there is no reliable preview/modal detection signal. Image normalization and attachment tests do not establish working capture.
 
-`comp.reorder` is unsupported by the documented AE native API. Manual checkpoint restore opens a verified recovery copy and requires Save As and explicit rebind; guarded automatic rollback of stopped, acknowledged structured-operation errors is separate.
+`comp.reorder` is explicitly unsupported; layer reordering is supported. Manual checkpoint restore saves and verifies dirty work before guarded canonical restoration, retaining the displaced `originalPath`. Publication is not crash-atomic; fallback opens a private verified recovery copy with automation locked. See [recovery procedures](docs/OPERATIONS.md).
 
 ## Development
 
@@ -22,9 +22,9 @@ Package metadata and the lockfile are valid, with Zod pinned to 4.1.8. Run depen
 
 Build output: self-contained Node ESM package `dist/cm-ae/` with `plugin.mjs`, companion `render-worker.mjs`, default `permissions.json` and Zod license; complete `dist/panel`, compatibility mapping, and a deterministic SHA256 manifest. Keep the plugin and worker together. No install, signing, or publishing occurs. V8 parsing of host JSX is not an AE/ExtendScript test.
 
-The coordinating parent's final-source verification passed **182/182 tests, zero failures, skips or cancellations, in 246.2576849 seconds**; `npm run check` checked **32 scripts**; `npm run build` produced **11 hashed artifacts**; and `node scripts/verify-build.mjs --rebuild` passed manifest inventory, SHA256 and reproducibility verification.
+Final AE source verification passed **264/264 tests, zero failures, skips or cancellations, in 613.0605642 seconds**; `npm run check` checked **32 scripts**; `npm run build` produced **11 hashed artifacts**; and `node scripts/verify-build.mjs --rebuild` passed manifest inventory, SHA256 and reproducibility verification. The verified source is committed as `b3a1fb3` (base `49ef591`), unchanged since verification. Sibling desktop source is committed as `a1e9efeff` (base `fa0b443cd`). Both commits are local and unpushed.
 
-The parent reports all findings from the original five safety-review findings and seven acceptance-review findings plus the final three findings fixed and rechecked, with no remaining concrete P1/P2 findings in those targeted reviews. Final verified artifacts include `dist/cm-ae/plugin.mjs`, its companion `dist/cm-ae/render-worker.mjs`, and `dist/panel`. [The evidence ledger](docs/ISSUE_STATUS.md) separates standalone implementation from acceptance: all 17 issues remain open and remotely unmodified. No live AE run was attempted; no commits, pushes or deployment were performed by this workstream.
+Restore/credential, render-retirement P1/P2 and desktop permission-override findings were fixed and re-reviewed with no remaining concrete findings in those scoped reviews. [Issue status](docs/ISSUE_STATUS.md) records **13 confirmed closed issues; only #7, #15, #16 and #17 remain open**. Final refreshed Windows packaged smoke passed, including four matching artifact hashes, actual loader checks and detached-worker completion with a render double; see [integration evidence](docs/INTEGRATION.md#final-smoke-evidence). Live AE/CEP, macOS and network qualification, signing and approved internal distribution remain absent.
 
 ## Configuration
 
@@ -38,12 +38,12 @@ The CLI never searches for or edits global configuration, never overwrites an ex
 
 After explicitly installing the whole plugin package and selecting the reviewed config in the consumer, fully quit and restart CookieMonster/OpenCode to reload them. Resolve uncertain operations and account for active renders first. Generating the config file alone does not install or activate anything; no restart is performed by these commands.
 
-For the desktop application integrator, see [the consumer bridge](docs/INTEGRATION.md). This repo does not modify CookieMonster desktop packaging or startup: **#1 remains partial**.
+Desktop staging/startup/packaging is implemented in the sibling's `packages/desktop`, using `CM_AE_ARTIFACT_DIR` and the application version in server `releaseMetadata`, without replacing browser policy. Refreshed Windows packaged smoke passed and #1 is closed; see [integration](docs/INTEGRATION.md).
 
 ## Install And Use
 
 There is no approved production installation yet. After release gates pass, install the signed ZXP with the qualified extension manager and open the panel under AE's **Window > Extensions** menu (wording varies by qualified host). Do not bypass signature verification for a pilot.
 
-In chat, request a pairing code (`ae_pair`), enter it in the panel, list connections (`ae_connections`), then explicitly bind a saved project (`ae_bind`). Inspect, propose a structured plan, review it, and approve execution through the existing permission UI. Grant only required filesystem roots. Release the binding when finished. Reconnect does not imply automatic rebinding.
+Select an explicit panel profile and reuse its exact name after restart; `legacy` reuses the previous shared pairing in place. In chat, request a pairing code (`ae_pair`), enter it in the panel, list connections (`ae_connections`), then explicitly bind a saved project (`ae_bind`). Invalid-credential recovery requires a fresh code and explicit confirmation, preserves identity/latches/locks and never automatically reconnects or rebinds. Inspect, propose a structured plan, review it, and approve execution through the existing permission UI. Grant only required filesystem roots. Release the binding when finished.
 
 See [operations](docs/OPERATIONS.md) for scripting preferences, updates, uninstallation, checkpoints and recovery; [release instructions](docs/RELEASE.md) for signing and evidence requirements. The docs describe the intended workflow and gates, not proof that every host scenario is implemented or qualified.
