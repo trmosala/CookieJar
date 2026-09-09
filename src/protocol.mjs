@@ -5,6 +5,46 @@ export const PROTOCOL = 1
 export const UPDATE_URL = "https://github.com/trmosala/CookieJar/releases"
 export const PROPOSAL_TTL = 5 * 60 * 1000
 
+export const validVersion = value => typeof value === "string" && value.length <= 64 &&
+  /^\d{1,6}(?:\.\d{1,6}){1,3}(?:-[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?(?:\+[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?$/.test(value)
+export const validProtocol = value => Number.isSafeInteger(value) && value >= 1
+
+// Only the embedding runtime supplies release metadata, never a panel or tool argument.
+export function releaseMetadata(value = {}) {
+  assertObject(value)
+  if (Object.keys(value).some(key => !["cookieMonsterVersion", "updates"].includes(key)) ||
+      value.cookieMonsterVersion !== undefined && value.cookieMonsterVersion !== null && !validVersion(value.cookieMonsterVersion))
+    fail("invalid_payload", "Invalid runtime release metadata")
+  const supplied = value.updates === undefined ? {} : assertObject(value.updates)
+  if (Object.keys(supplied).some(key => !["plugin", "panel", "cookieMonster"].includes(key)))
+    fail("invalid_payload", "Unknown update component")
+  const updates = {}
+  for (const component of ["plugin", "panel", "cookieMonster"]) {
+    const entry = supplied[component]
+    if (entry === undefined || entry === null) {
+      updates[component] = { status: "not_configured", version: null, protocol: null, url: null }
+      continue
+    }
+    assertObject(entry)
+    if (Object.keys(entry).sort().join(",") !== "protocol,url,version" ||
+        !validVersion(entry.version) || entry.protocol !== PROTOCOL ||
+        component !== "cookieMonster" && entry.version !== VERSION)
+      fail("invalid_payload", "Update must target a release compatible with this bridge")
+    let url
+    try { url = new URL(entry.url) } catch { fail("invalid_payload", "Invalid runtime update URL") }
+    if (typeof entry.url !== "string" || entry.url.length > 2048 ||
+        !/^https:\/\/[A-Za-z0-9.:[\]-]+(?:\/[A-Za-z0-9._~/-]*)?$/.test(entry.url) ||
+        url.protocol !== "https:" || !url.hostname || url.username || url.password || url.search || url.hash)
+      fail("invalid_payload", "Update URL must be HTTPS without credentials, query, fragment or encoded content")
+    updates[component] = { status: "configured", version: entry.version, protocol: entry.protocol, url: url.href }
+  }
+  return {
+    cookieMonsterVersion: value.cookieMonsterVersion ?? null,
+    cookieMonsterVersionStatus: value.cookieMonsterVersion == null ? "not_configured" : "configured",
+    releaseSourceUrl: UPDATE_URL, updates,
+  }
+}
+
 export class AEError extends Error {
   constructor(code, message, details = {}) {
     super(message)

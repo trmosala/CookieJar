@@ -3,9 +3,11 @@ import path from "node:path"
 import { randomUUID } from "node:crypto"
 import { setTimeout as delay } from "node:timers/promises"
 import { fail, hash, assertString } from "./protocol.mjs"
+import { secureDirectory } from "./storage.mjs"
 import {
   createProcessAdapter, timestamp, sameIdentity, save, load, exists, signature,
   outputSpec, checkDestination, commandFor, readJob, checkCheckpoint, verifyFiles, recoverExited,
+  directoryIdentity, withJobLock,
 } from "./render-worker.mjs"
 
 const terminal = new Set(["completed", "failed", "cancelled"])
@@ -48,8 +50,9 @@ async function progress(job) {
  * Await createRenderer(...) before use. processAdapter is an OS-only testing seam:
  * {platform, launch(jobDir), self(), start(command, logFd), inspect(pid),
  * discover({executable,args}), terminate(identity)}. See render-worker.mjs.
- * No Session audit or grant credentials are persisted. The caller owns retention
- * of manifests and quarantine; unknown records are never reaped.
+ * No Session audit or grant credentials are persisted. retire(id) previews explicit
+ * expiry; retire(id, {approval: preview.approval}) requires caller-confirmed warning.
+ * Unknown/legacy records are never reaped. Approval is an inventory digest, not a grant.
  * New jobs lease a private verified copy and never change the source pin.
  * Terminal status releases only that copy, once the supervisor has exited.
  * templates contains host-confirmed names, not model assertions. The caller must
@@ -65,6 +68,12 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
   const root = path.join(dataDir, "render", "jobs")
   await fs.mkdir(root, { recursive: true, mode: 0o700 })
   if (await fs.realpath(root) !== root) fail("render_config", "Recovery directory must be canonical and not symlinked")
+  const rootIdentity = await directoryIdentity(root)
+  const retirementPath = id => path.join(root, "." + id + ".retirement")
+  const interrupted = id => ({
+    jobId: id, state: "unknown", reason: "render_retire_partial", controllable: false, deliverables: [],
+    remediation: "manual_retirement_recovery_required",
+  })
   let closed = false
   // ponytail: serialize mutations in this service; filesystem reservations arbitrate
   // independent services. Per-directory parallel submission can be added if needed.
@@ -85,29 +94,39 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
     return await exists(file) ? load(file) : null
   }
   async function release(job) {
-    // Serialize release across renderer instances so a stale observation cannot
-    // rename a new job's reservation after another observer has released ours.
+    // Serialize release across renderer instances; never recursively erase a
+    // replacement reservation or foreign entries added to an owned reservation.
     const lock = path.join(root, "." + job.jobId + ".release-lock")
     try { await fs.mkdir(lock, { mode: 0o700 }) } catch (error) {
       if (error.code === "EEXIST") return
       throw error
     }
     try {
-      const owner = await optional(path.join(job.reservationPath, "owner.json"))
+      if (!await exists(job.reservationPath)) return
+      const identity = await directoryIdentity(job.reservationPath)
+      const ownerPath = path.join(job.reservationPath, "owner.json")
+      const before = await signature(ownerPath)
+      const owner = await load(ownerPath)
       if (owner?.jobId !== job.jobId || owner?.jobDir !== directory(job.jobId)) return
-      const retired = job.reservationPath + "." + job.jobId + ".released"
-      await fs.rename(job.reservationPath, retired)
-      await fs.rm(retired, { recursive: true })
+      if (job.ownership && hash(identity) !== hash(job.ownership.reservation) ||
+          hash((await fs.readdir(job.reservationPath)).sort()) !== hash(["owner.json"]) ||
+          hash(await signature(ownerPath)) !== hash(before) ||
+          hash(await directoryIdentity(job.reservationPath)) !== hash(identity)) {
+        fail("render_unknown", "Reservation changed; left untouched")
+      }
+      await fs.unlink(ownerPath)
+      await fs.rmdir(job.reservationPath)
     } finally { await fs.rmdir(lock) }
   }
   async function releaseCheckpoint(job, worker) {
     // Inspection errors must also block legacy receipt cleanup and reservation release.
     const workerLive = worker?.identity ? await adapter.inspect(worker.identity.pid) : null
+    if (!sameIdentity(worker?.identity, worker?.identity) || workerLive && !sameIdentity(worker.identity, workerLive)) {
+      fail("render_unknown", "Supervisor identity is missing or reused; cleanup refused")
+    }
+    if (workerLive) return { ownership: "integration", state: "held", reason: "Supervisor has not exited yet" }
     // Version 1 used a shared boolean pin without ownership. Never guess its owner.
     if (job.version !== 2) return { ownership: "shared", state: "preserved" }
-    if (sameIdentity(worker?.identity, workerLive)) {
-      return { ownership: "integration", state: "held", reason: "Supervisor has not exited yet" }
-    }
     const recordPath = path.join(directory(job.jobId), "checkpoint-release.json")
     let record = await optional(recordPath)
     if (record && (record.jobId !== job.jobId || record.commandHash !== job.commandHash ||
@@ -116,6 +135,7 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
     try {
       const actual = await signature(job.checkpoint.path)
       if (hash(actual) !== hash(job.checkpointSignature)) fail("render_unknown", "Private checkpoint was replaced; left untouched")
+      if ((await fs.lstat(job.checkpoint.path)).nlink !== 1) fail("render_unknown", "Private checkpoint became shared; left untouched")
     } catch (error) {
       if (error.code !== "ENOENT" && error.code !== "render_output") throw error
       // Another observer may chmod/unlink after our record read. Only a validated
@@ -138,8 +158,12 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
     await save(recordPath, record)
     return { ownership: "integration", ...record }
   }
-  async function observe(id) {
+  const observe = id => withJobLock(directory(id), () => observeUnlocked(id))
+  async function observeUnlocked(id, mutate = true) {
     const jobDir = directory(id)
+    // Presence alone blocks recovery, even for a corrupt plan or missing manifest.
+    // Never infer which deletions completed, or resume them on a restart.
+    if (await exists(retirementPath(id))) return interrupted(id)
     if (!await exists(jobDir)) fail("render_job", "Render job does not exist")
     let job
     try { job = await readJob(jobDir) } catch (error) {
@@ -208,13 +232,13 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
         }
         observed.state = receipt.state
         observed.reason = receipt.uncertainty || receipt.error?.message || null
-        if (terminal.has(observed.state)) {
-          if (child?.identity && sameIdentity(child.identity, await adapter.inspect(child.identity.pid))) {
-            fail("render_unknown", "Completion receipt conflicts with a live render process")
+        if (mutate && terminal.has(observed.state)) {
+          if (child?.identity && await adapter.inspect(child.identity.pid)) {
+            fail("render_unknown", "Completion receipt conflicts with a live or reused render PID")
           }
           observed.checkpointRetention = await releaseCheckpoint(job, worker)
           if (observed.checkpointRetention.state === "released") observed.checkpoint = { ...job.checkpoint, pinned: false }
-          await release(job)
+          if (observed.checkpointRetention.state !== "held") await release(job)
         }
       } else {
         let workerLive = null, workerError = null
@@ -240,8 +264,8 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
           // No discovery match is NOT evidence of a successful exit.
           const discovered = await adapter.discover(job.command)
           observed.discoveredProcesses = discovered
-          if (!discovered.length && await exists(path.join(jobDir, "exit.json"))) {
-            if (await recoverExited(jobDir, job)) return observe(id)
+          if (mutate && !discovered.length && await exists(path.join(jobDir, "exit.json"))) {
+            if (await recoverExited(jobDir, job)) return observeUnlocked(id)
           }
           observed.reason = discovered.length ? "unrecorded_process_identity" : "missing_completion_receipt"
           observed.controllable = false
@@ -256,18 +280,261 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
       observed.controllable = false
     }
     // Last observation is useful but never treated as authoritative completion.
-    await save(path.join(jobDir, "observation.json"), observed)
+    if (mutate) await save(path.join(jobDir, "observation.json"), observed)
     return observed
   }
   async function reconcile() {
     const jobs = []
     for (const entry of await fs.readdir(root, { withFileTypes: true })) {
-      if (!jobID.test(entry.name)) continue
+      const retired = entry.name.match(/^\.(.+)\.retirement$/)?.[1]
+      if (retired && jobID.test(retired)) {
+        if (!jobs.some(job => job.jobId === retired)) {
+          try { jobs.push(await observe(retired)) } catch (error) {
+            if (error.code === "render_busy") {
+              jobs.push({ jobId: retired, state: "unknown", reason: "render_busy", deliverables: [], controllable: false })
+            } else if (error.code !== "render_job") throw error
+          }
+        }
+        continue
+      }
+      if (!jobID.test(entry.name) || jobs.some(job => job.jobId === entry.name)) continue
       if (!entry.isDirectory() || entry.isSymbolicLink()) {
         jobs.push({ jobId: entry.name, state: "unknown", reason: "invalid_job_directory", deliverables: [], controllable: false })
-      } else jobs.push(await observe(entry.name))
+      } else {
+        try { jobs.push(await observe(entry.name)) } catch (error) {
+          // A retirement may finish after readdir but before we acquire the job gate.
+          // Missing is not evidence of completion; never recreate its observation.
+          if (error.code === "render_busy") {
+            jobs.push({ jobId: entry.name, state: "unknown", reason: "render_busy", deliverables: [], controllable: false })
+          } else if (error.code !== "render_job") throw error
+        }
+      }
     }
     return jobs
+  }
+  async function retire(id, { approval, check = () => {} } = {}) {
+    // Caller-owned synchronous lifetime/scope guard; never persisted as approval.
+    check()
+    const jobDir = directory(id)
+    const removed = [], claimed = []
+    const recoveryPath = retirementPath(id)
+    if (!await exists(recoveryPath) && !await exists(jobDir)) fail("render_job", "Render job does not exist")
+    try {
+      if (await exists(recoveryPath)) fail("render_retire_refused", "Interrupted retirement requires manual recovery; plan and claims preserved")
+      const job = await readJob(jobDir)
+      const refuse = message => fail("render_retire_refused", message)
+      if (job.version !== 2 || !job.ownership) refuse("Legacy artifact ownership is unproven; records preserved")
+      const worker = await optional(path.join(jobDir, "worker.json"))
+      const child = await optional(path.join(jobDir, "process.json"))
+      const receipt = await optional(path.join(jobDir, "receipt.json"))
+      const launch = await optional(path.join(jobDir, "launch.json"))
+      if (!receipt || !terminal.has(receipt.state) || receipt.uncertainty) refuse("No certain terminal receipt")
+      if (worker?.jobId !== id || !sameIdentity(worker.identity, worker.identity)) refuse("Supervisor identity is unproven")
+      if (launch && (launch.jobId !== id || launch.commandHash !== job.commandHash ||
+          child?.jobId !== id || child.commandHash !== job.commandHash ||
+          !sameIdentity(child.identity, child.identity) || child.pid !== child.identity.pid ||
+          !sameIdentity(receipt.processIdentity, child.identity))) refuse("Launched child identity is unproven")
+      if (!launch && (child || receipt.exit || receipt.processIdentity || receipt.state === "completed")) {
+        refuse("Launch history is inconsistent")
+      }
+      if (launch && (!receipt.exit || receipt.exit.quiescent === false ||
+          (receipt.cancellation?.requested || receipt.exit.signal || receipt.exit.error ||
+            !Number.isInteger(receipt.exit.code)) && receipt.exit.quiescent !== true)) {
+        refuse("Descendant shutdown is not certified")
+      }
+      async function quiescent() {
+        for (const identity of [worker.identity, child?.identity].filter(Boolean)) {
+          // A reused or inaccessible PID is not proof that this job is safe to erase.
+          if (await adapter.inspect(identity.pid) !== null) refuse("Recorded process is live or its PID was reused")
+        }
+        const discovered = await adapter.discover(job.command)
+        if (!Array.isArray(discovered) || discovered.length) refuse("Unrecorded render processes may still exist")
+      }
+      await quiescent()
+      const observed = await observeUnlocked(id, false)
+      if (!terminal.has(observed.state)) refuse("Terminal artifacts cannot be verified: " + (observed.detail || observed.reason))
+      const directories = []
+      const files = []
+      async function ownedDirectory(target, expected) {
+        if (!expected || hash(await directoryIdentity(target)) !== hash(expected)) refuse("Directory ownership changed: " + target)
+        const names = (await fs.readdir(target)).sort()
+        directories.push({ path: target, identity: expected, names })
+        return names
+      }
+      async function ownedFile(target, expected) {
+        const actual = await signature(target)
+        if (expected && hash(actual) !== hash(expected)) refuse("Artifact was replaced or modified: " + target)
+        files.push({ path: target, signature: actual })
+      }
+      const names = await ownedDirectory(jobDir, job.ownership.job)
+      if (hash(await directoryIdentity(job.destinationDir)) !== hash(job.ownership.destination)) {
+        refuse("Destination directory was replaced")
+      }
+      const artifactDir = receipt.state === "completed" ? job.stageDir : job.quarantineDir
+      if (await exists(receipt.state === "completed" ? job.quarantineDir : job.stageDir)) refuse("Ambiguous staging/quarantine")
+      const artifactNames = await ownedDirectory(artifactDir, job.ownership.stage)
+      if (hash(artifactNames) !== hash(receipt.files.map(file => file.name).sort())) refuse("Artifact inventory changed")
+      for (const file of receipt.files) {
+        if (path.basename(file.name) !== file.name) refuse("Invalid artifact filename")
+        await ownedFile(path.join(artifactDir, file.name), {
+          size: file.size, hash: file.hash, dev: file.dev, ino: file.ino,
+        })
+      }
+      const records = new Set(["manifest.json", "worker.json", "process.json", "permit.json",
+        "launch.json", "exit.json", "publication.json", "receipt.json", "cancel.json",
+        "cancellation.json", "checkpoint-release.json", "observation.json"])
+      const inspected = { "manifest.json": job, "worker.json": worker, "process.json": child,
+        "receipt.json": receipt, "launch.json": launch }
+      if (Object.entries(inspected).some(([name, value]) => value !== null && !names.includes(name))) {
+        refuse("Inspected recovery record disappeared")
+      }
+      const checkpointName = path.basename(job.checkpoint.path)
+      const releaseRecord = await optional(path.join(jobDir, "checkpoint-release.json"))
+      if (releaseRecord && (releaseRecord.jobId !== id || releaseRecord.commandHash !== job.commandHash ||
+          !["releasing", "released"].includes(releaseRecord.state))) refuse("Invalid checkpoint release record")
+      if (!names.includes(checkpointName) && !releaseRecord) refuse("Private checkpoint disappeared without a release record")
+      for (const name of names) {
+        const target = path.join(jobDir, name)
+        if (name === "worker-lock") {
+          if ((await ownedDirectory(target, worker.lockIdentity)).length) refuse("Worker lock is not empty")
+        } else if (name === checkpointName) {
+          if (releaseRecord?.state === "released") refuse("Released checkpoint path was recreated")
+          await ownedFile(target, job.checkpointSignature)
+          if ((await fs.lstat(target)).nlink !== 1) refuse("Private checkpoint has shared hard links")
+        } else if (name === "aerender.log") {
+          if (!receipt.log) refuse("Log ownership is unproven")
+          await ownedFile(target, receipt.log)
+        } else if (records.has(name)) {
+          const before = await signature(target)
+          const value = await load(target)
+          if (Object.hasOwn(inspected, name) && hash(value) !== hash(inspected[name])) refuse("Inspected record changed: " + name)
+          if (!value || typeof value !== "object" || Array.isArray(value) ||
+              !["permit.json", "cancel.json", "cancellation.json"].includes(name) && value.jobId !== id ||
+              value.jobId !== undefined && value.jobId !== id ||
+              value.commandHash !== undefined && value.commandHash !== job.commandHash) refuse("Foreign recovery record: " + name)
+          if (name === "exit.json" && (hash(value.exit) !== hash(receipt.exit) ||
+              hash(value.log) !== hash(receipt.log))) refuse("Conflicting exit record")
+          if (name === "cancellation.json" && value.requested && receipt.exit?.quiescent !== true) {
+            refuse("Cancellation has uncertain descendants")
+          }
+          await ownedFile(target, before)
+        } else refuse("Unowned or in-flight job entry: " + name)
+      }
+      if (!names.includes("worker-lock")) refuse("Supervisor admission lock is missing")
+      // Another job may now reserve this destination. Never touch its reservation.
+      const preserved = [job.sourceCheckpoint.path, ...job.expectedOutputs.names.map(name => path.join(job.destinationDir, name))]
+      if (await exists(job.reservationPath)) {
+        const ownerPath = path.join(job.reservationPath, "owner.json")
+        await directoryIdentity(job.reservationPath)
+        const owner = await load(ownerPath)
+        if (owner.jobId === id) {
+          if (owner.jobDir !== jobDir) refuse("Reservation ownership changed")
+          if (hash(await ownedDirectory(job.reservationPath, job.ownership.reservation)) !== hash(["owner.json"])) {
+            refuse("Reservation inventory changed")
+          }
+          await ownedFile(ownerPath)
+        } else preserved.push(job.reservationPath)
+      }
+      if (await exists(path.join(root, "." + id + ".release-lock"))) refuse("Checkpoint/reservation release is in flight")
+      for (const target of preserved) {
+        if (!path.isAbsolute(target) || directories.some(dir => target === dir.path || target.startsWith(dir.path + path.sep))) {
+          refuse("Deletion would overlap a protected path")
+        }
+      }
+      const warning = "Permanently remove this job's recovery records, log, private checkpoint and staging/quarantined partials. " +
+        "Status, cancellation and recovery will no longer be available. Published outputs and the source checkpoint are preserved."
+      // Observations are disposable and change on every status poll, not approval scope.
+      const digest = hash({ jobId: id, commandHash: job.commandHash, warning,
+        directories: directories.map(dir => ({ ...dir, names: dir.names.filter(name => name !== "observation.json") })),
+        files: files.filter(file => path.basename(file.path) !== "observation.json"), preserved })
+      const preview = { jobId: id, state: observed.state, retired: false, approval: digest, warning,
+        remove: directories.map(dir => dir.path), preserve: preserved }
+      check()
+      if (approval === undefined) return { ...preview, approvalRequired: true }
+      if (typeof approval !== "string" || approval !== digest) refuse("Approval is stale or does not match this inventory; preview and ask again")
+      await quiescent()
+      async function checkDirectories() {
+        if (hash(await directoryIdentity(job.destinationDir)) !== hash(job.ownership.destination)) refuse("Destination changed during retirement")
+        for (const dir of directories) {
+          if (hash(await directoryIdentity(dir.path)) !== hash(dir.identity)) refuse("Directory replaced during retirement: " + dir.path)
+        }
+      }
+      await checkDirectories()
+      for (const dir of directories) {
+        if (hash((await fs.readdir(dir.path)).sort()) !== hash(dir.names)) refuse("Inventory changed during retirement")
+      }
+      for (const file of files) {
+        if (hash(await signature(file.path)) !== hash(file.signature)) refuse("File changed during retirement: " + file.path)
+      }
+      // Claim storage is outside all source directories, protected by the storage
+      // service's current-user-only ACL/mode. Cross-volume rename fails closed:
+      // copying would not claim the source name. No callback runs inside a claim.
+      if (directories.some(dir => dir.identity.dev !== rootIdentity.dev)) refuse("Retirement requires same-volume protected claim storage")
+      if (hash(await directoryIdentity(root)) !== hash(rootIdentity)) refuse("Recovery root changed")
+      await secureDirectory(recoveryPath)
+      const recoveryIdentity = await directoryIdentity(recoveryPath)
+      const marker = ".cookiemonster-storage-owner.json"
+      if (hash((await fs.readdir(recoveryPath)).sort()) !== hash([marker])) refuse("Unexpected claim-area entry; preserved")
+      const markerPath = path.join(recoveryPath, marker)
+      const housekeeping = [{ path: markerPath, signature: await signature(markerPath) }]
+      files.sort((a, b) => Number(a.path === path.join(jobDir, "manifest.json")) - Number(b.path === path.join(jobDir, "manifest.json")))
+      const entries = [...files, ...directories.filter(dir => dir.path !== jobDir), directories[0]].map((entry, index) => ({
+        ...entry, claim: path.join(recoveryPath, "claim-" + index),
+        parent: directories.find(dir => dir.path === path.dirname(entry.path))?.identity ??
+          (path.dirname(entry.path) === root ? rootIdentity : job.ownership.destination),
+      }))
+      const planPath = path.join(recoveryPath, "plan.json")
+      // Intent precedes the first rename. Missing claims after a crash do NOT prove
+      // deletion; manual recovery must inspect originals and claims without overwrite.
+      await save(planPath, { jobId: id, commandHash: job.commandHash, entries, preserved,
+        remediation: "Stop render services; inspect original and claim identities against this plan. Preserve mismatches. Restore only to vacant verified parents, or explicitly remove proven owned remnants. Never replay this plan as authorization." })
+      housekeeping.push({ path: planPath, signature: await signature(planPath) })
+      for (const entry of entries) {
+        if (entry.signature) {
+          await checkDirectories()
+          if (hash(await signature(entry.path)) !== hash(entry.signature)) refuse("File changed before claim")
+        }
+        check()
+        if (hash(await directoryIdentity(root)) !== hash(rootIdentity) ||
+            hash(await directoryIdentity(recoveryPath)) !== hash(recoveryIdentity)) refuse("Claim storage changed")
+        if (await exists(entry.claim)) refuse("Claim path is occupied")
+        await fs.rename(entry.path, entry.claim)
+        claimed.push({ path: entry.path, claim: entry.claim })
+        // Verification is of the object actually removed from the source namespace,
+        // not the pathname we inspected before rename. A swapped parent also refuses.
+        if (hash(await directoryIdentity(path.dirname(entry.path))) !== hash(entry.parent) ||
+            await exists(entry.path)) refuse("Source parent or pathname changed during claim; claim preserved")
+        if (entry.signature) {
+          if (hash(await signature(entry.claim)) !== hash(entry.signature)) refuse("Claimed file was replaced; claim preserved")
+          if (entry.path === job.checkpoint.path) {
+            if ((await fs.lstat(entry.claim)).nlink !== 1) refuse("Private checkpoint became shared; claim preserved")
+            await fs.chmod(entry.claim, 0o600)
+          }
+          await fs.unlink(entry.claim)
+        } else {
+          if (hash(await directoryIdentity(entry.claim)) !== hash(entry.identity)) refuse("Claimed directory was replaced; claim preserved")
+          // Never recursive: unexpected children remain in the claim for recovery.
+          await fs.rmdir(entry.claim)
+        }
+        removed.push(entry.path)
+      }
+      if (hash((await fs.readdir(recoveryPath)).sort()) !== hash(housekeeping.map(file => path.basename(file.path)).sort())) {
+        refuse("Unexpected claim-area entry; plan preserved")
+      }
+      for (const file of housekeeping) {
+        if (hash(await directoryIdentity(recoveryPath)) !== hash(recoveryIdentity) ||
+            hash(await signature(file.path)) !== hash(file.signature)) refuse("Retirement plan changed; preserved")
+        await fs.unlink(file.path)
+      }
+      await fs.rmdir(recoveryPath)
+      return { jobId: id, state: "retired", retired: true, removed, preserved }
+    } catch (error) {
+      fail(removed.length || claimed.length ? "render_retire_partial" : "render_retire_refused", error.message, {
+        jobId: id, retired: false, cause: error.code || "verification_failed", removed, claimed,
+        recoveryPath: await exists(recoveryPath) ? recoveryPath : null,
+        remediation: "manual_retirement_recovery_required",
+      })
+    }
   }
   async function submit(input) {
     if (!input || typeof input !== "object" || Array.isArray(input)) fail("invalid_payload", "Render submission must be an object")
@@ -350,6 +617,10 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
       job.checkpointSignature = await signature(checkpointPath)
       await fs.chmod(checkpointPath, 0o400)
       await fs.mkdir(job.stageDir, { mode: 0o700 })
+      job.ownership = {
+        job: await directoryIdentity(jobDir), stage: await directoryIdentity(job.stageDir),
+        destination: await directoryIdentity(destinationDir), reservation: await directoryIdentity(job.reservationPath),
+      }
       job.command = commandFor(job)
       job.commandHash = hash(job.command)
       await save(path.join(jobDir, "manifest.json"), job)
@@ -364,16 +635,21 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
       if (worker.jobId !== id || !sameIdentity(worker.identity, await adapter.inspect(worker.identity.pid))) {
         fail("render_process_identity", "Supervisor identity mismatch")
       }
-      // This permission is ephemeral; only the grant-checked canonical path is durable.
-      const rechecked = await grants.check(request)
-      if (rechecked !== destination) fail("render_grant", "Destination grant changed before launch")
-      await checkDestination(job)
-      await checkCheckpoint(job)
-      await save(path.join(jobDir, "permit.json"), { commandHash: job.commandHash, at: timestamp() })
-      return observe(id)
+      return await withJobLock(jobDir, async () => {
+        // This permission is ephemeral; only the grant-checked canonical path is durable.
+        const rechecked = await grants.check(request)
+        if (rechecked !== destination) fail("render_grant", "Destination grant changed before launch")
+        if (await exists(path.join(jobDir, "receipt.json"))) fail("render_launch", "Supervisor already finished before permission")
+        await checkDestination(job)
+        await checkCheckpoint(job)
+        await save(path.join(jobDir, "permit.json"), { commandHash: job.commandHash, at: timestamp() })
+        return observeUnlocked(id)
+      })
     } catch (error) {
       if (durable) {
-        await save(path.join(jobDir, "cancel.json"), { at: timestamp(), reason: "submission_failed" })
+        await withJobLock(jobDir, async () => {
+          if (await exists(jobDir)) await save(path.join(jobDir, "cancel.json"), { at: timestamp(), reason: "submission_failed" })
+        })
         error.details = { ...error.details, jobId: id }
       } else {
         // No process can exist before a durable manifest.
@@ -396,8 +672,8 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
     }),
     list: () => serial(reconcile),
     reconcile: () => serial(reconcile),
-    cancel: id => serial(async () => {
-      const job = await observe(id)
+    cancel: id => serial(() => withJobLock(directory(id), async () => {
+      const job = await observeUnlocked(id)
       if (terminal.has(job.state)) return job
       if (job.reason === "corrupt_manifest" || job.reason === "process_identity_mismatch" || job.state === "unknown") {
         fail("render_process_identity", "Job identity is not safely controllable", { jobId: id, reason: job.reason })
@@ -416,8 +692,9 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
           ...await adapter.terminate(job.processIdentity), at: timestamp(),
         })
       }
-      return observe(id)
-    }),
+      return observeUnlocked(id)
+    })),
+    retire: (id, options) => serial(() => withJobLock(directory(id), () => retire(id, options))),
     close: async () => { await pending; closed = true },
   }
   await reconcile()

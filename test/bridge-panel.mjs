@@ -5,6 +5,33 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { setTimeout as delay } from "node:timers/promises"
 import { createBridge } from "../src/bridge.mjs"
 import { hash } from "../src/protocol.mjs"
+import vm from "node:vm"
+import transport from "../panel/transport.cjs"
+import { hostDouble } from "./workflow-host.mjs"
+
+// Production HTTP bridge, Client and HostRPC with real host source. Only AE objects are simulated.
+export async function restoreFixture(t, options = {}) {
+  const p = await panelFixture(t, { timeoutMs: 10000, ...options.bridge })
+  const h = hostDouble(p.state.project.path)
+  const store = new transport.Store(p.dataDir, "restore-test")
+  const host = new transport.HostRPC({ evalScript(code, cb) {
+    if (options.evalScript) return options.evalScript(code, cb, h)
+    cb(vm.runInContext(code, h.context))
+  } }, options.hostTimeout || 5000)
+  const client = new transport.Client({ store, host })
+  await client.pair(p.bridge.pairingCode("restore-session").code)
+  await client.connect()
+  const connection = (await p.bridge.connections()).find(c => c.panelId === store.state.panelId)
+  await p.bridge.bind("restore-session", connection.id, { expectedProject: connection.project })
+  const commands = []
+  const command = client.command.bind(client)
+  client.command = async cmd => { commands.push(structuredClone(cmd)); return command(cmd) }
+  let stopped = false
+  const pump = (async () => { while (!stopped) { await client.tick(); await delay(5) } })()
+  const stop = async () => { stopped = true; await pump; client.stop() }
+  t.after(async () => { await stop(); store.close() })
+  return { p, h, store, host, client, commands, stop, sessionID: "restore-session", connectionId: connection.id }
+}
 
 export function request(port, endpoint, body, { credential, headers = {}, raw } = {}) {
   return new Promise((resolve, reject) => {

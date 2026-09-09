@@ -5,7 +5,8 @@ import { randomBytes, randomUUID, createHash } from "node:crypto"
 import net from "node:net"
 import { lstat, readFile, open, rename, unlink } from "node:fs/promises"
 import { secureDirectory } from "./storage.mjs"
-import { AEError, fail, canonical, assertObject, assertString, PROTOCOL, VERSION, UPDATE_URL } from "./protocol.mjs"
+import { AEError, fail, canonical, assertObject, assertString, PROTOCOL, VERSION, UPDATE_URL,
+  validVersion, validProtocol, releaseMetadata } from "./protocol.mjs"
 
 const MAX_BYTES = 4 * 1024 * 1024
 const digest = value => createHash("sha256").update(value).digest("hex")
@@ -46,6 +47,18 @@ function capabilities(value) {
 function activeComp(value = null) {
   if (value !== null && (!Number.isSafeInteger(value) || value <= 0))
     fail("invalid_payload", "Invalid active composition ID")
+  return value
+}
+
+function restoreSnapshot(value, expectedProject) {
+  assertObject(value)
+  if (!sameProject(project(value.project), expectedProject) || !Number.isSafeInteger(value.revision) ||
+      value.revision < 1 || value.busy !== false || !Array.isArray(value.items) ||
+      !Array.isArray(value.selection) || !Array.isArray(value.installedEffects))
+    fail("invalid_payload", "Restore requires a complete idle snapshot of the expected project")
+  capabilities(value.capabilities)
+  if (!Object.hasOwn(value, "activeCompId")) fail("invalid_payload", "Restore snapshot lacks active composition state")
+  activeComp(value.activeCompId)
   return value
 }
 
@@ -90,7 +103,17 @@ async function startBridge({
   heartbeatMs = 15000,
   pairingTtlMs = 120000,
   now = Date.now,
+  releaseMetadata: suppliedReleases,
 } = {}) {
+  const releases = releaseMetadata(suppliedReleases)
+  function compatibility(peer = null) {
+    return clone({
+      status: !peer ? "unknown" : peer.panelProtocol === PROTOCOL && peer.panelVersion === VERSION ? "compatible" : "incompatible",
+      pluginVersion: VERSION, protocol: PROTOCOL,
+      panelVersion: peer?.panelVersion ?? null, panelProtocol: peer?.panelProtocol ?? null,
+      ...releases,
+    })
+  }
   for (const value of [timeoutMs, heartbeatMs, pairingTtlMs])
     if (!Number.isFinite(value) || value <= 0) fail("invalid_payload", "Timeouts must be positive")
   dataDir = path.resolve(dataDir)
@@ -115,6 +138,18 @@ async function startBridge({
       assertString(lock.id, "lock id", 256)
       assertString(lock.connectionId, "connectionId", 256)
       project(lock.project)
+      if (lock.recoveryOriginal) project(lock.recoveryOriginal)
+      if (lock.restore) {
+        schema(lock.restore, ["id", "phase", "emergencyPath"], ["openPath"])
+        assertString(lock.restore.id, "restore id", 256)
+        if (!["preparing", "saved", "finishing", "finished"].includes(lock.restore.phase))
+          fail("unsafe_storage", "Invalid persisted restore phase")
+        for (const field of ["emergencyPath", "openPath"]) {
+          const file = lock.restore[field]
+          if (file !== undefined && (typeof file !== "string" || !path.isAbsolute(file) || path.resolve(file) !== file))
+            fail("unsafe_storage", "Invalid persisted restore path")
+        }
+      }
       delete lock.sessionID
       lock.state = "uncertain"
       lock.recoveryReason = "Bridge restarted; reconcile before writing"
@@ -162,7 +197,8 @@ async function startBridge({
   }
   function targetLock(connectionId, p) {
     return state.locks.find(lock => lock.connectionId === connectionId ||
-      p?.path && (lock.project.path === p.path || lock.recoveryOriginal?.path === p.path))
+      p?.path && (lock.project.path === p.path || lock.recoveryOriginal?.path === p.path ||
+        lock.restore?.emergencyPath === p.path || lock.restore?.openPath === p.path))
   }
   function view(binding) {
     return clone({ ...binding, lock: targetLock(binding.connectionId, binding.project) || null })
@@ -227,7 +263,12 @@ async function startBridge({
     return view(b)
   }
   const bridge = {
-    dataDir,
+    dataDir, canonicalRestore: true,
+    compatibility(sessionID) {
+      return { ...compatibility(), pendingPanels: [...pairing.values()]
+        .filter(entry => entry.sessionID === sessionID && entry.expiresAt > now() && entry.peer)
+        .map(entry => compatibility(entry.peer)) }
+    },
     pairingCode(sessionID) {
       healthy()
       assertString(sessionID, "sessionID", 256)
@@ -236,12 +277,13 @@ async function startBridge({
       const code = randomBytes(6).toString("hex").toUpperCase()
       const expiresAt = now() + pairingTtlMs
       pairing.set(digest(code), { sessionID, expiresAt })
-      return { code, expiresAt, protocol: PROTOCOL, version: VERSION, updateUrl: UPDATE_URL }
+      return { code, expiresAt, protocol: PROTOCOL, version: VERSION, updateUrl: UPDATE_URL, compatibility: compatibility() }
     },
     async connections() {
       await expire()
       return [...live.values()].map(c => ({
         id: c.id, connectionId: c.id, epoch: c.epoch, panelId: c.panelId, aeVersion: c.aeVersion,
+        compatibility: compatibility(c.peer),
         project: clone(c.project), capabilities: clone(c.capabilities), activeCompId: c.activeCompId ?? null,
         connected: c.connected, busy: c.busy, binding: [...bindings.values()].filter(b => b.connectionId === c.id).map(view)[0] || null,
         lock: clone(targetLock(c.id, c.project) || null),
@@ -317,8 +359,12 @@ async function startBridge({
       if (c.pending || c.busy) fail("host_busy", "Cannot unlock while AE is busy")
       const lock = targetLock(b.connectionId, b.project)
       if (!lock) return
-      if (lock.connectionId !== b.connectionId || !sameProject(lock.project, b.project))
+      if (lock.connectionId !== b.connectionId || !sameProject(lock.recoveryOriginal || lock.project, b.project))
         fail("recovery_target_mismatch", "Rebind the original connection and project before clearing its lock")
+      if (lock.restore && lock.state === "executing" &&
+          (lock.restore.phase !== "finished" || lock.evidence?.outcome !== "confirmed"))
+        fail("restore_in_progress", "Manual restore is not confirmed; retain its lock")
+      c.restore = null
       state.locks = state.locks.filter(value => value !== lock)
       await persist()
     },
@@ -371,11 +417,16 @@ async function startBridge({
       if (writes.has(method) && (!lock || lock.state !== "executing" || lock.sessionID !== sessionID ||
           lock.connectionId !== b.connectionId || !sameProject(lock.project, b.project)))
         fail("lock_required", "Acquire this session's durable executing lock before changing AE state")
+      const manual = method === "execute" && ["restore_prepare", "restore_finish"].includes(payload.phase)
+      if (lock?.restore && method !== "inspect" && !manual)
+        fail("restore_in_progress", "Only inspection and the authorized manual restore may run")
       if (method === "execute" && payload.phase) {
         const fields = {
           begin: ["actions"], chunk: ["offset", "count", "expected"],
           recovery_prepare: ["recoveryId", "expected", "path"],
           recovery_finish: ["recoveryId", "expected", "verifiedCheckpoint"],
+          restore_prepare: ["recoveryId", "expected", "path"],
+          restore_finish: ["recoveryId", "expected", "path", "verifiedCheckpoint"],
         }
         if (!Object.hasOwn(fields, payload.phase)) fail("invalid_payload", "Unknown execution phase")
         schema(payload, ["phase", "transaction", ...fields[payload.phase]])
@@ -396,10 +447,71 @@ async function startBridge({
         if (payload.phase === "recovery_finish" &&
             (!c.stopped || c.stopped.id !== payload.recoveryId || !c.stopped.original))
           fail("unsafe_state", "No prepared recovery transition")
+        if (manual) {
+          assertString(payload.recoveryId, "restore id", 256)
+          restoreSnapshot(payload.expected, b.project)
+          assertString(payload.path, "restore path", 32768)
+          const privatePath = prefix => path.isAbsolute(payload.path) && path.resolve(payload.path) === payload.path &&
+            path.dirname(payload.path) === dataDir &&
+            new RegExp("^workflow-" + prefix + "-[a-f0-9-]+[.]aepx?$").test(path.basename(payload.path))
+          if (payload.phase === "restore_prepare") {
+            if (c.stopped || c.restore || lock.restore || lock.recoveryOriginal || lock.reason?.kind !== "restore")
+              fail("unsafe_state", "Manual restore requires a fresh restore lock without stopped or uncertain execution")
+            assertString(lock.reason.checkpointId, "checkpoint id", 256)
+            if (!/^[a-f0-9]{64}$/.test(lock.reason.planHash) ||
+                digest(canonical(payload.expected)) !== lock.reason.fingerprint)
+              fail("unsafe_state", "Restore snapshot does not match the approved lock")
+            if (!privatePath("emergency")) fail("invalid_path", "Restore save must use a private emergency project")
+          } else {
+            const rec = c.restore
+            if (!rec || rec.phase !== "saved" || lock.restore?.phase !== "saved" ||
+                rec.id !== payload.recoveryId || rec.owner !== canonical(payload.transaction) ||
+                rec.snapshot !== canonical(payload.expected))
+              fail("unsafe_state", "No matching single-use manual restore preparation")
+            schema(payload.verifiedCheckpoint, ["id", "hash", "size"])
+            const proof = payload.verifiedCheckpoint, evidence = lock.evidence
+            assertString(proof.id, "current checkpoint", 256)
+            if (!/^[a-f0-9]{64}$/.test(proof.hash) || !Number.isSafeInteger(proof.size) ||
+                proof.size < 1 || proof.size > 5 * 1024 ** 3)
+              fail("invalid_payload", "Invalid verified current-state checkpoint")
+            if (evidence?.outcome !== "dispatched" || evidence.currentCheckpointId !== proof.id ||
+                evidence.checkpointId !== lock.reason.checkpointId || evidence.planHash !== lock.reason.planHash)
+              fail("unsafe_state", "Restore finish requires matching durable current-backup evidence")
+            if (payload.path !== rec.original.path && !privatePath("recovery"))
+              fail("invalid_path", "Restore may open only the original path or a private recovery copy")
+          }
+        }
       }
       return new Promise((resolve, reject) => {
         const pending = { command: { id: randomUUID(), method, params: payload, sessionID }, bindingID: b.id, project: clone(b.project), resolve, reject, delivered: false }
         c.pending = pending
+        pending.ready = !manual
+        if (manual) {
+          if (payload.phase === "restore_prepare") {
+            c.restore = { id: payload.recoveryId, owner: canonical(payload.transaction), bindingID: b.id,
+              original: clone(b.project), phase: "preparing" }
+            lock.recoveryOriginal = clone(b.project)
+            lock.restore = { id: payload.recoveryId, phase: "preparing", emergencyPath: payload.path }
+          } else {
+            c.restore.phase = "finishing"
+            lock.restore.phase = "finishing"
+            lock.restore.openPath = payload.path
+          }
+          // Reserve in-flight state before awaiting persistence. Nothing is pollable yet.
+          persist().then(() => {
+            if (c.pending !== pending) return
+            const latest = binding(sessionID, { write: true, allowLocked: true })
+            if (latest.id !== b.id || latest.lock?.id !== lock.id || lock.state !== "executing" ||
+                !sameProject(latest.project, b.project)) fail("stale_binding", "Restore owner changed before dispatch")
+            pending.ready = true
+          }).catch(async error => {
+            if (c.pending !== pending) return
+            c.pending = null
+            clearTimeout(pending.timer)
+            await uncertain(c, "Restore dispatch could not be durably confirmed").catch(() => {})
+            reject(new AEError("outcome_uncertain", "Restore remains locked; no host retry", { cause: error.code }))
+          })
+        }
         pending.timer = setTimeout(async () => {
           if (c.pending !== pending) return
           c.pending = null
@@ -435,10 +547,16 @@ async function startBridge({
     },
   }
 
-  function negotiate(body) {
-    if (body.protocol !== PROTOCOL || body.version !== VERSION)
+  function peerVersion(body) {
+    if (!validProtocol(body.protocol) || !validVersion(body.version))
+      fail("invalid_payload", "Invalid panel version or protocol")
+    return { panelProtocol: body.protocol, panelVersion: body.version }
+  }
+  function negotiate(peer) {
+    const metadata = compatibility(peer)
+    if (metadata.status === "incompatible")
       fail("incompatible_version", "Panel and plugin versions must match", {
-        protocol: PROTOCOL, version: VERSION, panelProtocol: body.protocol, panelVersion: body.version, updateUrl: UPDATE_URL,
+        protocol: PROTOCOL, version: VERSION, ...peer, updateUrl: UPDATE_URL, compatibility: metadata,
       })
   }
   async function route(req) {
@@ -451,7 +569,7 @@ async function startBridge({
       fail("invalid_payload", "Content-Type must be application/json")
     const endpoint = req.url
     if ((endpoint === "/poll" ? "GET" : "POST") !== req.method) fail("invalid_method", "Wrong HTTP method")
-    if (!["/pair", "/connect", "/heartbeat", "/poll", "/reply", "/disconnect", "/unpair", "/rotate", "/panel"].includes(endpoint))
+    if (!["/pair", "/connect", "/compatibility", "/heartbeat", "/poll", "/reply", "/disconnect", "/unpair", "/rotate", "/panel"].includes(endpoint))
       fail("not_found", "Unknown endpoint")
     let credential
     if (endpoint !== "/pair") {
@@ -478,15 +596,18 @@ async function startBridge({
       try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")) } catch { fail("invalid_payload", "Invalid JSON") }
     } else if (endpoint !== "/poll") fail("invalid_payload", "JSON body required")
     if (endpoint === "/poll" && bytes) fail("invalid_payload", "Poll must not have a body")
-    const info = { protocol: PROTOCOL, version: VERSION, updateUrl: UPDATE_URL }
+    const info = { protocol: PROTOCOL, version: VERSION, updateUrl: UPDATE_URL, compatibility: compatibility() }
     if (endpoint === "/pair") {
       schema(body, ["code", "protocol", "version", "panelId"])
       assertString(body.code, "code", 64)
       assertString(body.panelId, "panelId", 256)
-      negotiate(body)
       const codeHash = digest(body.code)
       const code = pairing.get(codeHash)
       if (!code || code.expiresAt <= now()) fail("invalid_pairing_code", "Pairing code is invalid, used, or expired")
+      // Bounded by the existing one-code-per-session TTL; never persisted or linked to a credential.
+      code.peer = peerVersion(body)
+      negotiate(code.peer)
+      info.compatibility = compatibility(code.peer)
       pairing.delete(codeHash)
       let record = state.credentials.find(c => c.panelId === body.panelId)
       if (record) {
@@ -503,23 +624,41 @@ async function startBridge({
       return { credential: secret, connectionId: record.connectionId, ...info }
     }
     let c = live.get(credential.connectionId)
-    if (endpoint === "/connect") {
-      schema(body, ["protocol", "version", "panelId", "project", "aeVersion", "capabilities"], ["activeCompId"])
-      negotiate(body)
+    if (endpoint === "/connect" || endpoint === "/compatibility") {
+      schema(body, endpoint === "/connect"
+        ? ["protocol", "version", "panelId", "project", "aeVersion", "capabilities"]
+        : ["protocol", "version", "panelId"], endpoint === "/connect" ? ["activeCompId"] : [])
       if (body.panelId !== credential.panelId) fail("unauthorized", "Credential belongs to a different panel")
-      const p = project(body.project)
-      const caps = capabilities(body.capabilities), activeCompId = activeComp(body.activeCompId)
-      assertString(body.aeVersion, "aeVersion", 128)
-      if (c) await suspend(c, "Panel reconnected; explicitly rebind")
+      const peer = peerVersion(body), metadata = compatibility(peer)
+      const p = endpoint === "/connect" ? project(body.project) : null
+      const caps = endpoint === "/connect" ? capabilities(body.capabilities) : null
+      const activeCompId = endpoint === "/connect" ? activeComp(body.activeCompId) : null
+      if (endpoint === "/connect") assertString(body.aeVersion, "aeVersion", 128)
+      if (c && (endpoint === "/connect" || metadata.status === "incompatible"))
+        await suspend(c, "Panel negotiation changed; explicitly rebind")
+      if (!c) {
+        c = { id: credential.connectionId, epoch: randomUUID(), panelId: credential.panelId,
+          project: null, capabilities: null, aeVersion: null, activeCompId: null,
+          connected: false, seen: now(), busy: false, pending: null }
+        live.set(c.id, c)
+      }
+      c.peer = peer
+      info.compatibility = metadata
+      // Discovery never connects, binds, dispatches tools or clears recovery state.
+      if (endpoint === "/compatibility") return { connectionId: c.id, ...info }
+      negotiate(peer)
       c = { id: credential.connectionId, epoch: randomUUID(), panelId: credential.panelId, project: p, capabilities: caps,
-        aeVersion: body.aeVersion, activeCompId, connected: true, seen: now(), busy: false, pending: null }
+        peer, aeVersion: body.aeVersion, activeCompId, connected: true, seen: now(), busy: false, pending: null }
       live.set(c.id, c)
       return { connectionId: c.id, ...info }
     }
     if (endpoint === "/disconnect" || endpoint === "/unpair" || endpoint === "/rotate") {
       schema(body, [])
       if (c) await suspend(c, "Panel disconnected or credential changed")
-      if (endpoint === "/unpair") credential.hash = null
+      if (endpoint === "/unpair") {
+        credential.hash = null
+        if (c) delete c.peer
+      }
       const secret = endpoint === "/rotate" ? randomBytes(32).toString("base64url") : null
       if (secret) credential.hash = digest(secret)
       await persist()
@@ -543,10 +682,20 @@ async function startBridge({
       if (!panelHandler) fail("handler_unavailable", "Panel services are not registered")
       if (c.panelPending) fail("panel_busy", "Panel request already outstanding")
       const handler = panelHandler, credentialHash = credential.hash, input = clone(body)
-      const recheck = () => {
+      const recheck = result => {
         const current = binding(b.sessionID, { allowLocked: true })
+        const rec = c.restore, lock = current.lock
+        const recoveryResult = input.action === "checkpoint.restore.confirm" &&
+          result?.recoveryCopy === true && result.rebindRequired === true && result.automationSuspended === true &&
+          rec?.phase === "finished" && rec.bindingID === b.id && sameProject(rec.original, b.project) &&
+          lock?.restore?.phase === "finished" && lock.state === "uncertain" &&
+          lock.evidence?.outcome === "recovery_copy" && lock.evidence.checkpointId === result.checkpointId &&
+          lock.evidence.currentCheckpointId === result.currentCheckpointId &&
+          lock.evidence.expectedFingerprint === result.fingerprint &&
+          result.path === lock.restore.openPath && result.path === current.project.path &&
+          result.canonicalPath === b.project.path
         if (live.get(c.id) !== c || credential.hash !== credentialHash ||
-            current.id !== b.id || current.connectionId !== c.id || !sameProject(current.project, b.project))
+            current.id !== b.id || current.connectionId !== c.id || (!sameProject(current.project, b.project) && !recoveryResult))
           fail("stale_binding", "Panel request binding or credential changed")
       }
       c.panelPending = true
@@ -555,7 +704,7 @@ async function startBridge({
         try {
           recheck()
           const result = await handler({ connectionId: c.id, sessionID: b.sessionID, binding: clone(b), body: input })
-          recheck()
+          recheck(result)
           const response = { result: clone(result) }
           if (Buffer.byteLength(canonical(response)) > MAX_BYTES) fail("payload_too_large", "Panel response exceeds limit")
           return response
@@ -581,7 +730,7 @@ async function startBridge({
     }
     if (endpoint === "/poll") {
       const pending = c.pending
-      if (!pending || pending.delivered) return { command: null }
+      if (!pending || !pending.ready || pending.delivered) return { command: null }
       pending.delivered = true
       return { command: clone(pending.command) }
     }
@@ -638,6 +787,34 @@ async function startBridge({
               !Number.isSafeInteger(r.recovery.snapshot.revision) || r.recovery.snapshot.busy !== false)
             fail("invalid_host_result", "Invalid stopped execution evidence")
           c.stopped = clone(r.recovery)
+        } else if (p.phase === "restore_prepare" || p.phase === "restore_finish") {
+          schema(r, ["status", "project", "snapshot"])
+          const next = project(r.project), rec = c.restore
+          const b = bindings.get(pending.command.sessionID), lock = targetLock(c.id, pending.project)
+          const preparing = p.phase === "restore_prepare"
+          if (!rec || rec.id !== p.recoveryId || rec.owner !== canonical(p.transaction) ||
+              rec.phase !== (preparing ? "preparing" : "finishing") ||
+              r.status !== (preparing ? "recovery_saved" : "recovered") ||
+              next.path !== p.path || !next.saved || !b || b.id !== pending.bindingID ||
+              !sameProject(b.project, pending.project) || lock?.state !== "executing" ||
+              lock.sessionID !== pending.command.sessionID || lock.restore?.id !== rec.id)
+            fail("invalid_host_result", "Manual restore reply does not match the executing owner")
+          restoreSnapshot(r.snapshot, next)
+          if (preparing) {
+            const normalized = clone(r.snapshot), prior = clone(p.expected)
+            normalized.project = prior.project
+            delete normalized.fingerprint; delete prior.fingerprint
+            if (canonical(normalized) !== canonical(prior))
+              fail("invalid_host_result", "Manual emergency save changed the approved scene or revision")
+            rec.snapshot = canonical(r.snapshot)
+          } else if (p.path === rec.original.path) {
+            if (!sameProject(next, rec.original)) fail("invalid_host_result", "Original identity did not return")
+            delete lock.recoveryOriginal
+          }
+          rec.phase = preparing ? "saved" : "finished"
+          lock.restore.phase = rec.phase
+          b.project = clone(next); c.project = clone(next); lock.project = clone(next)
+          await persist()
         } else if (p.phase === "recovery_prepare" || p.phase === "recovery_finish") {
           schema(r, ["status", "project", "snapshot"])
           const next = project(r.project)

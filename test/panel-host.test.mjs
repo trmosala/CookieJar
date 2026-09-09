@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { createBridge } from "../src/bridge.mjs";
 import transport from "../panel/transport.cjs";
+import { hostDouble } from "./workflow-host.mjs";
 
 const source = readFileSync(new URL("../panel/host.jsx", import.meta.url), "utf8");
 function fixture() {
@@ -436,6 +437,48 @@ test("panel pins project identity through evalScript and refuses a switch before
     await assert.rejects(host.call("raw",{source:"app.project.revision = 999"},expected),{code:"stale_project"});
     assert.equal(f.project.revision,1);assert.equal(f.begins,0);
 });
+test("manual restore host close requires exact owner, saved snapshot, clean state and verified backup", t => {
+    for(const mode of ["success","owner","snapshot","dirty","unknown","proof","mode","callback","close_refused","open_edit"]){
+        const base=process.platform==="win32" ? path.join(os.tmpdir(),"opencode") : os.tmpdir();
+        const dir=mkdtempSync(path.join(base,"cm-manual-host-"));
+        t.after(()=>rmSync(dir,{recursive:true,force:true}));
+        const canonical=path.join(dir,"original.aep"),h=hostDouble(canonical);
+        h.props[0].setValue(42);
+        const transaction={id:"restore",sessionID:"session",bindingID:"binding"};
+        const saved=h.call("execute",{phase:"restore_prepare",transaction,recoveryId:"restore",
+            expected:h.call("inspect").result,path:path.join(dir,"emergency.aep")});
+        assert.ok(saved.result,JSON.stringify(saved));
+        assert.equal(saved.result.status,"recovery_saved");
+        const finish={phase:"restore_finish",transaction,recoveryId:"restore",expected:saved.result.snapshot,
+            path:canonical,verifiedCheckpoint:{id:"backup",hash:"a".repeat(64),size:100}};
+        if(mode==="owner")finish.transaction={...transaction,sessionID:"other"};
+        if(mode==="snapshot")h.props[0].setValue(19);
+        if(mode==="dirty")h.project.dirty=true;
+        if(mode==="unknown")delete h.project.dirty;
+        if(mode==="proof")finish.verifiedCheckpoint.hash="not-verified";
+        if(mode==="mode"){finish.phase="recovery_finish";delete finish.path;}
+        if(mode==="callback")h.app.onError="artistCallback";
+        if(mode==="close_refused")h.project.close=()=>false;
+        if(mode==="open_edit"){
+            const open=h.app.open.bind(h.app);
+            h.app.open=file=>{const result=open(file);h.props[0].setValue(19);return result;};
+        }
+        const result=h.call("execute",finish);
+        if(mode==="success"){
+            assert.equal(result.result.status,"recovered");
+            assert.equal(h.closes,1);
+            assert.equal(h.project.file.fsName,canonical);
+            assert.equal(h.props[0].value,100);
+            assert.ok(h.call("execute",finish).error,"finish cannot replay");
+        }else{
+            assert.equal(result.error.code,"uncertain_outcome",mode);
+            assert.equal(h.closes,mode==="open_edit" ? 1 : 0,mode);
+            assert.equal(h.props[0].value,mode==="snapshot" || mode==="open_edit" ? 19 : 42);
+            assert.equal(h.call("status").result.uncertain,true);
+        }
+    }
+});
+
 test("dirty or unknown project state refuses open without discarding changes",()=>{
     const f=fixture();
     for(const dirty of [true,undefined]){f.project.dirty=dirty;assert.equal(f.call("open",{path:"C:/Project/recovery.aep"}).error.code,"unsafe_state");}

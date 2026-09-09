@@ -533,50 +533,75 @@ export function createCheckpoints({ dataDir }) {
     verify(id) {
       return run(async root => verifyManifest(await load(root, id)))
     },
-    restore(id, { canonicalPath }) {
+    restore(id, { canonicalPath, expectedDestination, expectedCheckpoint, beforeReplace }) {
       return run(async root => {
         const manifest = await verifyManifest(await load(root, id))
+        if (expectedCheckpoint && ["id", "projectId", "projectPath", "path", "planHash", "createdAt", "size", "hash"].some(key =>
+          manifest[key] !== expectedCheckpoint[key])) fail("checkpoint_changed", "Approved checkpoint changed")
         // Persist protection before handing a recovery path to a host that may outlive this process.
         // The workflow releases "recovery" only after AE has closed that copy.
         const held = { ...manifest, inUse: true,
           protectionOwners: [...new Set([...protectionOwners(manifest), "recovery"])] }
         if (held.protectionOwners.length > 100) fail("checkpoint_capacity", "Too many checkpoint protection owners")
         await atomicWrite(metadata(held), manifestData(held))
-        let temp
-        let parent
+        let temp, parent, originalPath, originalDirectory, guardError
         let restored = false
+        const destination = absolute(canonicalPath)
         try {
-          const destination = absolute(canonicalPath)
           if (destination !== manifest.projectPath || await canonical(destination, true) !== destination) fail("path_denied", "Restore destination must be the original canonical project")
           const before = await optionalStat(destination)
-          if (before) await regular(destination)
+          const original = before ? await verifiedFile(destination) : null
+          if (expectedDestination && (!before || !sameStat(before, expectedDestination) || original.hash !== expectedDestination.hash))
+            fail("checkpoint_changed", "Approved destination changed")
           parent = path.dirname(destination)
           const parentStat = await fs.stat(parent)
           temp = path.join(parent, ".cookiemonster-restore-" + randomUUID() + ".tmp")
           await copyVerified(manifest.path, temp, manifest)
+          if (beforeReplace) {
+            try { await beforeReplace() } catch (error) { guardError = error; throw error }
+          }
           await unchangedParent(parent)
           const afterParent = await fs.stat(parent)
           const after = await optionalStat(destination)
           if (parentStat.dev !== afterParent.dev || parentStat.ino !== afterParent.ino ||
               (before ? !after || !sameStat(before, after) : after)) fail("checkpoint_changed", "Restore destination changed")
-          await fs.rename(temp, destination)
+          if (before) {
+            // Retain the actual displaced inode, including edits racing the final check.
+            originalDirectory = await fs.mkdtemp(path.join(parent, ".cookiemonster-original-"))
+            const displaced = path.join(originalDirectory, path.basename(destination))
+            await fs.rename(destination, displaced)
+            originalPath = displaced
+            const moved = await regular(displaced)
+            if (moved.dev !== before.dev || moved.ino !== before.ino ||
+                (await verifiedFile(displaced)).hash !== original.hash)
+              fail("checkpoint_changed", "Destination changed at replacement; original retained")
+          }
+          // link is exclusive: a newly appeared destination is never overwritten.
+          await fs.link(temp, destination)
           restored = true
-        } catch {
+        } catch (error) {
+          if (guardError) throw guardError
+          if (originalPath) {
+            try { await unchangedParent(parent); await fs.link(originalPath, destination) } catch {}
+          }
           await verifyManifest(manifest)
-          return { path: manifest.path, recoveryCopy: true, automationSuspended: true }
+          return { path: manifest.path, recoveryCopy: true, automationSuspended: true,
+            ...(originalPath ? { originalPath } : {}),
+            ...(expectedDestination ? { cause: error.code || "restore_failed" } : {}) }
         } finally {
           try {
             if (temp) {
               await unchangedParent(parent)
               await fs.unlink(temp).catch(error => { if (error.code !== "ENOENT") throw error })
             }
+            if (originalDirectory && !originalPath) await fs.rmdir(originalDirectory)
             if (restored) await atomicWrite(metadata(manifest), manifestData(manifest))
           } catch {
-            // Never report a failed restore after the atomic replacement committed.
-            process.emitWarning("Restore cleanup failed; the checkpoint remains protected. Inspect storage before resuming automation.", { code: "checkpoint_cleanup_failed" })
+            // Never undo a committed replacement: an external edit may already exist.
+            process.emitWarning("Restore cleanup failed; retain recovery files and inspect storage before resuming automation.", { code: "checkpoint_cleanup_failed" })
           }
         }
-        return { path: manifest.projectPath, recoveryCopy: false }
+        return { path: manifest.projectPath, recoveryCopy: false, ...(originalPath ? { originalPath } : {}) }
       })
     },
   }

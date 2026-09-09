@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises"
 import { createReadStream } from "node:fs"
+import { createServer } from "node:net"
 import { createHash, randomUUID } from "node:crypto"
 import { spawn, execFile } from "node:child_process"
 import { promisify } from "node:util"
@@ -21,6 +22,48 @@ export async function exists(file) {
     if (error.code === "ENOENT") return false
     throw error
   }
+}
+
+export async function directoryIdentity(directory) {
+  const stat = await fs.lstat(directory, { bigint: true })
+  if (!stat.isDirectory() || stat.isSymbolicLink() || await fs.realpath(directory) !== directory) {
+    fail("render_corrupt", "Directory is not canonical", { directory })
+  }
+  return { dev: String(stat.dev), ino: String(stat.ino), birthtimeNs: String(stat.birthtimeNs) }
+}
+
+// Kernel-owned exclusive bind is released even by process.exit/SIGKILL. Never
+// infer death from a PID, timeout or failed connect. Hash collisions only serialize
+// unrelated jobs (or return busy); no competing listener is contacted or killed.
+export async function withJobLock(jobDir, operation) {
+  const legacy = path.join(path.dirname(jobDir), "." + path.basename(jobDir) + ".access-lock")
+  if (await exists(legacy)) fail("render_busy", "Legacy ownerless gate requires manual recovery")
+  const canonical = path.join(await fs.realpath(path.dirname(jobDir)), path.basename(jobDir))
+  // Case folding also covers default case-insensitive macOS volumes; on a
+  // case-sensitive volume it can only serialize otherwise independent jobs.
+  const key = canonical.toLowerCase()
+  const port = 49152 + parseInt(hash(key).slice(0, 8), 16) % 16384
+  const deadline = Date.now() + 30000
+  let server
+  for (;;) {
+    server = createServer(socket => socket.destroy())
+    try {
+      await new Promise((resolve, reject) => {
+        server.once("error", reject)
+        server.listen({ host: "127.0.0.1", port, exclusive: true }, resolve)
+      })
+      break
+    } catch (error) {
+      server.close()
+      if (error.code !== "EADDRINUSE") fail("render_busy", "Exclusive job gate unavailable")
+      if (Date.now() >= deadline) fail("render_busy", "Exclusive job gate is occupied; holder left untouched")
+      await delay(25)
+    }
+  }
+  try {
+    if (await exists(legacy)) fail("render_busy", "Legacy ownerless gate requires manual recovery")
+    return await operation()
+  } finally { await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
 }
 
 // Atomic replacement plus fsync: an interrupted write never becomes valid JSON.
@@ -437,14 +480,24 @@ function run(args) {
 }
 
 export async function runWorker(jobDir, adapter = createProcessAdapter()) {
-  const job = await readJob(jobDir)
   const receiptPath = path.join(jobDir, "receipt.json")
-  if (await exists(receiptPath)) return
-  // A second supervisor must never launch another render for this job.
-  await fs.mkdir(path.join(jobDir, "worker-lock"), { mode: 0o700 })
-  const worker = await adapter.self()
-  if (!sameIdentity(worker, worker)) fail("render_process", "Cannot identify render supervisor")
-  await save(path.join(jobDir, "worker.json"), { jobId: job.jobId, identity: worker, at: timestamp() })
+  const job = await withJobLock(jobDir, async () => {
+    if (await exists(path.join(path.dirname(jobDir), "." + path.basename(jobDir) + ".retirement"))) {
+      fail("render_retire_refused", "Interrupted retirement requires manual recovery")
+    }
+    const job = await readJob(jobDir)
+    if (await exists(receiptPath)) return null
+    // Admission shares the observer gate; a delayed supervisor cannot resurrect a retired job.
+    const lock = path.join(jobDir, "worker-lock")
+    await fs.mkdir(lock, { mode: 0o700 })
+    const worker = await adapter.self()
+    if (!sameIdentity(worker, worker)) fail("render_process", "Cannot identify render supervisor")
+    await save(path.join(jobDir, "worker.json"), {
+      jobId: job.jobId, identity: worker, lockIdentity: await directoryIdentity(lock), at: timestamp(),
+    })
+    return job
+  })
+  if (!job) return
   let launched = false
   let log
   let journal = []

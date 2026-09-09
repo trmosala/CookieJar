@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import * as fs from "node:fs/promises"
+import * as syncFS from "node:fs"
 import path from "node:path"
 import os from "node:os"
 import { randomUUID } from "node:crypto"
@@ -13,7 +14,7 @@ import { setTimeout as delay } from "node:timers/promises"
 import { createRenderer } from "../src/render.mjs"
 import {
   runWorker, readJob, signature, load, save, exists, sameIdentity,
-  createProcessAdapter, outputSpec, collides,
+  createProcessAdapter, outputSpec, collides, withJobLock,
 } from "../src/render-worker.mjs"
 
 async function until(check) {
@@ -134,7 +135,9 @@ async function setup(t, platform = "win32") {
   }
   t.after(async () => {
     for (const context of workers.values()) {
-      await save(path.join(context.jobDir, "cancel.json"), { at: new Date().toISOString(), reason: "test cleanup" })
+      if (await exists(context.jobDir)) {
+        await save(path.join(context.jobDir, "cancel.json"), { at: new Date().toISOString(), reason: "test cleanup" })
+      }
     }
     for (const child of children.values()) {
       if (!child.done) {
@@ -771,6 +774,538 @@ test("terminal cleanup never deletes a replaced private checkpoint or releases a
   assert.equal(await fs.readFile(job.checkpoint.path, "utf8"), "replacement private file")
   assert.equal(await exists(path.join(f.jobDir(job.jobId), "checkpoint-release.json")), false)
 })
+
+for (const state of ["completed", "failed", "cancelled"]) {
+  test(`retirement: explicit approval expires ${state} records and preserves outputs/source`, async t => {
+    const f = await setup(t)
+    f.checkpoint.pinned = true
+    const job = await f.service.submit(f.input)
+    await f.started(job.jobId)
+    if (state === "cancelled") {
+      await fs.writeFile(path.join(job.stageDir, "movie.mov"), "partial")
+      await f.service.cancel(job.jobId)
+      await f.workers.get(job.jobId).task
+    } else await f.finish(job.jobId, { code: state === "failed" ? 7 : 0 })
+    const preview = await f.service.retire(job.jobId)
+    assert.equal(preview.state, state)
+    assert.equal(preview.retired, false)
+    assert.equal(preview.approvalRequired, true)
+    assert.match(preview.warning, /Permanently remove/)
+    assert.match(preview.approval, /^[a-f0-9]{64}$/)
+    assert.equal(await exists(job.checkpoint.path), true, "Preview must not release anything")
+    assert.equal(await exists(job.reservationPath), true)
+    await assert.rejects(f.service.retire(job.jobId, { approval: true }), { code: "render_retire_refused" })
+    const result = await f.service.retire(job.jobId, { approval: preview.approval })
+    assert.equal(result.retired, true)
+    for (const target of [f.jobDir(job.jobId), job.stageDir, job.quarantineDir, job.reservationPath]) {
+      assert.equal(await exists(target), false, target)
+    }
+    assert.equal(await fs.readFile(f.checkpoint.path, "utf8"), "immutable test checkpoint")
+    assert.equal(f.checkpoint.pinned, true)
+    assert.equal(await exists(f.input.outputPath), state === "completed")
+    if (state === "completed") assert.equal(await fs.readFile(f.input.outputPath, "utf8"), "rendered bytes")
+    assert.deepEqual(await f.service.list(), [])
+    await assert.rejects(f.service.status(job.jobId), { code: "render_job" })
+    await assert.rejects(f.service.retire(job.jobId, { approval: preview.approval }), { code: "render_job" })
+    await f.service.close()
+    assert.deepEqual(await (await f.open()).reconcile(), [])
+    await assert.rejects(runWorker(f.jobDir(job.jobId), f.adapter))
+    assert.equal(await exists(f.jobDir(job.jobId)), false, "Delayed supervisors cannot resurrect jobs")
+  })
+}
+
+test("retirement: prelaunch cancellation can expire without inventing a child identity", async t => {
+  const f = await setup(t)
+  f.onCheck(count => { if (count === 2) f.revoke() })
+  await assert.rejects(f.service.submit(f.input), { code: "grant_denied" })
+  const [worker] = f.workers.values()
+  await worker.task
+  const id = path.basename(worker.jobDir)
+  const preview = await f.service.retire(id)
+  assert.equal(preview.state, "cancelled")
+  assert.equal((await f.service.retire(id, { approval: preview.approval })).retired, true)
+  assert.equal(await exists(f.checkpoint.path), true)
+})
+
+test("retirement: live sibling shares only the preserved source and keeps its reservation", async t => {
+  const f = await setup(t)
+  f.checkpoint.pinned = true
+  const first = await f.service.submit(f.input)
+  await f.finish(first.jobId)
+  await f.service.status(first.jobId)
+  const second = await f.service.submit({ ...f.input, outputPath: path.join(f.output, "second.mov") })
+  await f.started(second.jobId)
+  const checkpoint = await signature(second.checkpoint.path)
+  const owner = await load(path.join(second.reservationPath, "owner.json"))
+  const preview = await f.service.retire(first.jobId)
+  assert.equal((await f.service.retire(first.jobId, { approval: preview.approval })).retired, true)
+  assert.deepEqual(await signature(second.checkpoint.path), checkpoint)
+  assert.deepEqual(await load(path.join(second.reservationPath, "owner.json")), owner)
+  assert.equal((await f.service.status(second.jobId)).state, "running")
+  assert.equal(await fs.readFile(first.outputPath, "utf8"), "rendered bytes")
+  assert.equal(f.checkpoint.pinned, true)
+  assert.equal(await exists(f.checkpoint.path), true)
+})
+
+test("retirement: refuses live, unknown, reused and uninspectable process identities without cleanup", async t => {
+  const f = await setup(t)
+  const job = await f.service.submit(f.input)
+  const child = await f.started(job.jobId)
+  const refuse = async () => {
+    await assert.rejects(f.service.retire(job.jobId), { code: "render_retire_refused" })
+    assert.equal(await exists(job.checkpoint.path), true)
+    assert.equal(await exists(job.reservationPath), true)
+    assert.equal(await exists(f.jobDir(job.jobId)), true)
+  }
+  await refuse()
+  await f.finish(job.jobId)
+  const worker = f.workers.get(job.jobId)
+  for (const identity of [worker.identity, child.identity]) {
+    for (const live of [identity, { ...identity, startTime: "reused" }]) {
+      f.live.set(identity.pid, live)
+      await refuse()
+    }
+    f.live.delete(identity.pid)
+    const inspect = f.adapter.inspect
+    f.adapter.inspect = async pid => { if (pid === identity.pid) throw new Error("Inspection denied"); return inspect(pid) }
+    await refuse()
+    f.adapter.inspect = inspect
+  }
+  const discover = f.adapter.discover
+  f.adapter.discover = async () => [child.identity]
+  await refuse()
+  f.adapter.discover = async () => { throw new Error("Discovery unavailable") }
+  await refuse()
+  f.adapter.discover = discover
+  const receiptPath = path.join(f.jobDir(job.jobId), "receipt.json")
+  const receipt = await load(receiptPath)
+  for (const changed of [
+    { ...receipt, state: "unknown" },
+    { ...receipt, exit: { ...receipt.exit, quiescent: false } },
+    { ...receipt, exit: { ...receipt.exit, signal: "SIGTERM", quiescent: undefined } },
+  ]) {
+    await save(receiptPath, JSON.parse(JSON.stringify(changed)))
+    await refuse()
+  }
+  await save(receiptPath, receipt)
+  await fs.unlink(path.join(f.jobDir(job.jobId), "process.json"))
+  await refuse()
+  assert.deepEqual(f.killed, [])
+})
+
+test("retirement: preserves legacy records, corruption, unknown files and replaced private artifacts", async t => {
+  const f = await setup(t)
+  const job = await f.service.submit(f.input)
+  await f.finish(job.jobId, { code: 7 })
+  const jobDir = f.jobDir(job.jobId)
+  const refuse = async () => {
+    await assert.rejects(f.service.retire(job.jobId), { code: "render_retire_refused" })
+    assert.equal(await exists(job.checkpoint.path), true)
+    assert.equal(await exists(job.reservationPath), true)
+    assert.equal(await exists(jobDir), true)
+  }
+  const manifestPath = path.join(jobDir, "manifest.json")
+  const manifest = await load(manifestPath)
+  for (const legacy of [{ ...manifest, version: 1 }, { ...manifest, ownership: undefined }]) {
+    await save(manifestPath, JSON.parse(JSON.stringify(legacy)))
+    await refuse()
+  }
+  await fs.writeFile(manifestPath, "{broken")
+  await refuse()
+  await save(manifestPath, manifest)
+  for (const name of ["foreign.txt", "manifest.json.inflight.tmp", "recovery-lock"]) {
+    const target = path.join(jobDir, name)
+    await fs.writeFile(target, "leave this alone")
+    await refuse()
+    assert.equal(await fs.readFile(target, "utf8"), "leave this alone")
+    await fs.unlink(target)
+  }
+  for (const target of [job.logPath, job.checkpoint.path, path.join(job.quarantineDir, "movie.mov")]) {
+    const moved = path.join(f.base, path.basename(target) + ".original")
+    await fs.rename(target, moved)
+    await fs.copyFile(moved, target)
+    await refuse()
+    await fs.chmod(target, 0o600)
+    await fs.unlink(target)
+    await fs.rename(moved, target)
+  }
+  const moved = job.quarantineDir + ".original"
+  await fs.rename(job.quarantineDir, moved)
+  await fs.mkdir(job.quarantineDir)
+  await refuse()
+  await fs.rmdir(job.quarantineDir)
+  await fs.symlink(moved, job.quarantineDir, process.platform === "win32" ? "junction" : "dir")
+  await refuse()
+  await fs.unlink(job.quarantineDir)
+  await fs.rename(moved, job.quarantineDir)
+  const shared = path.join(f.base, "shared-private.aep")
+  await fs.link(job.checkpoint.path, shared)
+  await refuse()
+  assert.equal(await fs.readFile(shared, "utf8"), "immutable test checkpoint")
+  await fs.unlink(shared)
+  const ownerPath = path.join(job.reservationPath, "owner.json")
+  await fs.writeFile(ownerPath, "{broken")
+  await refuse()
+})
+
+test("retirement: status changes invalidate artifact scope, but subsequent observations do not", async t => {
+  const f = await setup(t)
+  const job = await f.service.submit(f.input)
+  await f.finish(job.jobId)
+  const preview = await f.service.retire(job.jobId)
+  await f.service.status(job.jobId)
+  await assert.rejects(f.service.retire(job.jobId, { approval: preview.approval }), { code: "render_retire_refused" })
+  const fresh = await f.service.retire(job.jobId)
+  await f.service.status(job.jobId)
+  assert.equal((await f.service.retire(job.jobId, { approval: fresh.approval })).retired, true)
+})
+
+test("retirement: observers, cancellation, list, restart and duplicate retire cannot resurrect metadata", async t => {
+  const f = await setup(t)
+  const services = await Promise.all(Array.from({ length: 5 }, () => f.open()))
+  const job = await f.service.submit(f.input)
+  await f.finish(job.jobId)
+  await f.service.status(job.jobId)
+  const preview = await f.service.retire(job.jobId)
+  let entered, resume
+  const paused = new Promise(resolve => { entered = resolve })
+  const gate = new Promise(resolve => { resume = resolve })
+  const inspect = f.adapter.inspect
+  let held = false
+  f.adapter.inspect = async pid => {
+    if (!held) { held = true; entered(); await gate }
+    return inspect(pid)
+  }
+  const retired = f.service.retire(job.jobId, { approval: preview.approval })
+  await paused
+  const outcomes = Promise.allSettled([
+    services[0].status(job.jobId), services[1].cancel(job.jobId),
+    services[2].list(), services[3].reconcile(),
+    services[4].retire(job.jobId, { approval: preview.approval }), f.open(),
+  ])
+  await delay(50)
+  resume()
+  assert.equal((await retired).retired, true)
+  const results = await outcomes
+  for (const index of [0, 1, 4]) {
+    assert.equal(results[index].status, "rejected")
+    assert.equal(results[index].reason.code, "render_job")
+  }
+  for (const index of [2, 3]) assert.deepEqual(results[index].value, [])
+  assert.equal(results[5].status, "fulfilled")
+  assert.equal(await exists(f.jobDir(job.jobId)), false)
+  assert.deepEqual(await fs.readdir(path.dirname(f.jobDir(job.jobId))), [])
+})
+
+test("retirement: revalidates process identity and replacements after approval", async t => {
+  const f = await setup(t)
+  const job = await f.service.submit(f.input)
+  await f.finish(job.jobId, { code: 7 })
+  const preview = await f.service.retire(job.jobId)
+  const inspect = f.adapter.inspect
+  const worker = f.workers.get(job.jobId).identity
+  let inspections = 0
+  f.adapter.inspect = async pid => {
+    if (pid === worker.pid && ++inspections === 2) return { ...worker, startTime: "reused" }
+    return inspect(pid)
+  }
+  await assert.rejects(f.service.retire(job.jobId, { approval: preview.approval }), { code: "render_retire_refused" })
+  assert.equal(await exists(job.checkpoint.path), true)
+  f.adapter.inspect = inspect
+  const discover = f.adapter.discover
+  let discoveries = 0
+  f.adapter.discover = async command => {
+    if (++discoveries === 2) {
+      await fs.rename(job.quarantineDir, job.quarantineDir + ".original")
+      await fs.mkdir(job.quarantineDir)
+      await fs.writeFile(path.join(job.quarantineDir, "foreign"), "replacement")
+    }
+    return discover(command)
+  }
+  await assert.rejects(f.service.retire(job.jobId, { approval: preview.approval }), { code: "render_retire_refused" })
+  assert.equal(await fs.readFile(path.join(job.quarantineDir, "foreign"), "utf8"), "replacement")
+  assert.equal(await exists(job.checkpoint.path), true)
+})
+
+test("retirement: inspected receipts cannot be swapped or removed during inventory capture", async t => {
+  const f = await setup(t)
+  const job = await f.service.submit(f.input)
+  await f.finish(job.jobId)
+  const jobDir = f.jobDir(job.jobId)
+  const workerPath = path.join(jobDir, "worker.json")
+  const launchPath = path.join(jobDir, "launch.json")
+  const worker = await load(workerPath)
+  const launch = await load(launchPath)
+  const discover = f.adapter.discover
+  for (const mutate of [
+    () => save(workerPath, { ...worker, identity: { ...worker.identity, pid: worker.identity.pid + 100 } }),
+    () => fs.unlink(launchPath),
+  ]) {
+    f.adapter.discover = async command => { await mutate(); return discover(command) }
+    await assert.rejects(f.service.retire(job.jobId), { code: "render_retire_refused" })
+    assert.equal(await exists(job.checkpoint.path), true)
+    assert.equal(await exists(job.reservationPath), true)
+    await save(workerPath, worker)
+    await save(launchPath, launch)
+  }
+  f.adapter.discover = discover
+})
+
+test("retirement: replaced job/destination/reservation directories and foreign reservation entries survive", async t => {
+  const f = await setup(t)
+  const job = await f.service.submit(f.input)
+  await f.finish(job.jobId, { code: 7 })
+  const jobDir = f.jobDir(job.jobId)
+  for (const target of [jobDir, job.destinationDir, job.reservationPath]) {
+    const moved = target + ".original"
+    await fs.rename(target, moved)
+    await fs.cp(moved, target, { recursive: true })
+    await assert.rejects(f.service.retire(job.jobId), { code: "render_retire_refused" })
+    assert.equal(await exists(target), true)
+    await fs.rm(target, { recursive: true, force: true })
+    await fs.rename(moved, target)
+  }
+  const foreign = path.join(job.reservationPath, "foreign.txt")
+  await fs.writeFile(foreign, "preserve")
+  await assert.rejects(f.service.retire(job.jobId), { code: "render_retire_refused" })
+  assert.equal((await f.service.status(job.jobId)).state, "unknown")
+  assert.equal(await fs.readFile(foreign, "utf8"), "preserve")
+  assert.equal(await exists(path.join(job.reservationPath, "owner.json")), true)
+})
+
+test("retirement: durable terminal records survive shutdown until a restarted service explicitly expires them", async t => {
+  const f = await setup(t)
+  const job = await f.service.submit(f.input)
+  await f.finish(job.jobId)
+  await f.service.close()
+  assert.equal(await exists(path.join(f.jobDir(job.jobId), "receipt.json")), true)
+  assert.equal(await exists(job.logPath), true)
+  const recovered = await f.open()
+  const preview = await recovered.retire(job.jobId)
+  await recovered.close()
+  const next = await f.open()
+  assert.equal((await next.retire(job.jobId, { approval: preview.approval })).retired, true)
+  assert.equal(await exists(f.input.outputPath), true)
+})
+
+test("retirement: lifetime guard reports partial deletion honestly and preserves remaining records", async t => {
+  const f = await setup(t)
+  const job = await f.service.submit(f.input)
+  await f.finish(job.jobId)
+  const preview = await f.service.retire(job.jobId)
+  let checks = 0
+  await assert.rejects(f.service.retire(job.jobId, {
+    approval: preview.approval,
+    check() {
+      if (++checks === 4) throw Object.assign(new Error("Session released"), { code: "aborted" })
+    },
+  }), error => {
+    assert.equal(error.code, "render_retire_partial")
+    assert.equal(error.details.retired, false)
+    assert.equal(error.details.cause, "aborted")
+    assert.deepEqual(error.details.removed, [path.join(job.stageDir, "movie.mov")])
+    return true
+  })
+  assert.equal(await exists(path.join(f.jobDir(job.jobId), "manifest.json")), true)
+  assert.equal(await exists(job.logPath), true)
+  assert.equal(await exists(job.checkpoint.path), true)
+  assert.equal(await exists(job.reservationPath), true)
+  assert.equal(await fs.readFile(job.outputPath, "utf8"), "rendered bytes")
+  assert.equal(await fs.readFile(f.checkpoint.path, "utf8"), "immutable test checkpoint")
+  await assert.rejects(f.service.retire(job.jobId, { approval: preview.approval }), { code: "render_retire_refused" })
+})
+
+test("retirement: real process exit leaves a non-replayable plan and restart never deletes remnants", async t => {
+  const f = await setup(t)
+  const job = await f.service.submit(f.input)
+  await f.finish(job.jobId)
+  await f.service.close()
+  const rendererURL = new URL("../src/render.mjs", import.meta.url).href
+  const script = `import { createRenderer } from ${JSON.stringify(rendererURL)};
+    const service = await createRenderer({
+      dataDir: ${JSON.stringify(f.base)},
+      grants: { check() { throw Error("unused"); } },
+      checkpoints: { verify() { throw Error("unused"); } },
+      processAdapter: { inspect: async () => null, discover: async () => [] }
+    });
+    const preview = await service.retire(${JSON.stringify(job.jobId)});
+    let checks = 0;
+    await service.retire(preview.jobId, { approval: preview.approval, check() {
+      if (++checks === 4) { process.stdout.write("partial"); process.exit(0); }
+    }});`
+  const child = await exec(process.execPath, ["--input-type=module", "-e", script], { timeout: 30000 })
+  assert.equal(child.stdout, "partial")
+  const recoveryPath = path.join(path.dirname(f.jobDir(job.jobId)), "." + job.jobId + ".retirement")
+  const planPath = path.join(recoveryPath, "plan.json")
+  const plan = await load(planPath)
+  assert.match(plan.remediation, /Never replay/)
+  const first = plan.entries[0]
+  assert.equal(first.path, path.join(job.stageDir, "movie.mov"))
+  assert.equal(await exists(first.path), false)
+  assert.equal(await exists(first.claim), false)
+  const receipt = await signature(path.join(f.jobDir(job.jobId), "receipt.json"))
+  const log = await signature(job.logPath)
+  const before = await fs.readFile(planPath, "utf8")
+  for (let restart = 0; restart < 2; restart++) {
+    const service = await f.open()
+    assert.equal((await service.status(job.jobId)).reason, "render_retire_partial")
+    assert.equal((await service.result(job.jobId)).verified, false)
+    assert.equal((await service.list())[0].remediation, "manual_retirement_recovery_required")
+    await assert.rejects(service.retire(job.jobId), { code: "render_retire_refused" })
+    await assert.rejects(service.cancel(job.jobId), { code: "render_process_identity" })
+    await assert.rejects(runWorker(f.jobDir(job.jobId), f.adapter), { code: "render_retire_refused" })
+    assert.deepEqual(await signature(path.join(f.jobDir(job.jobId), "receipt.json")), receipt)
+    assert.deepEqual(await signature(job.logPath), log)
+    assert.equal(await fs.readFile(planPath, "utf8"), before)
+    await service.close()
+  }
+  // Manual remediation in a stopped fixture: reconstruct this one known hard
+  // link from the preserved output, verifying the original identity, not copying.
+  await fs.link(job.outputPath, first.path)
+  assert.deepEqual(await signature(first.path), first.signature)
+  assert.deepEqual((await fs.readdir(recoveryPath)).sort(), [".cookiemonster-storage-owner.json", "plan.json"])
+  await fs.unlink(planPath)
+  await fs.unlink(path.join(recoveryPath, ".cookiemonster-storage-owner.json"))
+  await fs.rmdir(recoveryPath)
+  const remediated = await f.open()
+  const fresh = await remediated.retire(job.jobId)
+  assert.equal((await remediated.retire(job.jobId, { approval: fresh.approval })).retired, true)
+  assert.equal(await fs.readFile(job.outputPath, "utf8"), "rendered bytes")
+})
+
+test("retirement: corrupt plan without a job directory is visible and never interpreted as deletion authority", async t => {
+  const f = await setup(t)
+  const id = randomUUID(), jobDir = f.jobDir(id)
+  const pending = path.join(path.dirname(jobDir), "." + id + ".retirement")
+  await fs.mkdir(pending)
+  await fs.writeFile(path.join(pending, "plan.json"), "{broken")
+  await fs.writeFile(path.join(pending, "foreign"), "preserve")
+  const service = await f.open()
+  assert.equal((await service.status(id)).reason, "render_retire_partial")
+  assert.equal((await service.list())[0].jobId, id)
+  await assert.rejects(service.retire(id), { code: "render_retire_refused" })
+  assert.equal(await fs.readFile(path.join(pending, "foreign"), "utf8"), "preserve")
+  assert.equal(await fs.readFile(path.join(pending, "plan.json"), "utf8"), "{broken")
+  assert.equal(await exists(jobDir), false)
+})
+
+test("retirement: marker-present socket contention isolates busy job during startup and list", { timeout: 120000 }, async t => {
+  const f = await setup(t)
+  const blocked = await f.service.submit(f.input)
+  await f.finish(blocked.jobId)
+  const healthyOutput = path.join(f.output, "healthy")
+  await fs.mkdir(healthyOutput)
+  const healthy = await f.service.submit({ ...f.input, outputPath: path.join(healthyOutput, "movie.mov") })
+  await f.started(healthy.jobId)
+  await f.service.close()
+  const jobDir = f.jobDir(blocked.jobId)
+  const marker = path.join(path.dirname(jobDir), "." + blocked.jobId + ".retirement")
+  await fs.mkdir(marker)
+  await fs.writeFile(path.join(marker, "plan.json"), "{broken")
+  await fs.writeFile(path.join(marker, "claim-0"), "preserve")
+  const preserved = [
+    path.join(marker, "plan.json"), path.join(marker, "claim-0"),
+    path.join(jobDir, "manifest.json"), path.join(jobDir, "observation.json"),
+    path.join(jobDir, "receipt.json"), blocked.logPath, blocked.checkpoint.path,
+    path.join(blocked.reservationPath, "owner.json"), path.join(blocked.stageDir, "movie.mov"),
+    blocked.outputPath, f.checkpoint.path,
+  ]
+  const before = await Promise.all(preserved.map(signature))
+  let restarted
+  // Exercise the real 30-second socket timeout twice, without bypassing the gate.
+  await withJobLock(jobDir, async () => {
+    restarted = await f.open()
+    const jobs = await restarted.list()
+    assert.equal(jobs.length, 2)
+    assert.deepEqual(jobs.find(job => job.jobId === blocked.jobId), {
+      jobId: blocked.jobId, state: "unknown", reason: "render_busy", deliverables: [], controllable: false,
+    })
+    assert.equal(jobs.find(job => job.jobId === healthy.jobId).state, "running")
+    assert.deepEqual(await Promise.all(preserved.map(signature)), before)
+    assert.deepEqual((await fs.readdir(marker)).sort(), ["claim-0", "plan.json"])
+    assert.equal(f.killed.length, 0)
+  })
+  const jobs = await restarted.list()
+  assert.equal(jobs.length, 2)
+  assert.deepEqual(jobs.find(job => job.jobId === blocked.jobId), {
+    jobId: blocked.jobId, state: "unknown", reason: "render_retire_partial",
+    controllable: false, deliverables: [], remediation: "manual_retirement_recovery_required",
+  })
+  await assert.rejects(restarted.cancel(blocked.jobId), { code: "render_process_identity" })
+  await assert.rejects(restarted.retire(blocked.jobId), { code: "render_retire_refused" })
+  assert.deepEqual(await Promise.all(preserved.map(signature)), before)
+  assert.equal(f.killed.length, 0)
+  await f.finish(healthy.jobId)
+  assert.equal((await restarted.result(healthy.jobId)).verified, true)
+})
+
+test("access gate: real child exit releases the gate and restart recovers a healthy render", async t => {
+  const f = await setup(t)
+  const job = await f.service.submit(f.input)
+  await f.started(job.jobId)
+  const moduleURL = new URL("../src/render-worker.mjs", import.meta.url).href
+  const script = `import { withJobLock } from ${JSON.stringify(moduleURL)};
+    await withJobLock(${JSON.stringify(f.jobDir(job.jobId))}, async () => {
+      process.stdout.write("gate-held");
+      process.exit(0);
+    });`
+  const child = await exec(process.execPath, ["--input-type=module", "-e", script])
+  assert.equal(child.stdout, "gate-held")
+  await f.service.close()
+  const restarted = await f.open()
+  assert.equal((await restarted.status(job.jobId)).state, "running")
+  await f.finish(job.jobId)
+  assert.equal((await restarted.status(job.jobId)).state, "completed")
+})
+
+test("access gate: concurrent holders serialize; legacy unknown ownership is never reaped", async t => {
+  const f = await setup(t)
+  const jobDir = f.jobDir(randomUUID())
+  let inside = 0, peak = 0
+  await Promise.all(Array.from({ length: 8 }, () => withJobLock(jobDir, async () => {
+    inside++; peak = Math.max(peak, inside)
+    await delay(15)
+    inside--
+  })))
+  assert.equal(peak, 1)
+  const legacy = path.join(path.dirname(jobDir), "." + path.basename(jobDir) + ".access-lock")
+  await fs.mkdir(legacy)
+  await fs.writeFile(path.join(legacy, "foreign"), "preserve")
+  await assert.rejects(withJobLock(jobDir, () => assert.fail("unknown holder admitted")), { code: "render_busy" })
+  assert.equal(await fs.readFile(path.join(legacy, "foreign"), "utf8"), "preserve")
+})
+
+for (const swap of ["file", "parent"]) {
+  test(`retirement: final guard replacement of ${swap} preserves both objects`, async t => {
+    const f = await setup(t)
+    const job = await f.service.submit(f.input)
+    await f.finish(job.jobId, { code: 7 })
+    const preview = await f.service.retire(job.jobId)
+    const target = path.join(job.quarantineDir, "movie.mov")
+    const moved = path.join(f.base, "original")
+    let checks = 0
+    await assert.rejects(f.service.retire(job.jobId, {
+      approval: preview.approval,
+      check() {
+        if (++checks !== 3) return
+        if (swap === "parent") {
+          syncFS.renameSync(job.quarantineDir, moved)
+          syncFS.mkdirSync(job.quarantineDir)
+        } else syncFS.renameSync(target, moved)
+        syncFS.writeFileSync(target, "foreign replacement")
+      },
+    }), error => ["render_retire_refused", "render_retire_partial"].includes(error.code))
+    assert.equal(await fs.readFile(swap === "parent" ? path.join(moved, "movie.mov") : moved, "utf8"), "rendered bytes")
+    // A protected claim may relocate the replacement, but must never erase it.
+    const pending = path.join(path.dirname(f.jobDir(job.jobId)), "." + job.jobId + ".retirement")
+    if (await exists(target)) assert.equal(await fs.readFile(target, "utf8"), "foreign replacement")
+    else {
+      const plan = await load(path.join(pending, "plan.json"))
+      const entry = plan.entries.find(entry => entry.path === target)
+      assert.equal(await fs.readFile(entry.claim, "utf8"), "foreign replacement")
+    }
+  })
+}
 
 test("native OS identity smoke check, not aerender certification", { skip: !["win32", "darwin"].includes(process.platform) }, async () => {
   const adapter = createProcessAdapter()

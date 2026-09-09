@@ -499,11 +499,14 @@ test("checkpoint byte corruption blocks verify and restore without touching cano
   assert.equal(await fs.readFile(f.projectPath, "utf8"), "original project bytes\0\n")
 })
 
-test("restore atomically replaces the canonical project and leaves the checkpoint intact", async t => {
+test("restore exclusively publishes the canonical project and retains original and checkpoint", async t => {
   const f = await fixture(t)
   const manifest = await f.store.create(f.args)
   await fs.writeFile(f.projectPath, "new current project")
-  assert.deepEqual(await f.store.restore(manifest.id, { canonicalPath: f.projectPath }), { path: f.projectPath, recoveryCopy: false })
+  const restored = await f.store.restore(manifest.id, { canonicalPath: f.projectPath })
+  assert.equal(restored.path, f.projectPath)
+  assert.equal(restored.recoveryCopy, false)
+  assert.equal(await fs.readFile(restored.originalPath, "utf8"), "new current project")
   assert.deepEqual(await fs.readFile(f.projectPath), await fs.readFile(manifest.path))
   await f.store.remove(manifest.id)
   assert.equal(await fs.readFile(f.projectPath, "utf8"), "original project bytes\0\n")
@@ -515,7 +518,7 @@ test("failed canonical rename keeps current bytes and persists in-use recovery p
   await fs.writeFile(f.projectPath, "keep current bytes")
   const rename = fs.rename.bind(fs)
   const mock = t.mock.method(fs, "rename", async (source, destination) => {
-    if (destination === f.projectPath) throw Object.assign(new Error("locked"), { code: "EACCES" })
+    if (source === f.projectPath) throw Object.assign(new Error("locked"), { code: "EACCES" })
     return rename(source, destination)
   })
   const result = await f.store.restore(manifest.id, { canonicalPath: f.projectPath })
@@ -730,7 +733,7 @@ test("failed protection release remains durable and recovery protection can be e
   await restarted.protect(saved.id, "render-job", false)
   await fs.writeFile(f.projectPath, "keep current")
   const failure = t.mock.method(fs, "rename", async (source, destination) => {
-    if (destination === f.projectPath) throw Object.assign(new Error("locked"), { code: "EACCES" })
+    if (source === f.projectPath) throw Object.assign(new Error("locked"), { code: "EACCES" })
     return rename(source, destination)
   })
   assert.equal((await restarted.restore(saved.id, { canonicalPath: f.projectPath })).recoveryCopy, true)
@@ -798,10 +801,65 @@ test("restore verifies the entire staged snapshot and preserves the current orig
   await assert.rejects(f.store.restore(saved.id, { canonicalPath: f.projectPath }), typed("checkpoint_corrupt"))
   assert.deepEqual(await fs.readFile(f.projectPath), current)
   await fs.writeFile(saved.path, snapshot)
-  assert.deepEqual(await f.store.restore(saved.id, { canonicalPath: f.projectPath }), {
-    path: f.projectPath, recoveryCopy: false,
-  })
+  const restored = await f.store.restore(saved.id, { canonicalPath: f.projectPath })
+  assert.equal(restored.path, f.projectPath)
+  assert.equal(restored.recoveryCopy, false)
+  assert.deepEqual(await fs.readFile(restored.originalPath), current)
   assert.deepEqual(await fs.readFile(f.projectPath), snapshot)
+})
+
+test("restore retains last-moment original edits and never clobbers a new destination", async t => {
+  for (const mode of ["before_move", "before_publish", "publish_failed"]) {
+    const f = await fixture(t)
+    const saved = await f.store.create(f.args)
+    await fs.writeFile(f.projectPath, "approved current")
+    const expectedDestination = { ...await fs.stat(f.projectPath),
+      hash: createHash("sha256").update("approved current").digest("hex") }
+    const rename = fs.rename.bind(fs), link = fs.link.bind(fs)
+    const moving = t.mock.method(fs, "rename", async (source, destination) => {
+      if (source === f.projectPath && mode === "before_move") await fs.writeFile(source, "last moment edit")
+      return rename(source, destination)
+    })
+    const publishing = t.mock.method(fs, "link", async (source, destination) => {
+      if (path.basename(source).startsWith(".cookiemonster-restore-")) {
+        if (mode === "before_publish") await fs.writeFile(destination, "new destination")
+        if (mode === "publish_failed") throw Object.assign(new Error("publication denied"), { code: "EACCES" })
+      }
+      return link(source, destination)
+    })
+    const result = await f.store.restore(saved.id, { canonicalPath: f.projectPath,
+      expectedCheckpoint: saved, expectedDestination })
+    moving.mock.restore()
+    publishing.mock.restore()
+    assert.equal(result.recoveryCopy, true, mode)
+    assert.equal(await fs.readFile(result.originalPath, "utf8"),
+      mode === "before_move" ? "last moment edit" : "approved current")
+    assert.equal(await fs.readFile(f.projectPath, "utf8"),
+      mode === "before_move" ? "last moment edit" : mode === "before_publish" ? "new destination" : "approved current")
+    assert.equal((await f.store.verify(saved.id)).inUse, true)
+  }
+})
+
+test("restore revalidates exact approved source and destination before changing either", async t => {
+  const f = await fixture(t)
+  const saved = await f.store.create(f.args)
+  const before = await fs.readFile(f.projectPath)
+  for (const code of ["stale_fingerprint", "outcome_uncertain", "proposal_expired"]) {
+    await assert.rejects(f.store.restore(saved.id, { canonicalPath: f.projectPath,
+      expectedCheckpoint: saved, beforeReplace: async () => { throw new AEError(code, "Host guard failed") } }), { code })
+    assert.deepEqual(await fs.readFile(f.projectPath), before)
+    assert.ok(!(await fs.readdir(f.projects)).some(name => name.startsWith(".cookiemonster-original-")))
+  }
+  await assert.rejects(f.store.restore(saved.id, { canonicalPath: f.projectPath,
+    expectedCheckpoint: { ...saved, createdAt: new Date(0).toISOString() } }), { code: "checkpoint_changed" })
+  const expectedDestination = { ...await fs.stat(f.projectPath), hash: saved.hash }
+  await fs.writeFile(f.projectPath, "external edit before queued restore")
+  const result = await f.store.restore(saved.id, { canonicalPath: f.projectPath,
+    expectedCheckpoint: saved, expectedDestination })
+  assert.equal(result.recoveryCopy, true)
+  assert.equal(result.cause, "checkpoint_changed")
+  assert.equal(await fs.readFile(f.projectPath, "utf8"), "external edit before queued restore")
+  assert.deepEqual(await fs.readFile(saved.path), before)
 })
 
 test("restore preserves a concurrent host edit instead of replacing it", async t => {

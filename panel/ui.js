@@ -2,7 +2,11 @@
 (function () {
     "use strict";
     function el(id) { return document.getElementById(id); }
-    var client, host, store, api, working = false, checkpoints = [], serviceContext = "", diagnosticURL = null, serviceTimer, restoreOperation = null;
+    var client, host, store, api, working = false, checkpoints = [], serviceContext = "", diagnosticURL = null, serviceTimer, restoreOperation = null, restoreResult = "";
+    function serviceStatus(message) {
+        // Operation evidence is not current-project metadata; refreshes must not erase backup locations.
+        el("services-status").textContent=message+(restoreResult ? "\n\n"+restoreResult : "");
+    }
     function clearExport() {
         if(diagnosticURL)window.URL.revokeObjectURL(diagnosticURL);
         diagnosticURL=null;el("diagnostics-download").hidden=true;el("diagnostics-download").removeAttribute("href");
@@ -23,7 +27,7 @@
         ["services-refresh","diagnostics"].forEach(function(id){el(id).disabled=working || client.panelPending || s.connection!=="connected";});
     }
     function serviceError(e) {
-        el("services-status").textContent=(e.code || "panel_error")+": "+(["not_found","unsupported_action","unsupported_method"].indexOf(e.code)>=0 ? "This bridge build does not provide the requested panel service." : (e.message || "Bridge service failed"));
+        serviceStatus((e.code || "panel_error")+": "+(["not_found","unsupported_action","unsupported_method"].indexOf(e.code)>=0 ? "This bridge build does not provide the requested panel service." : (e.message || "Bridge service failed")));
         problem(e);
     }
     function refreshServices() {
@@ -50,13 +54,28 @@
             }).catch(function(e){failures.push(e);});
         }).then(function(){
             if(failures.length){el("services-auto").checked=false;serviceError(failures[0]);}
-            else if(requested===client.context())el("services-status").textContent="Checkpoint and render metadata refreshed.";
+            else if(requested===client.context())serviceStatus("Checkpoint and render metadata refreshed.");
         });
     }
     function problem(e) { el("error").textContent = (e.code || "panel_error") + ": " + (e.message || "Panel failed"); }
     function render(s) {
         el("status").textContent = s.connection + (s.uncertain ? " / OUTCOME UNCERTAIN: DO NOT RETRY" : "");
-        el("versions").textContent = "Panel 0.1.0 / Bridge " + (s.bridgeVersion || "unknown") + " / AE " + (s.aeVersion || "unknown");
+        var compatibility=null;
+        try { if(s.compatibility)compatibility=api.compatibilityMetadata(s.compatibility); } catch(ignore) {}
+        el("versions").textContent="Panel "+api.VERSION+" / Bridge Plugin "+(compatibility ? compatibility.pluginVersion : s.bridgeVersion || "unknown")+
+            " / CookieMonster Desktop "+(compatibility && compatibility.cookieMonsterVersionStatus==="configured" ? compatibility.cookieMonsterVersion : "not configured")+
+            " / AE "+(s.aeVersion || "unknown");
+        el("compatibility-status").textContent=s.connection==="incompatible" ? "Incompatible: automation stopped. Install matching versions, then reconnect." :
+            compatibility ? "Panel/bridge compatibility: "+compatibility.status : "Compatibility not checked. Pair with a valid code or reconnect.";
+        ["plugin","panel","cookieMonster"].forEach(function(key){
+            var link=el("update-"+key),update=compatibility && compatibility.updates[key],configured=update && update.status==="configured";
+            link.removeAttribute("href");link.hidden=!configured;
+            el("update-"+key+"-status").textContent=configured ? "Configured for "+update.version+" / protocol "+update.protocol : "not configured";
+            if(configured)link.href=update.url;
+        });
+        var source=el("release-source");
+        source.removeAttribute("href");source.hidden=!compatibility;
+        if(compatibility)source.href=compatibility.releaseSourceUrl;
         el("project").textContent = s.project ? (s.project.saved ? s.project.path : "Unsaved; writes disabled") : "Unknown";
         el("binding").textContent = s.binding ? s.binding.sessionID + " (" + s.binding.state + ")" : "Unbound; bind in chat";
         el("lock").textContent = s.uncertain ? "Local uncertain latch; durable lock requires chat reconciliation" : s.lock ? s.lock.state : "No bridge lock reported";
@@ -65,12 +84,14 @@
         el("preference").textContent = s.capabilities.fileNetwork ? "Enabled. Preference left unchanged." : "Disabled or unreadable. File operations and capture unavailable; inspection remains available.";
         if (s.lastError) el("error").textContent = s.lastError;
         ["pair","connect","disconnect","rotate","unpair","idle"].forEach(function (id) { el(id).disabled = working || s.busy || s.uncertain; });
-        el("reconcile").disabled = working || !s.uncertain || host.pending;
+        el("rotate").disabled = el("rotate").disabled || s.connection==="incompatible" || compatibility && compatibility.status==="incompatible";
+        el("recover-credential").disabled = working || client.recovering || client.panelPending || host.pending || s.busy && !s.uncertain || !store.state.credential;
+        el("reconcile").disabled = working || client.recovering || !s.uncertain || host.pending || s.connection==="incompatible";
         el("idle").disabled = true;
         var context=client.context();
         if(context!==serviceContext){
             serviceContext=context;checkpoints=[];el("checkpoint").textContent="";
-            el("renders").textContent="";el("services-status").textContent="Binding changed. Refresh bridge metadata.";
+            el("renders").textContent="";serviceStatus("Binding changed. Refresh bridge metadata.");
             clearExport();
         }
         checkpointState();
@@ -80,14 +101,12 @@
         working = true; el("error").textContent = "";
         Promise.resolve().then(fn).catch(problem).then(function () { working = false; render(client.state); });
     }
-    try {
-        if (!window.__adobe_cep__ || typeof window.__adobe_cep__.evalScript !== "function") throw {code:"cep_required",message:"Open this extension inside After Effects 25 or 26."};
-        var nodeRequire = window.cep_node ? window.cep_node.require : require;
-        var path = nodeRequire("path"), url = nodeRequire("url");
-        var filename = decodeURIComponent(url.parse(window.location.href).pathname);
-        if (/^\/[A-Za-z]:/.test(filename)) filename = filename.slice(1);
-        api = nodeRequire(path.join(path.dirname(filename),"transport.cjs"));
-        store = new api.Store();
+    function openProfile() {
+        if (store) return;
+        try {
+        store = new api.Store(undefined,el("profile").value);
+        el("profile").disabled=true;el("profile-open").disabled=true;
+        el("profile-status").textContent="Profile: "+store.profile+". Reuse this exact name after reopening or restarting AE. Close this panel to select another profile.";
         host = new api.HostRPC(window.__adobe_cep__,25000,function (method,value) {
             if (method === "capture" && value.result) {
                 try { api.cleanupCapture(value.result); } catch (e) { problem(e); }
@@ -104,28 +123,27 @@
                 });});
             });
         }});
-        // Preserve the exact review text before transport projects the response to timestamps.
-        // Transport still owns authentication, binding checks and the single-use token.
-        var request=client.request;
-        client.request=function(descriptor,credential,endpoint,body,timeout){
-            return request(descriptor,credential,endpoint,body,timeout).then(function(response){
-                if(endpoint==="/panel" && body.action==="checkpoint.restore.propose"){
-                    var operation=response && response.result && response.result.operation;
-                    if(typeof operation!=="string" || !operation.trim() || operation.length>65536)
-                        throw {code:"invalid_response",message:"Bridge did not provide a bounded restore operation to review"};
-                    restoreOperation=operation;
-                }
-                return response;
-            });
-        };
         render(client.state);
         el("pair-form").addEventListener("submit",function(e){
             e.preventDefault();var code=el("code").value.trim();el("code").value="";
             action(function(){client.stop();return client.pair(code).then(function(){client.start();});});
         });
-        el("connect").addEventListener("click",function(){action(function(){client.start();});});
+        el("connect").addEventListener("click",function(){action(function(){client.stop();return client.connect().then(function(){client.start();});});});
         ["disconnect","rotate","unpair"].forEach(function(id){
             el(id).addEventListener("click",function(){action(function(){return client.management("/"+id);});});
+        });
+        el("recover-credential").addEventListener("click",function(){
+            var code=el("code").value.trim();el("code").value="";
+            if(working || !window.confirm("Recover the invalid credential for profile "+store.profile+"? This revokes its server credential using the fresh chat code. Panel identity, uncertain latch and durable locks are retained. Automation stays stopped; reconnect and rebind separately."))return;
+            action(function(){
+                el("credential-recovery-status").textContent="Checking credential recovery. Identity, uncertain latch and durable locks will be retained.";
+                return client.recoverCredential(code).then(function(){
+                    el("credential-recovery-status").textContent="Credential recovered for this profile. Automation remains stopped. Inspect AE and clear any local latch separately, then reconnect, rebind and review durable locks in chat.";
+                },function(e){
+                    el("credential-recovery-status").textContent="Credential recovery not confirmed. Preserve this profile and all recovery state. Correct the reported problem; if the credential remains invalid, use a fresh chat code for explicit recovery.";
+                    throw e;
+                });
+            });
         });
         el("reconcile").addEventListener("click",function(){action(function(){return client.reconcile();});});
         el("checkpoint").addEventListener("change",function(){client.restoreApproval=null;checkpointState();});
@@ -146,7 +164,8 @@
             action(function(){
                 client.restoreApproval=null;restoreOperation=null;
                 return client.panel("checkpoint.restore.propose",{id:c.id}).then(function(r){
-                    if(!restoreOperation || !client.restoreApproval)throw {code:"invalid_response",message:"Restore review is unavailable"};
+                    if(!client.restoreApproval)throw {code:"invalid_response",message:"Restore review is unavailable"};
+                    restoreOperation=r.operation;
                     el("restore-details").textContent="Checkpoint "+c.id+" / source: "+new Date(r.sourceTimestamp).toLocaleString()+" / destination: "+(r.destinationTimestamp === null ? "Not present" : new Date(r.destinationTimestamp).toLocaleString());
                     el("restore-operation").textContent=restoreOperation;
                     el("restore-review").hidden=false;el("restore-cancel").focus();
@@ -156,12 +175,19 @@
         el("restore-confirm").addEventListener("click",function(){
             action(function(){
                 if(!restoreOperation || !client.restoreApproval)throw {code:"invalid_token",message:"Review the exact restore operation first"};
+                var session=client.state.binding.sessionID;
                 client.start();
-                return client.confirmRestore().then(function(){
-                    el("services-status").textContent="Restore confirmed. Inspect AE; if a recovery copy opened, Save As to the intended path. Explicitly rebind and review reconciliation in chat before further automation.";
+                return client.confirmRestore().then(function(r){
+                    restoreResult="Last Restore Result / Session "+session+" / checkpointId: "+r.checkpointId+
+                        "\n"+r.warning+"\ncurrentCheckpointId: "+r.currentCheckpointId+"\nemergencyPath: "+r.emergencyPath+
+                        "\noriginalPath: "+(r.originalPath || "Not returned; inspect canonicalPath")+
+                        "\npath: "+r.path+"\ncanonicalPath: "+r.canonicalPath+
+                        "\ncanonicalReplaced: "+r.canonicalReplaced+"\nrebindRequired: "+r.rebindRequired+
+                        "\nautomationSuspended: "+r.automationSuspended+(r.cleanup ? "\n"+r.cleanup : "");
+                    serviceStatus("Restore completed. Inspect AE and retain the disclosed backups.");
                     checkpoints=[];el("checkpoint").textContent="";
                 }).catch(function(e){
-                    el("services-status").textContent="Restore not confirmed ("+(e.code || "panel_error")+"). Do not retry; inspect AE and reconcile in chat.";
+                    serviceStatus("Restore not confirmed ("+(e.code || "panel_error")+"). Do not retry; inspect AE and reconcile in chat.");
                     problem(e);
                 });
             });
@@ -173,7 +199,7 @@
                 return client.panel("diagnostics",{}).then(function(metadata){
                     diagnosticURL=window.URL.createObjectURL(new Blob([JSON.stringify(metadata,null,2)],{type:"application/json"}));
                     el("diagnostics-download").href=diagnosticURL;el("diagnostics-download").hidden=false;el("diagnostics-download").focus();
-                    el("services-status").textContent="Bridge metadata prepared. Click Save Metadata JSON to download.";
+                    serviceStatus("Bridge metadata prepared. Click Save Metadata JSON to download.");
                 }).catch(serviceError);
             });
         });
@@ -183,10 +209,41 @@
         window.addEventListener("beforeunload",function(){
             clearInterval(serviceTimer);clearExport();client.restoreApproval=null;
             client.stop();
-            if (client.descriptor && store.state.credential) client.send("/disconnect",{}).catch(function(){});
-            store.close();
+            // Unload cannot await HTTP: a late disconnect could suspend a reopened profile.
+            // The bridge suspends on heartbeat expiry; use Disconnect for an acknowledged close.
         });
         if (store.state.credential && !store.state.uncertain) client.start();
-        else if (!store.state.uncertain) client.status().catch(problem);
+        // Unpaired panels need a valid code before negotiation or host startup.
+        } catch (e) {
+            problem(e);el("status").textContent="Panel unavailable";
+            // A failed initialization never selects a different profile or resets its latch.
+            if (store) { el("profile-status").textContent="Initialization failed. Close and reopen this panel with the same profile."; }
+        }
+    }
+    try {
+        var cep=window.__adobe_cep__;
+        if (!cep || typeof cep.evalScript !== "function" || typeof cep.getHostEnvironment !== "function" || typeof cep.getSystemPath !== "function") throw {code:"cep_required",message:"Open this extension inside After Effects 25 or 26."};
+        // Adobe CEP 12 CSInterface: HostEnvironment identifies the application, not a persistent launch.
+        // https://github.com/Adobe-CEP/CEP-Resources/blob/master/CEP_12.x/CSInterface.js
+        var raw=cep.getHostEnvironment();
+        if (typeof raw !== "string" || raw.length>65536) throw {code:"invalid_host",message:"Invalid CEP host environment"};
+        var environment=JSON.parse(raw);
+        if (!environment || environment.appId!=="AEFT" || typeof environment.appVersion!=="string" || !/^(25|26)\./.test(environment.appVersion)) throw {code:"invalid_host",message:"This panel requires After Effects 25 or 26"};
+        var nodeRequire=window.cep_node ? window.cep_node.require : require;
+        var path=nodeRequire("path"),url=nodeRequire("url"),extension=cep.getSystemPath("extension");
+        if (typeof extension!=="string" || extension.length>32768) throw {code:"invalid_host",message:"Invalid CEP extension path"};
+        if (/^file:/i.test(extension)) {
+            var parsed=new url.URL(extension);
+            if (parsed.host || parsed.search || parsed.hash) throw {code:"invalid_host",message:"Extension must be a local installed directory"};
+            extension=url.fileURLToPath(extension);
+        } else extension=decodeURI(extension);
+        if (!path.isAbsolute(extension) || /^[\\/]{2}/.test(extension) || extension.indexOf("\0")>=0 || extension.split(/[\\/]/).indexOf("..")>=0) throw {code:"invalid_host",message:"CEP extension path must be absolute and local, without traversal"};
+        api=nodeRequire(path.join(extension,"transport.cjs"));
+        if (!el("profile-form") || !el("profile") || !el("profile-open") || !el("profile-status")) throw {code:"profile_ui_required",message:"Install the matching panel HTML with explicit profile selection"};
+        ["pair","connect","disconnect","rotate","unpair","idle","reconcile","services-refresh","diagnostics"].forEach(function(id){el(id).disabled=true;});
+        el("status").textContent="Select a profile before connecting";
+        el("profile-status").textContent="AE "+environment.appVersion+". Each simultaneous AE instance needs a different profile. Select legacy only to use the previous shared pairing.";
+        el("profile-form").addEventListener("submit",function(e){e.preventDefault();el("error").textContent="";openProfile();});
+        window.addEventListener("unload",function(){if(store)store.close();});
     } catch (e) { problem(e); el("status").textContent = "Panel unavailable"; }
 }());

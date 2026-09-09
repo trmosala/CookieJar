@@ -57,7 +57,8 @@ test("bundled config preserves browser entries/policy, isolates invalid artifact
   assert.equal(defaults.ae_templates, "ask");
   assert.equal(defaults.ae_render_list, "allow");
   assert.equal(defaults.ae_render_recover, "ask");
-  const renderPolicy = { ae_templates: "deny", ae_render_list: "ask", ae_render_recover: "deny" };
+  assert.equal(defaults.ae_render_retire, "ask");
+  const renderPolicy = { ae_templates: "deny", ae_render_list: "ask", ae_render_recover: "deny", ae_render_retire: "deny" };
   const overridden = await mergeBundledPlugins({ permission: renderPolicy }, [artifact]);
   for (const [name, value] of Object.entries(renderPolicy)) assert.equal(overridden.config.permission[name], value);
   assert.equal(defaults.ae_raw_enable, "deny");

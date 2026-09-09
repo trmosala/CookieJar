@@ -740,12 +740,24 @@ var CookieMonsterAE = (function () {
             if(result.status==="complete")transaction=null;
             return result;
         }
-        object(p,p.phase==="recovery_prepare" ? "phase transaction recoveryId expected path" : "phase transaction recoveryId expected verifiedCheckpoint","phase transaction recoveryId expected");
+        if(p.phase==="restore_prepare"){
+            object(p,"phase transaction recoveryId expected path","phase transaction recoveryId expected path");
+            ready(true);
+            if(recovery || transaction)fail("unsafe_state","Another transaction requires recovery");
+            str(p.recoveryId,"restore id");
+            var approved=inspect();
+            if(stringify(p.expected)!==stringify(approved))fail("unsafe_state","Approved restore snapshot changed");
+            recovery={id:p.recoveryId,owner:owner(p.transaction),projectObject:app.project,project:project(),snapshot:stringify(approved),phase:"stopped",manual:true};
+            plan=null;
+        }
+        var preparing=p.phase==="recovery_prepare" || p.phase==="restore_prepare";
+        object(p,preparing ? "phase transaction recoveryId expected path" : (p.phase==="restore_finish" ? "phase transaction recoveryId expected verifiedCheckpoint path" : "phase transaction recoveryId expected verifiedCheckpoint"),"phase transaction recoveryId expected");
         var rec=recovery,identity=owner(p.transaction);
+        if(rec && !!rec.manual!==(p.phase==="restore_prepare" || p.phase==="restore_finish"))fail("unsafe_state","Recovery mode changed");
         if(!rec || rec.id!==p.recoveryId || (rec.owner && rec.owner!==identity) || app.project!==rec.projectObject || stringify(p.expected)!==rec.snapshot || stringify(inspect())!==rec.snapshot)
             fail("unsafe_state","Stopped snapshot changed; preserve current edits and recover manually");
         requireFiles();
-        if(p.phase==="recovery_prepare"){
+        if(preparing){
             if(rec.phase!=="stopped")fail("unsafe_state","Recovery prepare is single-use");
             str(p.path,"emergency path");
             var slash=String.fromCharCode(92),local=p.path.split(slash).join("/");
@@ -763,12 +775,13 @@ var CookieMonsterAE = (function () {
                 return {status:"recovery_saved",project:project(),snapshot:saved};
             }catch(saveError){uncertain=true;fail("uncertain_outcome","Emergency save failed; do not close or retry");}
         }
-        if(p.phase!=="recovery_finish" || rec.phase!=="saved")fail("invalid_payload","Unknown recovery phase");
+        if((p.phase!=="recovery_finish" && p.phase!=="restore_finish") || rec.phase!=="saved")fail("invalid_payload","Unknown recovery phase");
         object(p.verifiedCheckpoint,"id hash size","id hash size");str(p.verifiedCheckpoint.id,"checkpoint");
         if(!/^[a-f0-9]{64}$/.test(p.verifiedCheckpoint.hash))fail("invalid_payload","Verified emergency hash required");
         num(p.verifiedCheckpoint.size,1,9007199254740991,true);
         if(app.project.dirty!==false)fail("unsafe_state","Dirty or unknown state after emergency verification");
-        var canonicalFile=pathFile(rec.project.path);
+        var canonicalFile=pathFile(rec.manual ? p.path : rec.project.path);
+        if(!/[.]aepx?$/i.test(canonicalFile.fsName))fail("invalid_path","Expected a verified AE project");
         if(app.onError)fail("unsafe_state","Application error callback prevents automatic close");
         if(app.project!==rec.projectObject || stringify(inspect())!==rec.snapshot || app.project.dirty!==false)
             fail("unsafe_state","Current state changed before close");
@@ -779,7 +792,8 @@ var CookieMonsterAE = (function () {
             if(!app.project.close(CloseOptions.DO_NOT_SAVE_CHANGES))fail("unsafe_state","Project close was refused");
             if(!app.open(canonicalFile))fail("unsafe_state","Canonical reopen was refused");
             var restored=inspect();
-            if(stringify(restored.project)!==stringify(rec.project))fail("unsafe_state","Canonical identity did not return");
+            if(app.project.dirty!==false)fail("unsafe_state","Reopened project changed before confirmation");
+            if(rec.manual ? restored.project.path!==canonicalFile.fsName : stringify(restored.project)!==stringify(rec.project))fail("unsafe_state","Recovery identity did not return");
             recovery=null;transaction=null;
             return {status:"recovered",project:restored.project,snapshot:restored};
         }catch(closeError){uncertain=true;fail("uncertain_outcome","Recovery close/open could not be confirmed; emergency checkpoint retained");}
@@ -816,7 +830,7 @@ var CookieMonsterAE = (function () {
             if(busy)fail("busy","Host command already running");
             ready(false);
             if(recovery && request.method!=="status" && request.method!=="inspect" && request.method!=="reconcile" &&
-                !(request.method==="execute" && (p.phase==="recovery_prepare" || p.phase==="recovery_finish")))
+                !(request.method==="execute" && (p.phase==="recovery_prepare" || p.phase==="recovery_finish" || p.phase==="restore_prepare" || p.phase==="restore_finish")))
                 fail("unsafe_state","Stopped execution permits only inspected recovery");
             if(request.method==="status"){object(p,"");result={project:project(),activeCompId:app.project.activeItem instanceof CompItem ? app.project.activeItem.id : null,aeVersion:String(app.version),capabilities:capability(),busy:busy,uncertain:uncertain};}
             else if(request.method==="inspect"){object(p,"");result=inspect();}
@@ -850,7 +864,7 @@ var CookieMonsterAE = (function () {
             return text;
         } catch(e) {
             if(mutationStarted || (recovery && request && request.method==="execute" && p &&
-                (p.phase==="recovery_prepare" || p.phase==="recovery_finish"))){
+                (p.phase==="recovery_prepare" || p.phase==="recovery_finish" || p.phase==="restore_prepare" || p.phase==="restore_finish"))){
                 uncertain=true;return stringify({error:{code:"uncertain_outcome",message:"Execution or recovery could not be confirmed ("+(e.code || "host_error")+"); do not retry"}});
             }
             return stringify({error:{code:e.code || "host_error",message:String(e.message || e).substr(0,2048)}});

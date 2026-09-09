@@ -1,6 +1,56 @@
 import vm from "node:vm"
 import { readFileSync, writeFileSync, existsSync } from "node:fs"
 
+// Proposed parent bridge contract, not production bridge/transport qualification.
+export function manualRestoreBridge(dataDir, host) {
+  const state = { id: "manual-binding", connectionId: "manual-connection",
+    project: host.call("inspect").result.project, lock: null }
+  const events = []
+  const fail = code => { throw Object.assign(new Error(code), { code }) }
+  return {
+    canonicalRestore: true, dataDir, state, events, onRelease() {},
+    binding(sessionID, { allowLocked = false } = {}) {
+      if (sessionID !== "session") fail("not_bound")
+      if (state.lock && !allowLocked) fail("target_locked")
+      return structuredClone(state)
+    },
+    async lock(sessionID, reason) {
+      this.binding(sessionID)
+      state.lock = { id: "manual-lock", state: "executing", reason, project: structuredClone(state.project) }
+    },
+    async unlock() {
+      if (state.lock?.recoveryOriginal) fail("recovery_target_mismatch")
+      state.lock = null
+    },
+    async markUncertain() { if (state.lock) state.lock.state = "uncertain" },
+    async recordOutcome(sessionID, evidence) {
+      this.binding(sessionID, { allowLocked: true })
+      if (state.lock?.state !== "executing") fail("lock_required")
+      state.lock.evidence = structuredClone(evidence)
+    },
+    async call(sessionID, method, params = {}) {
+      this.binding(sessionID, { allowLocked: true })
+      events.push({ method, params: structuredClone(params) })
+      if (method === "execute") {
+        if (state.lock?.state !== "executing") fail("lock_required")
+        if (params.transaction.sessionID !== sessionID || params.transaction.bindingID !== state.id) fail("stale_binding")
+      }
+      const reply = host.call(method, params)
+      if (reply.error) {
+        if (reply.error.code === "uncertain_outcome") state.lock.state = "uncertain"
+        throw Object.assign(new Error(reply.error.message), { code: reply.error.code })
+      }
+      if (params.phase === "restore_prepare") state.lock.recoveryOriginal = structuredClone(state.project)
+      if (params.phase === "restore_prepare" || params.phase === "restore_finish") {
+        state.project = structuredClone(reply.result.project)
+        state.lock.project = structuredClone(state.project)
+        if (state.lock.recoveryOriginal.path === state.project.path) delete state.lock.recoveryOriginal
+      }
+      return reply.result
+    },
+  }
+}
+
 // Real host source, fake AE objects. This is not live-AE qualification.
 export function hostDouble(projectPath) {
   const PT = { PROPERTY: 1, INDEXED_GROUP: 2 }

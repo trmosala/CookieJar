@@ -29,6 +29,7 @@ export const AE_PERMISSIONS = Object.freeze({
   ae_render_submit: "ask",
   ae_render_status: "allow",
   ae_render_cancel: "ask",
+  ae_render_retire: "ask",
   ae_render_result: "allow",
   ae_diagnostics: "allow",
   ae_reconcile: "ask",

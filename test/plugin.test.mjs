@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import path from "node:path"
 import os from "node:os"
 import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises"
+import { runWorker, readJob, save, load, exists } from "../src/render-worker.mjs"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { randomUUID } from "node:crypto"
@@ -10,7 +11,7 @@ import plugin, { createRuntime, createTools, server, checkPermissionConfig } fro
 import { createBridge } from "../src/bridge.mjs"
 import { hash } from "../src/protocol.mjs"
 import { AE_PERMISSIONS } from "../src/config.mjs"
-import { panelFixture, simulatedHost } from "./bridge-panel.mjs"
+import { panelFixture, simulatedHost, request, restoreFixture } from "./bridge-panel.mjs"
 import transport from "../panel/transport.cjs"
 
 const exec = promisify(execFile)
@@ -27,7 +28,8 @@ async function fixture(t, options = {}) {
   let clock = Date.now()
   r = await createRuntime({ factories: { bridge: async () => p.bridge,
     ...(options.renderer ? { renderer: async () => options.renderer } : {}) },
-    permissionConfig: options.permissionConfig || permissionConfig, now: () => clock })
+    permissionConfig: options.permissionConfig || permissionConfig, now: () => clock,
+    processAdapter: options.processAdapter, aerenderPath: options.aerenderPath })
   p.state.items = [{ id: 1, kind: "comp", name: "Main", duration: 2, frameRate: 25 }]
   await writeFile(p.state.project.path, JSON.stringify(p.state))
   await p.start(async command => {
@@ -46,6 +48,43 @@ async function fixture(t, options = {}) {
   return { p, r, tools: createTools(r), advance(ms) { clock += ms } }
 }
 
+async function retirementFixture(t) {
+  const live = new Map(), workers = new Map()
+  let pid = 31000
+  const adapter = {
+    async inspect(pid) { return live.get(pid) ?? null },
+    async discover() { return [] },
+    async launch(jobDir) {
+      const identity = { pid: pid++, startTime: randomUUID(), executable: "node", command: "worker " + jobDir }
+      live.set(identity.pid, identity)
+      const task = runWorker(jobDir, {
+        ...adapter, self: async () => identity,
+        async start(command) {
+          const child = { pid: pid++, startTime: randomUUID(), executable: command.executable, command: JSON.stringify(command) }
+          await writeFile(command.args[command.args.indexOf("-output") + 1], "completed render")
+          return { pid: child.pid, identity: child, exited: Promise.resolve({ code: 0, signal: null, error: null }) }
+        },
+      }).finally(() => live.delete(identity.pid))
+      workers.set(path.basename(jobDir), task)
+    },
+  }
+  const f = await fixture(t, { processAdapter: adapter, aerenderPath: process.execPath,
+    permissionConfig: { permission: AE_PERMISSIONS } })
+  const outputDir = path.join(f.p.dataDir, "output")
+  await mkdir(outputDir)
+  await f.tools.ae_grant.execute({ path: outputDir, write: true, recursive: true }, context())
+  const submitted = JSON.parse(await f.tools.ae_render_submit.execute({
+    compId: 1, startFrame: 0, endFrame: 0, renderSettings: "Best", outputModule: "PNG",
+    outputPath: path.join(outputDir, "frame.png"),
+  }, context()))
+  await workers.get(submitted.jobId)
+  const jobDir = path.join(f.p.dataDir, "render", "jobs", submitted.jobId)
+  const job = await readJob(jobDir)
+  assert.equal((await f.r.renderer.status(job.jobId)).state, "completed")
+  await f.r.checkpoints.pin(job.sourceCheckpoint.id, true)
+  return { ...f, adapter, job, jobDir }
+}
+
 test("object module export is import-safe and exposes all strict raw-shape tools", async () => {
   assert.equal(plugin.id, "cm-ae")
   assert.equal(plugin.server, server)
@@ -54,13 +93,79 @@ test("object module export is import-safe and exposes all strict raw-shape tools
   assert.equal(result.stderr, "")
   const tools = createTools({})
   const names = ["pair","connections","bind","release","inspect","propose","execute","grant","capture","raw_enable","raw_propose",
-    "raw_execute","checkpoints","restore","render_submit","render_status","render_cancel","render_result","render_recover","render_list","diagnostics","reconcile"]
+    "raw_execute","checkpoints","restore","templates","render_submit","render_status","render_cancel","render_retire","render_result","render_recover","render_list","diagnostics","reconcile"]
+  assert.deepEqual(Object.keys(tools).sort(), names.map(name => "ae_" + name).sort())
+  assert.deepEqual(Object.keys(AE_PERMISSIONS).sort(), Object.keys(tools).sort())
   for (const name of names) {
     const tool = tools["ae_" + name]
     assert.equal(typeof tool.execute, "function")
     assert.equal(typeof tool.args, "object")
     await assert.rejects(tool.execute({ sessionID: "forged", executable: "evil", templates: [] }, context()), { name: "ZodError" })
   }
+})
+
+test("compatibility chat discovery preserves legacy arrays and exposes mismatches without binding or diagnostic leaks", async t => {
+  const { p, tools } = await fixture(t)
+  await p.stop()
+  const readOnly = context(() => assert.fail("discovery must not ask"))
+  const list = JSON.parse(await tools.ae_connections.execute({}, readOnly))
+  assert.ok(Array.isArray(list))
+  assert.equal(list[0].compatibility.panelVersion, "0.1.0")
+  const overview = JSON.parse(await tools.ae_connections.execute({ includeCompatibility: true }, readOnly))
+  assert.equal(overview.compatibility.cookieMonsterVersionStatus, "not_configured")
+  assert.equal(overview.compatibility.updates.cookieMonster.url, null)
+  await assert.rejects(tools.ae_connections.execute({ updateUrl: "https://evil.test" }, readOnly), { name: "ZodError" })
+  await p.send("/compatibility", { panelId: "test-panel", version: "0.2.0-SECRET", protocol: 2 })
+  const mismatch = JSON.parse(await tools.ae_connections.execute({ includeCompatibility: true }, readOnly))
+  assert.equal(mismatch.connections[0].compatibility.panelVersion, "0.2.0-SECRET")
+  assert.equal(mismatch.connections[0].compatibility.status, "incompatible")
+  assert.equal(mismatch.connections[0].mutationEligible, false)
+  await assert.rejects(tools.ae_bind.execute({ connectionId: p.connectionId }, readOnly), { code: "disconnected" })
+  await assert.rejects(tools.ae_inspect.execute({}, readOnly), { code: "binding_suspended" })
+  const diagnostic = JSON.parse(await tools.ae_diagnostics.execute({}, readOnly))
+  assert.equal(diagnostic.connections[0].compatibility.panelVersion, "0.2.0")
+  assert.equal(diagnostic.connections[0].compatibility.status, "incompatible")
+  assert.ok(!/SECRET|https:/.test(JSON.stringify(diagnostic)))
+  assert.ok(!JSON.stringify(diagnostic).includes(p.state.project.path))
+  const other = JSON.parse(await tools.ae_connections.execute({}, context(undefined, "other")))
+  assert.equal(other[0].binding, null)
+  await tools.ae_release.execute({}, context())
+  assert.deepEqual(JSON.parse(await tools.ae_diagnostics.execute({}, readOnly)).connections, [])
+})
+
+test("compatibility chat overview works before connection and removes pending reports on session deletion", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cm-ae-compat-"))
+  const dataDir = path.join(root, "private")
+  let instance
+  t.after(async () => { try { await instance?.dispose() } finally { await rm(root, { recursive: true, force: true }) } })
+  const releases = { cookieMonsterVersion: "2.4.1",
+    updates: { cookieMonster: { version: "2.4.1", protocol: 1, url: "https://releases.example.test/desktop/2.4.1" } } }
+  instance = await server({}, { dataDir, releaseMetadata: releases })
+  const tools = instance.tool, readOnly = context(() => assert.fail("discovery must not ask"))
+  const discovery = async c => JSON.parse(await tools.ae_connections.execute({ includeCompatibility: true }, c))
+  const empty = await discovery(readOnly)
+  assert.deepEqual(empty.connections, [])
+  assert.equal(empty.compatibility.cookieMonsterVersion, "2.4.1")
+  assert.equal(empty.compatibility.updates.cookieMonster.url, releases.updates.cookieMonster.url)
+  await assert.rejects(server({}, { dataDir, releaseMetadata: { cookieMonsterVersion: "9.9.9" } }),
+    { code: "runtime_config" })
+  const descriptor = JSON.parse(await readFile(path.join(dataDir, "descriptor.json"), "utf8"))
+  const pairing = JSON.parse(await tools.ae_pair.execute({}, readOnly))
+  assert.equal(pairing.compatibility.cookieMonsterVersion, "2.4.1")
+  const response = await request(descriptor.port, "/pair", { code: pairing.code, panelId: "peer-SECRET",
+    protocol: 2, version: "0.2.0-SECRET" })
+  assert.equal(response.body.error.code, "incompatible_version")
+  const pending = await discovery(readOnly)
+  assert.deepEqual(pending.connections, [])
+  assert.equal(pending.compatibility.pendingPanels[0].panelVersion, "0.2.0-SECRET")
+  assert.deepEqual((await discovery(context(undefined, "other"))).compatibility.pendingPanels, [])
+  const diagnostic = JSON.parse(await tools.ae_diagnostics.execute({}, readOnly))
+  assert.equal(diagnostic.compatibility.pendingPanels[0].panelVersion, "0.2.0")
+  assert.ok(!/SECRET|https:/.test(JSON.stringify(diagnostic)))
+  await instance.event({ event: { type: "session.deleted", properties: { info: { id: "session" } } } })
+  assert.deepEqual((await discovery(readOnly)).compatibility.pendingPanels, [])
+  assert.equal((await request(descriptor.port, "/pair", { code: pairing.code, panelId: "peer",
+    protocol: 1, version: "0.1.0" })).body.error.code, "invalid_pairing_code")
 })
 
 test("permission policy fails closed on global, wildcard, pattern and agent auto-allow", () => {
@@ -116,51 +221,77 @@ test("real workflow adapters enforce one-time asks, context session, abort and s
 })
 
 test("runtime registers authenticated panel services; scope, token expiry/replay/drift and restore use real storage", async t => {
-  const { p, r, tools, advance } = await fixture(t)
-  const checkpoint = await r.checkpoints.create({ projectPath: p.state.project.path, projectId: p.state.project.id, planHash: hash("test") })
-  const foreign = await r.checkpoints.create({ projectPath: p.state.project.path, projectId: "other-project", planHash: hash("other") })
-  const descriptor = JSON.parse(await readFile(path.join(p.dataDir, "descriptor.json"), "utf8"))
-  const client = new transport.Client({ store: { state: { credential: p.credential }, save() {}, descriptor: () => descriptor }, host: {} })
-  client.descriptor = descriptor
-  Object.assign(client.state, { connection: "connected", project: structuredClone(p.state.project), binding: p.bridge.binding("session") })
+  const cleanup = []
+  let f, r, clock = Date.now()
+  t.after(async () => {
+    await f?.stop()
+    try { await r?.close() } finally { for (const close of cleanup.reverse()) await close() }
+  })
+  f = await restoreFixture({ after: close => cleanup.push(close) })
+  const { p, h, client, sessionID, commands } = f
+  r = await createRuntime({ factories: { bridge: async () => p.bridge,
+    renderer: async () => ({ list: async () => [], close: async () => {} }) },
+    permissionConfig, now: () => clock })
+  const tools = createTools(r), c = context(undefined, sessionID)
+  const canonicalPath = h.project.file.fsName
+  const checkpoint = await r.checkpoints.create({ projectPath: canonicalPath,
+    projectId: h.call("inspect").result.project.id, planHash: hash("test") })
+  const foreign = await r.checkpoints.create({ projectPath: canonicalPath, projectId: "other-project", planHash: hash("other") })
+  const source = await readFile(checkpoint.path)
+  h.props[0].setValue(73)
+  h.project.save(h.project.file)
+  const original = await readFile(canonicalPath)
+  assert.notDeepEqual(original, source)
+  h.props[0].setValue(42)
+  const send = body => transport.request(client.descriptor, f.store.state.credential, "/panel", body, 300000)
   const list = await client.panel("checkpoints", {})
   assert.equal(list.length, 1); assert.equal(list[0].id, checkpoint.id)
   assert.equal(typeof list[0].createdAt, "number")
-  await assert.rejects(tools.ae_checkpoints.execute({ action: "pin", id: foreign.id, pinned: true }, context()), { code: "checkpoint_scope" })
-  const injected = await p.send("/panel", { action: "diagnostics", sessionID: "other" })
-  assert.notEqual(injected.status, 200)
+  await assert.rejects(tools.ae_checkpoints.execute({ action: "pin", id: foreign.id, pinned: true }, c), { code: "checkpoint_scope" })
+  await assert.rejects(send({ action: "diagnostics", sessionID: "other" }))
   await client.panel("checkpoint.pin", { id: checkpoint.id, pinned: true })
   assert.equal((await r.checkpoints.verify(checkpoint.id)).pinned, true)
   const exported = await client.panel("diagnostics", {})
-  assert.ok(!JSON.stringify(exported).includes(p.state.project.path))
+  assert.ok(!JSON.stringify(exported).includes(canonicalPath))
   assert.equal(exported.storage.checkpointCount, 1)
   assert.equal(exported.storage.pinnedCount, 1)
-  assert.equal(JSON.parse(await tools.ae_diagnostics.execute({}, context())).storage.checkpointCount, 1)
-  let proposed = await p.send("/panel", { action: "checkpoint.restore.propose", id: checkpoint.id })
-  assert.equal(proposed.status, 200)
-  assert.match(proposed.body.result.operation, /save.*checkpoint.*current state/i)
-  assert.match(proposed.body.result.operation, /recovery copy/i)
-  assert.equal(p.log.some(command => ["save", "open"].includes(command.method)), false)
-  advance(300001)
-  assert.equal((await p.send("/panel", { action: "checkpoint.restore.confirm", token: proposed.body.result.token })).body.error.code, "invalid_token")
-  proposed = await p.send("/panel", { action: "checkpoint.restore.propose", id: checkpoint.id })
-  p.state.selection.push({ itemId: 1 })
-  assert.equal((await p.send("/panel", { action: "checkpoint.restore.confirm", token: proposed.body.result.token })).body.error.code, "stale_fingerprint")
-  assert.equal((await p.send("/panel", { action: "checkpoint.restore.confirm", token: proposed.body.result.token })).body.error.code, "invalid_token")
-  proposed = await p.send("/panel", { action: "checkpoint.restore.propose", id: checkpoint.id })
-  r.tokens.get("session").operation += " Unreviewed change."
-  assert.equal((await p.send("/panel", { action: "checkpoint.restore.confirm", token: proposed.body.result.token })).body.error.code, "stale_fingerprint")
-  assert.equal(p.log.some(command => ["save", "open"].includes(command.method)), false)
+  assert.equal(JSON.parse(await tools.ae_diagnostics.execute({}, c)).storage.checkpointCount, 1)
+  let proposed = await send({ action: "checkpoint.restore.propose", id: checkpoint.id })
+  assert.match(proposed.result.operation, /save current unsaved edits.*private emergency project.*verify a protected checkpoint/i)
+  assert.match(proposed.result.operation, /recovery copy/i)
+  assert.equal(commands.some(command => ["save", "open", "execute"].includes(command.method)), false)
+  clock += 300001
+  await assert.rejects(send({ action: "checkpoint.restore.confirm", token: proposed.result.token }), { code: "invalid_token" })
+  proposed = await send({ action: "checkpoint.restore.propose", id: checkpoint.id })
+  h.project.item(1).selected = true
+  await assert.rejects(send({ action: "checkpoint.restore.confirm", token: proposed.result.token }), { code: "stale_fingerprint" })
+  await assert.rejects(send({ action: "checkpoint.restore.confirm", token: proposed.result.token }), { code: "invalid_token" })
+  proposed = await send({ action: "checkpoint.restore.propose", id: checkpoint.id })
+  r.tokens.get(sessionID).operation += " Unreviewed change."
+  await assert.rejects(send({ action: "checkpoint.restore.confirm", token: proposed.result.token }), { code: "stale_fingerprint" })
+  assert.equal(commands.some(command => ["save", "open", "execute"].includes(command.method)), false)
+  assert.equal(h.project.dirty, true)
+  assert.equal(h.closes, 0)
   await client.panel("checkpoint.restore.propose", { id: checkpoint.id })
-  const canonicalPath = p.state.project.path
   const restored = await client.confirmRestore()
-  assert.equal(restored.recoveryCopy, true)
-  assert.equal(restored.canonicalReplaced, false)
-  assert.notEqual(restored.path, canonicalPath)
-  assert.ok(restored.currentCheckpointId)
-  assert.equal((await r.checkpoints.verify(restored.currentCheckpointId)).verified, true)
+  assert.equal(restored.recoveryCopy, false)
+  assert.equal(restored.canonicalReplaced, true)
+  assert.equal(restored.path, canonicalPath)
+  assert.equal(h.project.file.fsName, canonicalPath)
+  assert.equal(h.props[0].value, 100)
+  assert.deepEqual(await readFile(canonicalPath), source)
+  assert.deepEqual(await readFile(restored.originalPath), original)
+  const backup = await r.checkpoints.verify(restored.currentCheckpointId)
+  assert.equal(backup.verified, true)
+  assert.equal(backup.pinned, true)
+  assert.equal(JSON.parse(await readFile(backup.path)).props[0].value, 42)
+  assert.equal(JSON.parse(await readFile(restored.emergencyPath)).props[0].value, 42)
   assert.equal(r.tokens.size, 0)
-  assert.equal(p.log.filter(command => command.method === "open").length, 1)
+  assert.equal(h.closes, 1)
+  assert.deepEqual(commands.filter(command => command.params.phase?.startsWith("restore_")).map(command => command.params.phase),
+    ["restore_prepare", "restore_finish"])
+  assert.equal(p.bridge.binding(sessionID).lock, null)
+  await assert.rejects(client.confirmRestore(), { code: "invalid_token" })
 })
 
 test("render adapter derives live comp/templates, rejects untrusted submit fields, and scopes recovered access", async t => {
@@ -217,6 +348,174 @@ test("render adapter derives live comp/templates, rejects untrusted submit field
   })))
   assert.equal(recovered.jobId, jobId)
   await assert.rejects(renderTools.ae_render_cancel.execute({ jobId }, context()), { code: "render_process_identity" })
+})
+
+test("retirement policy rejects auto-allow, missing ask, deny and legacy overrides", () => {
+  for (const config of [
+    { permission: "allow" }, { permission: { ae_render_retire: "allow" } },
+    { permission: { "ae_render_*": "allow", ae_render_retire: "ask" } },
+    { permission: "ask", agent: { build: { permission: { ae_render_retire: "allow" } } } },
+    { permission: "ask", tools: { ae_render_retire: true } },
+  ]) assert.throws(() => checkPermissionConfig(config, null, { configure: true }), { code: "unsafe_permission_config" })
+  for (const permission of [{}, { ae_render_retire: "deny" }])
+    assert.throws(() => checkPermissionConfig({ permission }, "ae_render_retire"), { code: "permission_denied" })
+  checkPermissionConfig({ permission: AE_PERMISSIONS }, "ae_render_retire")
+})
+
+test("retirement adapter uses real inventory approval, refuses denial/staleness, and expires recovered ownership", async t => {
+  const { p, r, tools, job, jobDir } = await retirementFixture(t)
+  const args = { jobId: job.jobId }, receiptPath = path.join(jobDir, "receipt.json")
+  for (const extra of [{ approval: "forged" }, { metadataOnly: false }, { check: true }])
+    await assert.rejects(tools.ae_render_retire.execute({ ...args, ...extra }, context()), { name: "ZodError" })
+  await assert.rejects(tools.ae_render_retire.execute(args, { sessionID: "session" }), { code: "permission_required" })
+  await assert.rejects(tools.ae_render_retire.execute(args, context(request => {
+    assert.equal(request.permission, "ae_render_retire")
+    assert.deepEqual(request.always, [])
+    assert.match(request.patterns[0], /Permanently remove/)
+    assert.equal(request.metadata.jobId, job.jobId)
+    assert.ok(request.metadata.remove.includes(jobDir))
+    assert.ok(request.metadata.preserve.includes(job.sourceCheckpoint.path))
+    return false
+  })), { code: "permission_denied" })
+  assert.equal(await exists(receiptPath), true)
+  await assert.rejects(tools.ae_render_retire.execute(args, context(async () => {
+    const receipt = await load(receiptPath)
+    await save(receiptPath, { ...receipt, finishedAt: "2026-01-01T00:00:00.000Z" })
+  })), error => error.code === "render_retire_refused" && /Approval is stale/.test(error.message))
+  assert.equal(await exists(receiptPath), true)
+  const denied = createTools({ ...r, permissionPolicy: name => checkPermissionConfig({
+    permission: { ...AE_PERMISSIONS, ae_render_retire: "deny" },
+  }, name) })
+  await assert.rejects(denied.ae_render_retire.execute(args, context(() => assert.fail("denied policy asked"))),
+    { code: "permission_denied" })
+  await tools.ae_release.execute({}, context())
+  await tools.ae_bind.execute({ connectionId: p.connectionId }, context())
+  const reviews = []
+  const result = JSON.parse(await tools.ae_render_retire.execute(args, context(request => {
+    reviews.push(request.permission)
+    if (request.permission === "ae_render_retire") {
+      assert.match(request.metadata.approval, /^[a-f0-9]{64}$/)
+      request.metadata.approval = "callback mutation must not alter the reviewed digest"
+    }
+  })))
+  assert.deepEqual(reviews, ["ae_render_recover", "ae_render_retire"])
+  assert.equal(result.retired, true)
+  for (const target of [jobDir, job.stageDir, job.quarantineDir]) assert.equal(await exists(target), false)
+  assert.equal(await readFile(job.outputPath, "utf8"), "completed render")
+  assert.equal((await r.checkpoints.verify(job.sourceCheckpoint.id)).pinned, true)
+  assert.equal(r.jobs.has(job.jobId), false)
+  assert.equal(r.jobScopes.has(job.jobId), false)
+  assert.equal(r.recovered.has(job.jobId), false)
+  assert.deepEqual(JSON.parse(await tools.ae_render_list.execute({}, context())), [])
+  await assert.rejects(tools.ae_render_status.execute(args, context()), { code: "render_scope" })
+  const diagnostic = JSON.parse(await tools.ae_diagnostics.execute({}, context()))
+  assert.deepEqual(diagnostic.renders, [])
+  assert.ok(!JSON.stringify(diagnostic).includes(jobDir))
+  assert.ok(!JSON.stringify(diagnostic).includes(job.jobId))
+  await tools.ae_release.execute({}, context())
+  assert.deepEqual(r.diagnostics.export({ sessionID: "session" }).events, [])
+  assert.equal(r.recovered.has(job.jobId), false)
+  assert.equal(r.jobScopes.has(job.jobId), false)
+})
+
+test("retirement adapter rejects foreign session/project, metadata-only jobs and scope changes during approval", async t => {
+  const { p, r, tools, job, jobDir } = await retirementFixture(t)
+  const args = { jobId: job.jobId }, manifestPath = path.join(jobDir, "manifest.json")
+  const manifest = await load(manifestPath), owner = r.jobs.get(job.jobId)
+  const noAsk = context(() => assert.fail("unsafe retirement must not ask"))
+  r.jobs.set(job.jobId, { sessionID: "other", bindingID: "other" })
+  await assert.rejects(tools.ae_render_retire.execute(args, noAsk), { code: "render_scope" })
+  r.jobs.set(job.jobId, owner)
+  await writeFile(manifestPath, "{broken")
+  await assert.rejects(tools.ae_render_retire.execute(args, noAsk), { code: "render_retire_refused" })
+  const foreign = { ...manifest, sourceCheckpoint: { ...manifest.sourceCheckpoint, projectId: "foreign" } }
+  await save(manifestPath, foreign)
+  await assert.rejects(tools.ae_render_retire.execute(args, noAsk), { code: "render_scope" })
+  await save(manifestPath, manifest)
+  await assert.rejects(tools.ae_render_retire.execute(args, context(() => save(manifestPath, foreign))),
+    { code: "render_scope" })
+  await save(manifestPath, manifest)
+  assert.equal(await exists(jobDir), true)
+  assert.equal(await readFile(job.outputPath, "utf8"), "completed render")
+  p.state.project.id = "different-bound-project"
+  await p.heartbeat()
+  await tools.ae_bind.execute({ connectionId: p.connectionId }, context())
+  await assert.rejects(tools.ae_render_retire.execute(args, noAsk), { code: "render_scope" })
+})
+
+for (const action of ["abort", "release", "rebind"]) {
+  test(`retirement adapter stops a pending approval on ${action}`, async t => {
+    const { p, r, tools, job, jobDir } = await retirementFixture(t)
+    const controller = new AbortController()
+    let entered
+    const ready = new Promise(resolve => { entered = resolve })
+    const pending = tools.ae_render_retire.execute({ jobId: job.jobId }, {
+      ...context(() => { entered(); return new Promise(() => {}) }), abort: controller.signal,
+    })
+    const rejected = assert.rejects(pending, { code: "aborted" })
+    await ready
+    if (action === "abort") controller.abort()
+    else if (action === "release") await r.release("session")
+    else await p.bridge.bind("session", p.connectionId)
+    await rejected
+    assert.equal(await exists(jobDir), true)
+    assert.equal(await exists(job.logPath), true)
+    assert.equal(await readFile(job.outputPath, "utf8"), "completed render")
+    if (action !== "abort") assert.deepEqual(r.diagnostics.export({ sessionID: "session" }).events, [])
+  })
+}
+
+test("retirement adapter rechecks lifetime after waiting inside renderer verification", async t => {
+  const { r, tools, job, jobDir, adapter } = await retirementFixture(t)
+  let approved = false
+  adapter.discover = async () => {
+    if (approved) { approved = false; await r.release("session") }
+    return []
+  }
+  await assert.rejects(tools.ae_render_retire.execute({ jobId: job.jobId }, context(() => { approved = true })),
+    error => error.code === "render_retire_refused" && error.details.cause === "aborted" && error.details.removed.length === 0)
+  assert.equal(await exists(jobDir), true)
+  assert.equal(await exists(job.logPath), true)
+  assert.equal(await exists(job.stageDir), true)
+  assert.deepEqual(r.diagnostics.export({ sessionID: "session" }).events, [])
+})
+
+test("retirement adapter does not resurrect scope from an earlier in-flight status", async t => {
+  const { r, tools, job } = await retirementFixture(t)
+  const status = r.renderer.status
+  let entered, resume, held = false
+  const ready = new Promise(resolve => { entered = resolve })
+  const gate = new Promise(resolve => { resume = resolve })
+  r.renderer.status = async id => {
+    const result = await status(id)
+    if (!held) { held = true; entered(); await gate }
+    return result
+  }
+  const pending = tools.ae_render_status.execute({ jobId: job.jobId }, context())
+  const rejected = assert.rejects(pending, { code: "render_scope" })
+  await ready
+  assert.equal(JSON.parse(await tools.ae_render_retire.execute({ jobId: job.jobId }, context())).retired, true)
+  resume()
+  await rejected
+  assert.equal(r.jobs.has(job.jobId), false)
+  assert.equal(r.jobScopes.has(job.jobId), false)
+  assert.equal(r.recovered.has(job.jobId), false)
+})
+
+test("retirement adapter clears ownership even when release arrives after the final deletion", async t => {
+  const { r, tools, job, jobDir } = await retirementFixture(t)
+  const retire = r.renderer.retire
+  r.renderer.retire = async (id, options) => {
+    const result = await retire(id, options)
+    if (result.retired) await r.release("session")
+    return result
+  }
+  await assert.rejects(tools.ae_render_retire.execute({ jobId: job.jobId }, context()), { code: "aborted" })
+  assert.equal(await exists(jobDir), false)
+  assert.equal(r.jobs.has(job.jobId), false)
+  assert.equal(r.jobScopes.has(job.jobId), false)
+  assert.equal(r.recovered.has(job.jobId), false)
+  assert.deepEqual(r.diagnostics.export({ sessionID: "session" }).events, [])
 })
 
 test("detached renders remain discoverable only in their project and require one recovery claim under shipped read policies", async t => {
@@ -356,7 +655,7 @@ test("real corrupt manifests remain unscopable after restart and expose only agg
     assert.equal(r.recovered.has(jobId), true)
     assert.equal(r.jobScopes.size, 0)
     assert.deepEqual(JSON.parse(await tools.ae_render_list.execute({}, c)), [])
-    for (const name of ["ae_render_status", "ae_render_result", "ae_render_cancel", "ae_render_recover"])
+    for (const name of ["ae_render_status", "ae_render_result", "ae_render_cancel", "ae_render_recover", "ae_render_retire"])
       await assert.rejects(tools[name].execute({ jobId }, c), { code: "render_scope" })
     const diagnostics = JSON.parse(await tools.ae_diagnostics.execute({}, c))
     assert.deepEqual(diagnostics.recovery, { unscopableCount: 1, remediation: "manual_manifest_recovery_required" })

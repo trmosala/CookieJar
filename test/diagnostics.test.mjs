@@ -69,6 +69,46 @@ test("corrupt render diagnostics use fixed reasons and aggregate unscopable coun
     assert.equal(d.export({ unscopableRenderCount }).recovery.unscopableCount, 0)
 })
 
+test("retirement diagnostics retain only fixed errors, never inventory paths or approval digests", () => {
+  const d = createDiagnostics(), secret = "SECRET C:/private/project.aep approval inventory"
+  const codes = ["render_retire_refused", "render_retire_partial", "render_busy", "render_job", "render_closed"]
+  for (const errorCode of [...codes, secret]) d.record("session", "render_retire", "failed", {
+    errorCode, message: secret, jobId: secret, approval: secret, remove: [secret], removed: [secret],
+    preserve: [secret], cause: secret,
+  })
+  const result = d.export({ sessionID: "session" })
+  assert.deepEqual(result.events.map(event => event.errorCode), [...codes, "unknown"])
+  assert.ok(result.events.every(event => event.operation === "render_retire"))
+  assert.ok(!JSON.stringify(result).includes(secret))
+  d.release("session")
+  assert.deepEqual(d.export({ sessionID: "session" }).events, [])
+})
+
+test("compatibility diagnostics strip URLs, build labels and injected metadata but retain numeric negotiation evidence", () => {
+  const d = createDiagnostics(), secret = "SECRET"
+  const metadata = { status: "incompatible", panelVersion: "0.2.0-SECRET+artist", panelProtocol: 2,
+    cookieMonsterVersion: "2.4.1+SECRET", cookieMonsterVersionStatus: "configured",
+    releaseSourceUrl: "https://SECRET.test", updates: { panel: { url: "https://SECRET.test/token" } },
+    credential: secret, project: secret }
+  d.record("session", "bind", "failed", { errorCode: "incompatible_version", details: metadata })
+  const result = d.export({ sessionID: "session", compatibility: { ...metadata, pendingPanels: [metadata] },
+    connections: [{ compatibility: metadata }] })
+  const expected = { status: "incompatible", panelVersion: "0.2.0", panelProtocol: 2,
+    cookieMonsterVersion: "2.4.1", cookieMonsterVersionStatus: "configured" }
+  assert.deepEqual(result.connections[0].compatibility, expected)
+  assert.deepEqual(result.compatibility, { ...expected, pendingPanels: [expected] })
+  assert.equal(result.events[0].errorCode, "incompatible_version")
+  assert.ok(!/SECRET|artist|https|credential|updates/.test(JSON.stringify(result)))
+  for (const bad of [secret, {}, "C:/Users/artist/secret", "1.0\\n", "1".repeat(65),
+    ...["\n", "\r", "\t", "\0", "\u2028", "\u2029"].map(suffix => "1.0" + suffix)]) {
+    const output = d.export({ compatibility: { ...metadata, panelVersion: bad, cookieMonsterVersion: bad, panelProtocol: bad } })
+    assert.equal(output.compatibility.panelVersion, null)
+    assert.equal(output.compatibility.panelProtocol, null)
+    assert.equal(output.compatibility.cookieMonsterVersion, null)
+    assert.equal(output.compatibility.cookieMonsterVersionStatus, "not_configured")
+  }
+})
+
 test("session metadata is bounded, separate, volatile, and removed on release", () => {
   const d = createDiagnostics()
   for (let i = 0; i < 150; i++) d.record("one", "inspect", "ok")

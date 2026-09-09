@@ -20,9 +20,17 @@
 </section>
 <section aria-labelledby="pair-heading">
 <h2 id="pair-heading">Pairing</h2>
+<form id="profile-form">
+<label for="profile">Panel Profile</label>
+<input id="profile" required maxlength="64" pattern="[a-z0-9][a-z0-9_-]{0,63}" autocomplete="off" spellcheck="false">
+<button id="profile-open" type="submit">Open Profile</button>
+</form>
+<p id="profile-status" role="status" aria-live="polite"></p>
 <form id="pair-form"><label for="code">Single-use code from CookieMonster chat</label><input id="code" type="password" autocomplete="off" spellcheck="false" maxlength="64"><button id="pair" type="submit">Pair</button></form>
 <div class="buttons"><button id="connect" type="button">Reconnect</button><button id="disconnect" type="button">Disconnect</button><button id="rotate" type="button">Rotate Credential</button><button id="unpair" type="button">Unpair</button></div>
-<p>Reconnection always requires explicit rebinding in chat. One panel per user data directory can own a pairing.</p>
+<p>Use a different profile for each simultaneous AE instance. Reselect the same profile after reopening. Select legacy only for the previous shared pairing. Reconnection requires explicit rebinding in chat.</p>
+<button id="recover-credential" type="button" disabled aria-describedby="credential-recovery-status">Recover Invalid Credential</button>
+<p id="credential-recovery-status" role="status" aria-live="polite">If authentication fails, install matching panel/plugin versions, enter a fresh single-use code above, then explicitly recover. This replaces the server credential for the same profile, retains identity, uncertain latch and durable locks, and does not reconnect. Never delete profile or bridge state to recover.</p>
 </section>
 <section aria-labelledby="capture-heading">
 <h2 id="capture-heading">Capture &amp; Recovery</h2>
@@ -63,7 +71,14 @@
 <p>Export only the bridge's sanitized metadata. No local project, script, image, prompt, or credential collection.</p>
 <button id="diagnostics" type="button">Prepare Metadata Export</button>
 <a id="diagnostics-download" download="cookiemonster-ae-diagnostics.json" hidden>Save Metadata JSON</a>
-<p>Update source: github.com/trmosala/CookieJar/releases. Obtain the matching internal build from your administrator.</p>
+<h3>Compatibility &amp; Updates</h3>
+<p id="compatibility-status" role="status" aria-live="polite">Compatibility not checked.</p>
+<ul>
+<li>Bridge Plugin: <span id="update-plugin-status">not configured</span> <a id="update-plugin" target="_blank" rel="noopener noreferrer" hidden>Approved Plugin Update</a></li>
+<li>AE Panel: <span id="update-panel-status">not configured</span> <a id="update-panel" target="_blank" rel="noopener noreferrer" hidden>Approved Panel Update</a></li>
+<li>CookieMonster Desktop: <span id="update-cookieMonster-status">not configured</span> <a id="update-cookieMonster" target="_blank" rel="noopener noreferrer" hidden>Approved Desktop Update</a></li>
+</ul>
+<p><a id="release-source" target="_blank" rel="noopener noreferrer" hidden>Public Release Source</a> Release source is not an approved internal installer. Ask your administrator when updates are not configured.</p>
 </section>
 </main>
 <script src="ui.js"></script>

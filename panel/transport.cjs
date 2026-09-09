@@ -4,6 +4,43 @@ var VERSION = "0.1.0", PROTOCOL = 1, MAX = 4 * 1024 * 1024;
 function error(code, message) { var e = new Error(message); e.code = code; return e; }
 function record(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
 function text(v, max) { return typeof v === "string" && v.length > 0 && v.length <= max; }
+function validVersion(value) {
+    return text(value,64) && !/\s/.test(value) && /^\d{1,6}(?:\.\d{1,6}){1,3}(?:-[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?(?:\+[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?$/.test(value);
+}
+function compatibilityMetadata(value) {
+    function invalid() { throw error("invalid_response","Invalid compatibility metadata"); }
+    function protocol(v) { return Number.isSafeInteger(v) && v>=1; }
+    function https(v) {
+        if(!text(v,2048) || /[\s\\]/.test(v) || !/^https:\/\/[A-Za-z0-9.:[\]-]+(?:\/[A-Za-z0-9._~/-]*)?$/.test(v))invalid();
+        var u;try { u=new (require("url").URL)(v); } catch(e) { invalid(); }
+        if(u.protocol!=="https:" || !u.hostname || u.username || u.password || u.search || u.hash)invalid();
+        return u.href;
+    }
+    if(!record(value) || Object.keys(value).sort().join(",")!=="cookieMonsterVersion,cookieMonsterVersionStatus,panelProtocol,panelVersion,pluginVersion,protocol,releaseSourceUrl,status,updates" ||
+        !validVersion(value.pluginVersion) || !protocol(value.protocol) ||
+        !(value.panelVersion === null && value.panelProtocol === null || validVersion(value.panelVersion) && protocol(value.panelProtocol)) ||
+        !(value.cookieMonsterVersionStatus==="not_configured" && value.cookieMonsterVersion === null ||
+          value.cookieMonsterVersionStatus==="configured" && validVersion(value.cookieMonsterVersion)) ||
+        value.releaseSourceUrl!=="https://github.com/trmosala/CookieJar/releases" ||
+        !record(value.updates) || Object.keys(value.updates).sort().join(",")!=="cookieMonster,panel,plugin")invalid();
+    var expected=value.panelVersion === null ? "unknown" : value.panelVersion===value.pluginVersion && value.panelProtocol===value.protocol ? "compatible" : "incompatible";
+    if(value.status!==expected)invalid();
+    var updates={};
+    ["plugin","panel","cookieMonster"].forEach(function(key){
+        var u=value.updates[key];
+        if(!record(u) || Object.keys(u).sort().join(",")!=="protocol,status,url,version")invalid();
+        if(u.status==="not_configured"){
+            if(u.version !== null || u.protocol !== null || u.url !== null)invalid();
+            updates[key]={status:"not_configured",version:null,protocol:null,url:null};
+        } else {
+            if(u.status!=="configured" || !validVersion(u.version) || u.protocol!==value.protocol ||
+                key!=="cookieMonster" && u.version!==value.pluginVersion)invalid();
+            updates[key]={status:"configured",version:u.version,protocol:u.protocol,url:https(u.url)};
+        }
+    });
+    return {status:value.status,pluginVersion:value.pluginVersion,protocol:value.protocol,panelVersion:value.panelVersion,panelProtocol:value.panelProtocol,
+        cookieMonsterVersion:value.cookieMonsterVersion,cookieMonsterVersionStatus:value.cookieMonsterVersionStatus,releaseSourceUrl:value.releaseSourceUrl,updates:updates};
+}
 function secure(target, directory) {
     var stat = fs.lstatSync(target);
     if (stat.isSymbolicLink() || (directory ? !stat.isDirectory() : !stat.isFile())) throw error("unsafe_storage", "Storage must not be a link");
@@ -21,36 +58,116 @@ function readJSON(file, max) {
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > max) throw error("unsafe_storage", "Invalid or oversized local file");
     return JSON.parse(fs.readFileSync(file, "utf8"));
 }
-function Store(dataDir) {
+function privateDir(dir) {
+    var created = false;
+    try { fs.mkdirSync(dir, {mode:448}); created = true; } catch (e) { if (e.code !== "EEXIST") throw e; }
+    secure(dir, true);
+    return created;
+}
+function panelState(file) {
+    secure(file, false);
+    var state = readJSON(file, 8192);
+    if (!record(state) || !text(state.panelId,128) || !(state.credential === null || (typeof state.credential === "string" && /^[A-Za-z0-9_-]{43}$/.test(state.credential))) || typeof state.uncertain !== "boolean") throw error("unsafe_storage", "Invalid panel state; preserve it for recovery");
+    return state;
+}
+function processStamp(pid) {
+    if (!Number.isSafeInteger(pid) || pid < 1 || pid > 2147483647) throw error("ownership_unknown","Invalid owner PID");
+    try {
+        process.kill(pid, 0);
+        var stamp;
+        if (process.platform === "win32") {
+            var script = "$ErrorActionPreference='Stop';(Get-Process -Id " + pid + ").StartTime.ToUniversalTime().Ticks.ToString()";
+            stamp = child.execFileSync("powershell.exe", ["-NoProfile","-NonInteractive","-EncodedCommand",Buffer.from(script,"utf16le").toString("base64")], {windowsHide:true,timeout:15000,stdio:"pipe"}).toString().trim();
+            if (!/^[0-9]{15,20}$/.test(stamp)) throw new Error("Missing process start time");
+        } else if (process.platform === "linux") {
+            var stat = fs.readFileSync("/proc/" + pid + "/stat","utf8");
+            stamp = fs.readFileSync("/proc/sys/kernel/random/boot_id","utf8").trim() + ":" + stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+            if (!/^[a-f0-9-]+:[0-9]+$/.test(stamp)) throw new Error("Missing process start time");
+        } else if (process.platform === "darwin") {
+            // ps has second resolution: a same-second PID reuse stays blocked, never stolen.
+            stamp = child.execFileSync("/bin/ps",["-p",String(pid),"-o","lstart="],{timeout:5000,env:{LC_ALL:"C",TZ:"UTC",PATH:"/usr/bin:/bin"},stdio:"pipe"}).toString().trim();
+            if (!/^[A-Za-z]{3} [A-Za-z]{3} +[0-9]{1,2} [0-9:]{8} [0-9]{4}$/.test(stamp)) throw new Error("Missing process start time");
+        } else throw new Error("Unsupported process identity runtime");
+        return crypto.createHash("sha256").update(stamp).digest("hex");
+    } catch (e) {
+        try { process.kill(pid,0); } catch (gone) { if (gone.code === "ESRCH") return null; }
+        throw error("ownership_unknown","Cannot verify panel owner lifetime; close AE and retry without deleting recovery state");
+    }
+}
+function Store(dataDir, profile) {
+    if (typeof profile !== "string" || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(profile)) throw error("profile_required","Choose a profile: 1-64 lowercase letters, digits, underscores or hyphens. Reuse that exact name after restarting AE.");
+    this.profile = profile;
     this.root = path.resolve(dataDir || process.env.CM_AE_DATA_DIR || path.join(os.homedir(), ".cookiemonster-ae"));
     // The bridge owns the shared directory. Do not create or change permissions on it.
-    var rootStat=fs.lstatSync(this.root);
-    if(!rootStat.isDirectory() || rootStat.isSymbolicLink())throw error("unsafe_storage","Start the bridge with a real data directory first");
-    this.dir = path.join(this.root, "panel-private");
-    if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, {mode:448});
-    secure(this.dir, true);
-    this.file = path.join(this.dir, "credential.json");
-    this.lock = path.join(this.dir, "owner.json");
-    try {
-        var old = readJSON(this.lock, 4096), alive = false;
-        try { process.kill(old.pid, 0); alive = true; } catch (e) { if (e.code !== "ESRCH") alive = true; }
-        if (alive) throw error("panel_in_use", "Another panel owns this pairing. Close it before opening this panel.");
-        fs.unlinkSync(this.lock);
-    } catch (e) { if (e.code !== "ENOENT") throw e; }
-    fs.writeFileSync(this.lock, JSON.stringify({pid:process.pid}), {flag:"wx", mode:384});
-    try {
+    var rootStat = fs.lstatSync(this.root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw error("unsafe_storage","Start the bridge with a real data directory first");
+    var base = path.join(this.root,"panel-private"), legacy = path.join(base,"credential.json");
+    privateDir(base);
+    if (profile === "legacy") {
+        try { panelState(legacy); }
+        catch (e) {
+            if (e.code === "ENOENT") throw error("legacy_missing","No legacy state file exists. If previously paired, recover it; otherwise choose a named profile.");
+            throw e;
+        }
+    }
+    if (profile !== "legacy") {
         try {
-            secure(this.file, false);
-            this.state = readJSON(this.file, 8192);
-            if (!record(this.state) || !text(this.state.panelId, 128) || !(this.state.credential === null || /^[A-Za-z0-9_-]{43}$/.test(this.state.credential)) || typeof this.state.uncertain !== "boolean") throw error("unsafe_storage", "Invalid panel state");
+            if (panelState(legacy).uncertain) throw error("legacy_uncertain","Select legacy and reconcile its unscoped uncertain outcome before opening another profile");
         } catch (e) {
             if (e.code !== "ENOENT") throw e;
-            this.state = {panelId:crypto.randomBytes(24).toString("hex"), credential:null, uncertain:false};
+            if (fs.existsSync(path.join(base,"owner.json")) || fs.existsSync(path.join(base,"owners"))) throw error("profile_state_missing","Legacy ownership exists without its state; recover the original file before selecting another profile");
+        }
+    }
+    // ponytail: explicit legacy selection keeps the original file and latch in place, no copying/adoption.
+    this.dir = profile === "legacy" ? base : path.join(base,"profile-" + profile);
+    var created = profile !== "legacy" && privateDir(this.dir);
+    this.file = path.join(this.dir,"credential.json");
+    var owners = path.join(this.dir,"owners"), stamp = processStamp(process.pid), self = this;
+    if (!stamp) throw error("ownership_unknown","Cannot verify this panel process");
+    privateDir(owners);
+    this.lock = path.join(owners,process.pid + "-" + stamp + "-" + crypto.randomBytes(24).toString("hex") + ".lock");
+    fs.closeSync(fs.openSync(this.lock,"wx",384));
+    try {
+        // Publish BEFORE scanning. Concurrent claimants see each other and may both refuse;
+        // no claimant removes a live claim. Unique filenames avoid stale-unlink/ABA races.
+        fs.readdirSync(owners).forEach(function(name) {
+            var file = path.join(owners,name);
+            if (file === self.lock) return;
+            var match = /^([1-9][0-9]*)-([a-f0-9]{64})-([a-f0-9]{48})\.lock$/.exec(name);
+            if (!match) throw error("ownership_unknown","Unrecognized owner record; preserve it for recovery");
+            var current = processStamp(Number(match[1]));
+            if (current === match[2]) throw error("panel_in_use","This profile is already open. Choose a different profile for another AE instance.");
+            // Only a proven dead/reused process can be reaped; never guess from elapsed time.
+            try { fs.unlinkSync(file); } catch (e) { if (e.code !== "ENOENT") throw e; }
+        });
+        if (profile === "legacy") {
+            this.legacyLock = path.join(base,"owner.json");
+            try {
+                var old = readJSON(this.legacyLock,4096);
+                if (!record(old) || !Number.isSafeInteger(old.pid) || old.pid < 1 || old.pid > 2147483647) throw error("ownership_unknown","Invalid legacy owner; preserve it for recovery");
+                // Old records lack a birth stamp: even a reused live PID must remain blocked.
+                try { process.kill(old.pid,0); throw error("panel_in_use","Close the legacy panel/AE process before using its pairing"); }
+                catch (e) { if (e.code !== "ESRCH") throw e; }
+                fs.unlinkSync(this.legacyLock);
+            } catch (e) { if (e.code !== "ENOENT") throw e; }
+            this.legacyToken = crypto.randomBytes(24).toString("hex");
+            fs.writeFileSync(this.legacyLock,JSON.stringify({pid:process.pid,token:this.legacyToken}),{flag:"wx",mode:384});
+        }
+        try { this.state = panelState(this.file); }
+        catch (e) {
+            if (e.code !== "ENOENT") throw e;
+            if (profile === "legacy") throw error("legacy_missing","No legacy pairing exists. Choose a named profile instead.");
+            if (!created) throw error("profile_state_missing","Existing profile has no state file; preserve its files and recover the original state instead of creating a new identity");
+            this.state = {panelId:crypto.randomBytes(24).toString("hex"),credential:null,uncertain:false};
+            this.panelId = this.state.panelId;
             this.save();
         }
+        this.panelId = this.state.panelId;
     } catch (e) { this.close(); throw e; }
 }
 Store.prototype.save = function () {
+    if (!this.lock || !fs.existsSync(this.lock)) throw error("ownership_lost","This panel no longer owns its profile");
+    if (this.state.panelId !== this.panelId || typeof this.state.uncertain !== "boolean" || !(this.state.credential === null || (typeof this.state.credential === "string" && /^[A-Za-z0-9_-]{43}$/.test(this.state.credential)))) throw error("unsafe_storage","Refusing to overwrite panel identity or invalid state");
     var tmp = path.join(this.dir, "state-" + crypto.randomBytes(12).toString("hex") + ".tmp"), fd;
     try {
         fd = fs.openSync(tmp, "wx", 384);
@@ -63,7 +180,18 @@ Store.prototype.descriptor = function () {
     if (!record(d) || Object.keys(d).sort().join(",") !== "instanceId,port,protocol,updateUrl,version" || !Number.isInteger(d.port) || d.port < 1 || d.port > 65535 || !text(d.instanceId,256) || !text(d.version,128) || !text(d.updateUrl,2048)) throw error("invalid_descriptor", "Invalid loopback descriptor");
     return d;
 };
-Store.prototype.close = function () { if (this.lock && fs.existsSync(this.lock)) fs.unlinkSync(this.lock); this.lock = null; };
+Store.prototype.close = function () {
+    if (this.legacyLock && this.legacyToken) {
+        try {
+            if (readJSON(this.legacyLock,4096).token === this.legacyToken) fs.unlinkSync(this.legacyLock);
+        } catch (e) { if (e.code !== "ENOENT") throw e; }
+        this.legacyToken = null;
+    }
+    if (this.lock) {
+        try { fs.unlinkSync(this.lock); } catch (e) { if (e.code !== "ENOENT") throw e; }
+        this.lock = null;
+    }
+};
 function request(descriptor, credential, endpoint, body, timeout) {
     return new Promise(function (resolve, reject) {
         var data = body === undefined ? null : Buffer.from(JSON.stringify(body), "utf8"), finished = false, timer;
@@ -83,7 +211,11 @@ function request(descriptor, credential, endpoint, body, timeout) {
                     if (!record(value)) throw error("invalid_response", "Expected response object");
                     if (res.statusCode !== 200 || value.error) {
                         var code = value.error && value.error.code;
-                        throw error(typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? code : "bridge_error", "Bridge rejected request");
+                        var rejected=error(typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? code : "bridge_error", "Bridge rejected request");
+                        if(["/pair","/connect","/compatibility"].indexOf(endpoint)>=0 && ["incompatible","incompatible_version"].indexOf(code)>=0 &&
+                            record(value.error.details) && Object.prototype.hasOwnProperty.call(value.error.details,"compatibility"))
+                            rejected.details={compatibility:compatibilityMetadata(value.error.details.compatibility)};
+                        throw rejected;
                     }
                     done(null, value);
                 } catch (e) { done(e.code ? e : error("invalid_response", "Malformed bridge JSON")); }
@@ -189,14 +321,21 @@ function Client(options) {
     this.store=options.store;this.host=options.host;this.normalize=options.normalize;this.changed=options.changed || function(){};
     this.beforeCapture=options.beforeCapture || function(){return Promise.reject(error("unsafe_state","Visible capture indicator could not be confirmed"));};
     this.request=options.request || request;this.descriptor=null;this.running=false;this.timer=null;this.inFlight=false;
-    this.state={connection:this.store.state.credential ? "paired" : "unpaired",project:null,activeCompId:null,capabilities:{fileNetwork:false},binding:null,lock:null,busy:false,capture:null,uncertain:this.store.state.uncertain,aeVersion:"",bridgeVersion:"",lastError:""};
+    this.connectionGeneration=0;this.connectionId=null;this.connectionEpoch=null;
+    this.state={connection:this.store.state.credential ? "paired" : "unpaired",project:null,activeCompId:null,capabilities:{fileNetwork:false},binding:null,lock:null,busy:false,capture:null,uncertain:this.store.state.uncertain,aeVersion:"",bridgeVersion:"",compatibility:null,lastError:""};
 }
+Client.prototype.scope=function(){
+    var b=this.state.binding,d=this.descriptor;
+    return JSON.stringify([this.state.connection,d && d.instanceId,d && d.port,this.connectionGeneration,this.connectionId,this.connectionEpoch,
+        b && b.id,b && b.sessionID,b && b.connectionId,b && b.state]);
+};
 Client.prototype.context=function(){
-    var b=this.state.binding,p=this.state.project,d=this.descriptor;
-    return JSON.stringify([this.state.connection,d && d.instanceId,b && b.id,b && b.sessionID,b && b.state,p && p.id,p && p.path]);
+    var b=this.state.binding,p=this.state.project,bp=b && b.project;
+    return JSON.stringify([this.scope(),p && p.id,p && p.path,p && p.saved,bp && bp.id,bp && bp.path,bp && bp.saved]);
 };
 Client.prototype.emit=function(){
-    if(this.restoreApproval && (this.restoreApproval.context!==this.context() || this.state.busy || this.state.uncertain || this.state.lock))this.restoreApproval=null;
+    if(this.panelGuard && (this.panelGuard.scope!==this.scope() || this.panelGuard.credential!==this.store.state.credential))this.panelGuard.stale=true;
+    if(this.restoreApproval && (this.restoreApproval.context!==this.context() || this.restoreApproval.credential!==this.store.state.credential || this.state.busy || this.state.uncertain || this.state.lock))this.restoreApproval=null;
     this.changed(this.state);
 };
 Client.prototype.panel=function(action,args){
@@ -211,18 +350,57 @@ Client.prototype.panel=function(action,args){
     if(mutating && (self.state.busy || self.state.uncertain || self.state.lock || !self.state.binding || self.state.binding.state!=="active"))return Promise.reject(error("target_locked","Checkpoint changes require an active unlocked binding"));
     if(Object.prototype.hasOwnProperty.call(args,"id") && !text(args.id,256))return Promise.reject(error("invalid_payload","Invalid checkpoint ID"));
     if(action==="checkpoint.pin" && typeof args.pinned!=="boolean")return Promise.reject(error("invalid_payload","pinned must be boolean"));
-    if(action==="checkpoint.restore.confirm"){
-        var approval=self.restoreApproval;
+    var confirming=action==="checkpoint.restore.confirm",proposing=action==="checkpoint.restore.propose",approval=self.restoreApproval;
+    if(confirming){
         self.restoreApproval=null;
-        if(!approval || approval.context!==context || args.token!==approval.token)return Promise.reject(error("invalid_token","Review this restore again; approval is missing or stale"));
+        if(!approval || approval.context!==context || approval.credential!==self.store.state.credential || args.token!==approval.token)return Promise.reject(error("invalid_token","Review this restore again; approval is missing or stale"));
     }
+    var source=self.state.project,sourceProject=source && {id:source.id,path:source.path,saved:source.saved};
+    if(proposing && (!record(source) || !text(source.id,256) || !text(source.path,32768) || source.saved!==true ||
+        !self.state.binding.project || self.state.binding.project.id!==source.id || self.state.binding.project.path!==source.path || self.state.binding.project.saved!==true))
+        return Promise.reject(error("stale_binding","Restore review requires the current saved bound project"));
+    if(proposing)self.restoreApproval=null;
+    var guard={scope:self.scope(),credential:self.store.state.credential,stale:false};
+    var descriptor=Object.assign({},self.descriptor);
     Object.keys(args).forEach(function(k){payload[k]=args[k];});
-    self.panelPending=true;self.emit();
+    self.panelGuard=guard;self.panelPending=true;self.emit();
     // Do not stop host polling: restore.confirm can wait for a host command delivered by /poll.
-    return self.request(self.descriptor,self.store.state.credential,"/panel",payload,action==="checkpoint.restore.confirm" ? 300000 : 15000).then(function(response){
+    return Promise.resolve().then(function(){
+        if(guard.stale || guard.scope!==self.scope() || guard.credential!==self.store.state.credential || context!==self.context())
+            throw error("stale_binding","Panel scope changed before dispatch");
+        return self.request(descriptor,guard.credential,"/panel",payload,confirming ? 300000 : 15000);
+    }).then(function(response){
         if(!record(response) || Object.keys(response).length!==1 || !Object.prototype.hasOwnProperty.call(response,"result"))throw error("invalid_response","Panel service must return {result}");
-        if(self.context()!==context)throw error("stale_binding","Connection or binding changed during panel request");
+        if(guard.stale || guard.scope!==self.scope() || guard.credential!==self.store.state.credential)throw error("stale_binding","Connection or binding changed during panel request");
         var r=response.result;
+        if(confirming){
+            var validPath=function(value){
+                return text(value,32768) && !/[\x00-\x1f]/.test(value) && (path.posix.isAbsolute(value) || path.win32.isAbsolute(value));
+            };
+            if(!record(r) || !text(r.checkpointId,256) || !text(r.currentCheckpointId,256) || r.currentCheckpointId===r.checkpointId ||
+                typeof r.recoveryCopy!=="boolean" || r.canonicalReplaced!==!r.recoveryCopy || r.rebindRequired!==r.recoveryCopy || r.automationSuspended!==r.recoveryCopy ||
+                !text(r.fingerprint,64) || !/^[a-f0-9]{64}$/.test(r.fingerprint) || !text(r.warning,65536) || !r.warning.trim() ||
+                !(r.cleanup=== null || (text(r.cleanup,65536) && r.cleanup.trim())) ||
+                ["path","canonicalPath","emergencyPath"].some(function(k){return !validPath(r[k]);}) ||
+                !(r.originalPath===undefined || r.originalPath=== null || validPath(r.originalPath)) ||
+                (r.recoveryCopy ? r.path===r.canonicalPath : r.path!==r.canonicalPath) || r.emergencyPath===r.path || r.emergencyPath===r.canonicalPath ||
+                (r.originalPath && [r.path,r.canonicalPath,r.emergencyPath].indexOf(r.originalPath)>=0))
+                throw error("invalid_response","Invalid restore completion or backup disclosure");
+            if(r.checkpointId!==approval.checkpointId || r.canonicalPath!==approval.source.path)throw error("stale_binding","Restore completed for a different source");
+        }
+        if(self.context()!==context){
+            var p=self.state.project,bp=self.state.binding && self.state.binding.project;
+            // Only the authenticated backend's guarded fallback may change this request's project.
+            // Canonical completion must return to the original identity; ordinary services stay strict.
+            if(!confirming || !r.recoveryCopy || !record(p) || !record(bp) || !text(p.id,256) ||
+                p.path!==r.path || bp.path!==r.path || p.id!==bp.id || p.saved!==true || bp.saved!==true)
+                throw error("stale_binding","Project changed during panel request");
+        }
+        if(confirming){
+            r={checkpointId:r.checkpointId,currentCheckpointId:r.currentCheckpointId,path:r.path,canonicalPath:r.canonicalPath,
+                emergencyPath:r.emergencyPath,originalPath:r.originalPath || null,recoveryCopy:r.recoveryCopy,canonicalReplaced:r.canonicalReplaced,
+                rebindRequired:r.rebindRequired,automationSuspended:r.automationSuspended,fingerprint:r.fingerprint,cleanup:r.cleanup,warning:r.warning};
+        }
         if(action==="checkpoints"){
             if(!Array.isArray(r) || r.length>10000)throw error("invalid_response","Expected bounded checkpoint list");
             r=r.map(function(c){
@@ -234,13 +412,16 @@ Client.prototype.panel=function(action,args){
         } else if(action==="diagnostics"){
             if(!record(r))throw error("invalid_response","Expected sanitized diagnostic metadata");
         } else if(action==="checkpoint.restore.propose"){
-            if(!record(r) || !text(r.token,4096) || !Number.isFinite(r.sourceTimestamp) || !(r.destinationTimestamp === null || Number.isFinite(r.destinationTimestamp)))throw error("invalid_response","Invalid restore proposal");
-            self.restoreApproval={token:r.token,context:context};
-            r={sourceTimestamp:r.sourceTimestamp,destinationTimestamp:r.destinationTimestamp};
+            if(!record(r) || !text(r.token,4096) || !Number.isFinite(r.sourceTimestamp) || Math.abs(r.sourceTimestamp)>8640000000000000 ||
+                !(r.destinationTimestamp=== null || (Number.isFinite(r.destinationTimestamp) && Math.abs(r.destinationTimestamp)<=8640000000000000)) ||
+                !text(r.operation,65536) || !r.operation.trim())throw error("invalid_response","Invalid restore proposal or missing bounded operation");
+            self.restoreApproval={token:r.token,context:context,credential:guard.credential,checkpointId:payload.id,source:sourceProject,operation:r.operation};
+            r={sourceTimestamp:r.sourceTimestamp,destinationTimestamp:r.destinationTimestamp,operation:r.operation};
         }
         return r;
-    }).then(function(r){self.panelPending=false;self.emit();return r;},function(e){
-        self.panelPending=false;
+    }).then(function(r){self.panelPending=false;self.panelGuard=null;self.emit();return r;},function(e){
+        self.panelPending=false;self.panelGuard=null;
+        if(proposing)self.restoreApproval=null;
         if(action==="checkpoint.restore.confirm" && ["disconnected","invalid_response","stale_binding","outcome_uncertain","uncertain_outcome"].indexOf(e.code)>=0){
             self.state.busy=true;self.mark(true);
         }
@@ -253,35 +434,139 @@ Client.prototype.confirmRestore=function(){
 };
 Client.prototype.mark=function(value){this.store.state.uncertain=value;this.store.save();this.state.uncertain=value;};
 Client.prototype.discover=function(){
-    var d=this.store.descriptor();this.state.bridgeVersion=d.version;
-    if(d.protocol!==PROTOCOL || d.version!==VERSION){this.state.connection="incompatible";this.emit();throw error("incompatible_version","Panel "+VERSION+" requires matching bridge; installed "+d.version);}
+    var d=this.store.descriptor(),prior=this.descriptor;
+    if(!prior || prior.instanceId!==d.instanceId || prior.port!==d.port || prior.version!==d.version || prior.protocol!==d.protocol)this.state.compatibility=null;
+    this.state.bridgeVersion=validVersion(d.version) ? d.version : "";
     this.descriptor=d;return d;
+};
+Client.prototype.negotiate=function(endpoint,body){
+    var self=this,d=Object.assign({},self.descriptor),credential=self.store.state.credential,generation=self.connectionGeneration,panelId=self.store.state.panelId;
+    function current(){
+        return self.descriptor && self.descriptor.instanceId===d.instanceId && self.descriptor.port===d.port &&
+            self.descriptor.version===d.version && self.descriptor.protocol===d.protocol &&
+            self.store.state.credential===credential && self.connectionGeneration===generation && self.store.state.panelId===panelId;
+    }
+    function metadata(value){
+        var m=compatibilityMetadata(value);
+        if(endpoint!=="/rotate" && (m.panelVersion!==VERSION || m.panelProtocol!==PROTOCOL))
+            throw error("invalid_response","Compatibility report belongs to a different panel version");
+        return m;
+    }
+    self.state.compatibility=null;self.emit();
+    return Promise.resolve().then(function(){
+        if(!current())throw error("stale_binding","Negotiation scope changed");
+        return self.request(d,endpoint==="/pair" ? null : credential,endpoint,body);
+    }).then(function(r){
+        if(!current())throw error("stale_binding","Negotiation scope changed");
+        if(!record(r) || !text(r.connectionId,256))throw error("invalid_response","Missing negotiation identity");
+        var m=metadata(r.compatibility);
+        if(r.protocol!==m.protocol || r.version!==m.pluginVersion || r.updateUrl!==m.releaseSourceUrl)
+            throw error("invalid_response","Inconsistent negotiation metadata");
+        self.state.compatibility=m;self.state.bridgeVersion=m.pluginVersion;
+        if(m.status==="incompatible" || r.protocol!==PROTOCOL || r.version!==VERSION)throw error("incompatible_version","Install matching panel and bridge versions");
+        return r;
+    }).catch(function(e){
+        if(!current())throw error("stale_binding","Negotiation scope changed");
+        if(["incompatible","incompatible_version"].indexOf(e.code)>=0){
+            if(e.details && Object.prototype.hasOwnProperty.call(e.details,"compatibility")){
+                try { self.state.compatibility=metadata(e.details.compatibility);self.state.bridgeVersion=self.state.compatibility.pluginVersion; }
+                catch(invalid){self.state.compatibility=null;e=invalid;}
+            }
+            self.state.connection="incompatible";
+        } else {self.state.compatibility=null;if(self.state.connection!=="incompatible")self.state.connection="disconnected";}
+        self.state.binding=null;self.stop();self.emit();throw e;
+    });
 };
 Client.prototype.send=function(endpoint,body){return this.request(this.descriptor,this.store.state.credential,endpoint,body);};
 Client.prototype.pair=function(code){
     var self=this;
     if(self.inFlight || self.state.busy || self.state.uncertain)return Promise.reject(error("outcome_uncertain","Reconcile before pairing"));
-    self.discover();
+    if(self.store.state.credential)return Promise.reject(error("already_paired","This profile already has a credential. Explicitly unpair or rotate it instead."));
     if(!text(code,64))return Promise.reject(error("invalid_pairing_code","Enter the pairing code generated in chat"));
-    return self.request(self.descriptor,null,"/pair",{code:code,protocol:PROTOCOL,version:VERSION,panelId:self.store.state.panelId}).then(function(r){self.acceptCredential(r);self.state.connection="paired";self.emit();});
+    self.discover();
+    return self.negotiate("/pair",{code:code,protocol:PROTOCOL,version:VERSION,panelId:self.store.state.panelId}).then(function(r){self.acceptCredential(r);self.state.connection="paired";self.emit();});
 };
 Client.prototype.acceptCredential=function(r){
     if(!record(r) || r.protocol!==PROTOCOL || r.version!==VERSION || !/^[A-Za-z0-9_-]{43}$/.test(r.credential) || !text(r.connectionId,256))throw error("invalid_response","Malformed pairing/rotation response");
-    this.store.state.credential=r.credential;this.store.save();this.state.binding=null;this.state.lock=null;
+    var previous=this.store.state.credential;
+    this.store.state.credential=r.credential;
+    try { this.store.save(); } catch(e) { this.store.state.credential=previous;throw e; }
+    this.connectionGeneration++;this.connectionId=r.connectionId;this.connectionEpoch=null;
+    this.state.binding=null;this.state.lock=null;
+};
+Client.prototype.recoverCredential=function(code){
+    var self=this;
+    if(self.inFlight || self.panelPending || self.host.pending || self.state.busy && !self.state.uncertain)
+        return Promise.reject(error("host_busy","Wait for outstanding host and panel work before credential recovery"));
+    if(!self.store.state.credential)return Promise.reject(error("not_paired","Use Pair for a profile without a credential"));
+    if(!text(code,64) || !code.trim())return Promise.reject(error("invalid_pairing_code","Enter a fresh single-use code from chat"));
+    self.stop();
+    var d=Object.assign({},self.discover());
+    if(d.protocol!==PROTOCOL || d.version!==VERSION)return Promise.reject(error("incompatible_version","Install matching versions before credential recovery"));
+    self.connectionGeneration++;
+    var generation=self.connectionGeneration,credential=self.store.state.credential,panelId=self.store.state.panelId,connectionId=self.connectionId;
+    function current(){
+        var latest=self.store.descriptor();
+        if(self.connectionGeneration!==generation || self.store.state.credential!==credential || self.store.state.panelId!==panelId ||
+            self.descriptor.instanceId!==d.instanceId || self.descriptor.port!==d.port ||
+            latest.instanceId!==d.instanceId || latest.port!==d.port || latest.protocol!==d.protocol || latest.version!==d.version)
+            throw error("stale_binding","Credential recovery scope changed");
+        if(self.host.pending || self.panelPending)throw error("host_busy","Work started during credential recovery");
+    }
+    self.inFlight=true;self.recovering=true;self.state.connection="disconnected";self.state.binding=null;self.emit();
+    // ponytail: existing code-authenticated /pair revokes the server secret in place; no local reset or new endpoint.
+    return Promise.resolve().then(function(){
+        if(self.state.uncertain || self.host.uncertain)self.mark(true);
+        current();
+        return self.negotiate("/compatibility",{panelId:panelId,protocol:PROTOCOL,version:VERSION}).then(function(){
+            throw error("credential_valid","Credential still works; use Reconnect or Rotate instead");
+        },function(e){
+            if(e.code!=="unauthorized")throw e;
+            current();
+            return self.negotiate("/pair",{code:code,protocol:PROTOCOL,version:VERSION,panelId:panelId});
+        });
+    }).then(function(r){
+        current();
+        if(connectionId && r.connectionId!==connectionId)throw error("invalid_response","Recovery changed connection identity");
+        var lock=self.state.lock;
+        self.acceptCredential(r);self.state.lock=lock;
+        self.state.connection="paired";self.state.lastError="";
+    }).then(function(){
+        self.inFlight=false;self.recovering=false;self.stop();self.emit();
+    },function(e){
+        self.inFlight=false;self.recovering=false;self.stop();self.emit();throw e;
+    });
 };
 Client.prototype.management=function(endpoint){
     var self=this;
     if(["/disconnect","/unpair","/rotate"].indexOf(endpoint)<0)return Promise.reject(error("invalid_method","Invalid management action"));
-    if(self.inFlight || self.state.busy || self.state.uncertain)return Promise.reject(error("outcome_uncertain","Wait for host completion and reconcile before changing pairing"));
-    self.stop();
-    return self.send(endpoint,{}).then(function(r){
+    if(self.inFlight || self.panelPending || self.host.pending || self.state.busy || self.state.uncertain)return Promise.reject(error("outcome_uncertain","Wait for host completion and reconcile before changing pairing"));
+    if(endpoint==="/rotate"){
+        var incompatible=self.state.connection==="incompatible" || self.state.compatibility && self.state.compatibility.status==="incompatible",d=self.discover();
+        if(incompatible || d.protocol!==PROTOCOL || d.version!==VERSION){
+            self.state.connection="incompatible";self.state.binding=null;self.stop();self.emit();
+            return Promise.reject(error("incompatible_version","Install matching versions and reconnect before rotating"));
+        }
+    }
+    self.connectionGeneration++;self.stop();
+    var generation=self.connectionGeneration,credential=self.store.state.credential;
+    var pending=endpoint==="/rotate" ? self.negotiate("/compatibility",{panelId:self.store.state.panelId,protocol:PROTOCOL,version:VERSION}).then(function(){
+        var latest=self.store.descriptor();
+        if(generation!==self.connectionGeneration || credential!==self.store.state.credential || latest.instanceId!==d.instanceId ||
+            latest.port!==d.port || latest.protocol!==d.protocol || latest.version!==d.version)
+            throw error("stale_binding","Rotation scope changed");
+        return self.negotiate(endpoint,{});
+    }) : self.send(endpoint,{});
+    return pending.then(function(r){
         if(endpoint==="/rotate")self.acceptCredential(r);
-        if(endpoint==="/unpair"){self.store.state.credential=null;self.store.save();}
+        if(endpoint==="/unpair"){self.store.state.credential=null;self.store.save();self.state.compatibility=null;}
         self.state.connection=self.store.state.credential ? "paired" : "unpaired";self.state.binding=null;self.state.lock=null;self.emit();
     });
 };
 Client.prototype.status=function(){
     var self=this;
+    if(self.recovering)return Promise.reject(error("host_busy","Credential recovery is outstanding"));
+    if(self.state.connection==="incompatible")return Promise.reject(error("incompatible_version","Host access is stopped until versions match"));
     return self.host.call("status",{}).then(function(s){
         if(!record(s) || !record(s.project) || !record(s.capabilities) || typeof s.capabilities.fileNetwork!=="boolean" || !text(s.aeVersion,128) ||
             !(s.activeCompId === null || (Number.isSafeInteger(s.activeCompId) && s.activeCompId>0)))throw error("invalid_host_result","Host status incomplete");
@@ -299,16 +584,33 @@ Client.prototype.heartbeat=function(){
 };
 Client.prototype.connect=function(){
     var self=this;
-    self.discover();
-    return self.status().then(function(s){
-        return self.send("/connect",{protocol:PROTOCOL,version:VERSION,panelId:self.store.state.panelId,project:s.project,activeCompId:s.activeCompId,aeVersion:s.aeVersion,capabilities:s.capabilities});
+    if(self.recovering)return Promise.reject(error("host_busy","Credential recovery is outstanding"));
+    if(self.state.uncertain)return Promise.reject(error("outcome_uncertain","Reconcile before connecting"));
+    if(!self.store.state.credential)return Promise.reject(error("invalid_pairing_code","Pair with a valid code before connecting"));
+    self.connectionGeneration++;
+    var d=self.discover(),mismatch=d.protocol!==PROTOCOL || d.version!==VERSION;
+    return Promise.resolve().then(function(){
+        if(!mismatch)return;
+        self.state.connection="incompatible";self.state.binding=null;self.stop();self.emit();
+        return self.negotiate("/compatibility",{panelId:self.store.state.panelId,protocol:PROTOCOL,version:VERSION}).then(function(){
+            self.state.connection="incompatible";self.stop();self.emit();
+            throw error("incompatible_version","Descriptor differs from this panel; install matching versions");
+        });
+    }).then(function(){
+        self.state.connection="paired";
+        return self.status();
+    }).then(function(s){
+        return self.negotiate("/connect",{protocol:PROTOCOL,version:VERSION,panelId:self.store.state.panelId,project:s.project,activeCompId:s.activeCompId,aeVersion:s.aeVersion,capabilities:s.capabilities});
     }).then(function(r){
-        if(r.protocol!==PROTOCOL || r.version!==VERSION)throw error("incompatible_version","Bridge negotiation mismatch");
+        if(!record(r) || r.protocol!==PROTOCOL || r.version!==VERSION)throw error("incompatible_version","Bridge negotiation mismatch");
+        if(!text(r.connectionId,256) || !(r.epoch===undefined || text(r.epoch,256)))throw error("invalid_response","Missing connection identity");
+        self.connectionId=r.connectionId;self.connectionEpoch=r.epoch || null;
         self.state.connection="connected";self.state.binding=null;self.state.lock=null;self.emit();
     });
 };
 Client.prototype.command=function(cmd){
     var self=this, reply, beatTimer, beat=Promise.resolve(), beatError, finished=false, dispatched=false;
+    if(self.state.connection==="incompatible")return Promise.reject(error("incompatible_version","Host automation is stopped until versions match"));
     if(!record(cmd) || Object.keys(cmd).sort().join(",")!=="id,method,params,sessionID" || !text(cmd.id,256) || !text(cmd.sessionID,256) || !record(cmd.params) || ["inspect","preflight","save","execute","open","raw","capture","templates"].indexOf(cmd.method)<0) return Promise.reject(error("invalid_command","Malformed or unsupported command"));
     var b=self.state.binding, writes=["save","execute","open","raw"].indexOf(cmd.method)>=0;
     function bound(){
@@ -356,7 +658,7 @@ Client.prototype.command=function(cmd){
 };
 Client.prototype.tick=function(){
     var self=this;
-    if(self.inFlight || self.state.uncertain)return Promise.resolve();
+    if(self.inFlight || self.state.uncertain || self.state.connection==="incompatible" || !self.store.state.credential)return Promise.resolve();
     self.inFlight=true;
     return Promise.resolve().then(function(){
         var d=self.store.descriptor();
@@ -366,22 +668,23 @@ Client.prototype.tick=function(){
         if(!record(r) || !Object.prototype.hasOwnProperty.call(r,"command"))throw error("invalid_response","Malformed poll");
         if(r.command !== null)return self.command(r.command);
     }).catch(function(e){
-        self.state.lastError=e.code || "panel_error";self.state.connection=e.code==="incompatible_version" || e.code==="incompatible" ? "incompatible" : "disconnected";self.state.binding=null;
+        self.state.lastError=e.code || "panel_error";self.state.connection=self.state.connection==="incompatible" || e.code==="incompatible_version" || e.code==="incompatible" ? "incompatible" : "disconnected";self.state.binding=null;
         if(self.store.state.uncertain || self.host.uncertain){self.state.uncertain=true;self.state.busy=true;try{self.mark(true);}catch(ignore){}}
         if(e.code==="unauthorized")self.running=false;
         self.emit();
     }).then(function(){self.inFlight=false;});
 };
 Client.prototype.start=function(){
-    var self=this;if(self.running)return;self.running=true;
+    var self=this;if(self.running || self.state.connection==="incompatible" || !self.store.state.credential)return;self.running=true;
     function loop(){if(!self.running)return;self.tick().then(function(){if(self.running)self.timer=setTimeout(loop,1000);});}loop();
 };
 Client.prototype.stop=function(){this.running=false;clearTimeout(this.timer);};
 Client.prototype.reconcile=function(){
     var self=this;self.stop();
+    if(self.state.connection==="incompatible")return Promise.reject(error("incompatible_version","Install matching versions before host reconciliation"));
     if(self.inFlight || self.host.pending)return Promise.reject(error("host_busy","evalScript is still outstanding; wait for it to return or restart AE and inspect recovery state"));
     // Local confirmation clears only the panel/host latch, never the bridge's durable lock.
     self.host.uncertain=false;
     return self.host.call("reconcile",{}).then(function(){self.mark(false);self.state.busy=false;self.state.capture=null;self.state.binding=null;self.state.connection="paired";self.emit();self.start();},function(e){self.host.uncertain=true;throw e;});
 };
-module.exports={Store:Store,Client:Client,HostRPC:HostRPC,request:request,normalizeCapture:normalizeCapture,cleanupCapture:cleanupCapture,secure:secure,VERSION:VERSION,PROTOCOL:PROTOCOL};
+module.exports={Store:Store,Client:Client,HostRPC:HostRPC,request:request,compatibilityMetadata:compatibilityMetadata,normalizeCapture:normalizeCapture,cleanupCapture:cleanupCapture,secure:secure,VERSION:VERSION,PROTOCOL:PROTOCOL};

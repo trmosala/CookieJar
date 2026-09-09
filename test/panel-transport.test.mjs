@@ -6,8 +6,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { createBridge } from "../src/bridge.mjs";
 import transport from "../panel/transport.cjs";
+import { restoreFixture } from "./bridge-panel.mjs";
+import { createRuntime } from "../src/plugin.mjs";
+import { createCheckpoints } from "../src/storage.mjs";
+import fsp from "node:fs/promises";
+import { releaseMetadata } from "../src/protocol.mjs";
+import { createRequire } from "node:module";
+const compatibility=()=>({status:"compatible",pluginVersion:"0.1.0",protocol:1,panelVersion:"0.1.0",panelProtocol:1,...releaseMetadata()});
 const { Client, HostRPC, Store, request, normalizeCapture } = transport;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const descriptor = {port:12345,instanceId:"instance",protocol:1,version:"0.1.0",updateUrl:"https://github.com/trmosala/CookieJar/releases"};
@@ -22,7 +31,7 @@ function fixture(overrides={}) {
         normalize:async r=>({mime:"image/png",data:"AAAA",width:1,height:1}),
         request:async(d,c,endpoint,body)=>{
             events.push([endpoint,body,c]);
-            if(endpoint==="/connect")return {connectionId:"connection",protocol:1,version:"0.1.0"};
+            if(endpoint==="/connect" || endpoint==="/compatibility")return {connectionId:"connection",protocol:1,version:"0.1.0",updateUrl:descriptor.updateUrl,compatibility:compatibility()};
             if(endpoint==="/heartbeat")return {binding,lock:{state:"executing"}};
             if(endpoint==="/poll"){const c=command;command=null;return {command:c};}
             return {ok:true};
@@ -37,16 +46,19 @@ test("panel management sends exact authenticated schemas and requires an explici
     f.client.request=async(d,credential,endpoint,body)=>{
         assert.equal(endpoint,"/panel");assert.equal(credential,f.store.state.credential);f.events.push([endpoint,structuredClone(body)]);
         if(body.action==="checkpoints")return {result:rows};
-        if(body.action==="checkpoint.restore.propose")return {result:{token:"opaque-token",sourceTimestamp:1000,destinationTimestamp:2000}};
+        if(body.action==="checkpoint.restore.propose")return {result:{token:"opaque-token",sourceTimestamp:1000,destinationTimestamp:2000,operation:"Save edits and restore checkpoint."}};
         if(body.action==="diagnostics")return {result:{version:"0.1.0",counts:{jobs:0}}};
         if(body.action==="renders")return {result:[{id:"job",state:"completed"}]};
+        if(body.action==="checkpoint.restore.confirm")return {result:{checkpointId:"cp",currentCheckpointId:"backup",path:project.path,
+            canonicalPath:project.path,emergencyPath:"c:/private/emergency.aep",originalPath:"c:/private/original.aep",recoveryCopy:false,
+            canonicalReplaced:true,rebindRequired:false,automationSuspended:false,fingerprint:"f".repeat(64),cleanup:null,warning:"Keep backups."}};
         return {result:{ok:true}};
     };
     assert.deepEqual(await f.client.panel("checkpoints",{}),[{id:"cp",createdAt:1000,pinned:false,storageMode:"project",size:123}]);
     await f.client.panel("checkpoint.pin",{id:"cp",pinned:true});
     await f.client.panel("checkpoint.delete",{id:"cp"});
     const proposal=await f.client.panel("checkpoint.restore.propose",{id:"cp"});
-    assert.deepEqual(proposal,{sourceTimestamp:1000,destinationTimestamp:2000});assert.equal("token" in proposal,false);
+    assert.deepEqual(proposal,{sourceTimestamp:1000,destinationTimestamp:2000,operation:"Save edits and restore checkpoint."});assert.equal("token" in proposal,false);
     assert.equal(f.events.some(e=>e[1]?.action==="checkpoint.restore.confirm"),false);
     await f.client.confirmRestore();
     assert.deepEqual(f.events.find(e=>e[0]==="/panel" && e[1].action==="checkpoint.restore.confirm")[1],{action:"checkpoint.restore.confirm",token:"opaque-token"});
@@ -59,7 +71,7 @@ test("panel management sends exact authenticated schemas and requires an explici
 });
 test("restore approval is invalidated by binding switch/cancel and consumed even when confirmation fails",async()=>{
     const f=fixture();f.client.state.lock=null;
-    f.client.request=async(d,c,e,body)=>body.action==="checkpoint.restore.propose" ? {result:{token:"once",sourceTimestamp:1,destinationTimestamp:null}} : Promise.reject(Object.assign(new Error("lost response"),{code:"disconnected"}));
+    f.client.request=async(d,c,e,body)=>body.action==="checkpoint.restore.propose" ? {result:{token:"once",sourceTimestamp:1,destinationTimestamp:null,operation:"Save edits and restore checkpoint."}} : Promise.reject(Object.assign(new Error("lost response"),{code:"disconnected"}));
     await f.client.panel("checkpoint.restore.propose",{id:"cp"});
     f.client.state.binding={...f.binding,id:"new-binding"};f.client.emit();
     await assert.rejects(f.client.confirmRestore(),{code:"invalid_token"});
@@ -83,6 +95,120 @@ test("panel response validation rejects stale/malformed responses and pending se
     await assert.rejects(f.client.panel("checkpoints",{}),{code:"invalid_response"});
     f.client.request=async()=>({ok:true});
     await assert.rejects(f.client.panel("diagnostics",{}),{code:"invalid_response"});
+});
+test("restore completion accepts the same owner's validated fallback without weakening ordinary context guards",async()=>{
+    const f=fixture();f.client.state.lock=null;
+    const result={checkpointId:"cp",currentCheckpointId:"backup",path:"c:/private/recovery.aep",canonicalPath:project.path,
+        emergencyPath:"c:/private/emergency.aep",originalPath:"c:/private/original.aep",recoveryCopy:true,
+        canonicalReplaced:false,rebindRequired:true,automationSuspended:true,fingerprint:"f".repeat(64),cleanup:null,warning:"Review retained backups."};
+    f.client.request=async(d,c,e,body)=>{
+        if(body.action==="checkpoint.restore.propose")return {result:{token:"once",sourceTimestamp:1,destinationTimestamp:2,operation:"Save current edits; restore the checkpoint."}};
+        const next={id:"recovery",path:result.path,saved:true};
+        f.client.state.project=next;f.client.state.binding={...f.binding,project:next};f.client.emit();
+        return {result};
+    };
+    await f.client.panel("checkpoint.restore.propose",{id:"cp"});
+    assert.deepEqual(await f.client.confirmRestore(),result);
+    assert.equal(f.client.restoreApproval,null);
+});
+test("restore completion refuses stale owners, reconnects, foreign sources and malformed recovery evidence",async()=>{
+    const cases=[
+        ["port",f=>{f.client.descriptor.port++;},"stale_binding"],
+        ["instance",f=>{f.client.descriptor.instanceId="restarted";},"stale_binding"],
+        ["credential",f=>{f.store.state.credential="b".repeat(43);},"stale_binding"],
+        ["connection",f=>{f.client.connectionId="other";},"stale_binding"],
+        ["epoch",f=>{f.client.connectionEpoch="new-epoch";},"stale_binding"],
+        ["binding",f=>{f.client.state.binding={...f.binding,id:"other"};},"stale_binding"],
+        ["session",f=>{f.client.state.binding={...f.binding,sessionID:"other"};},"stale_binding"],
+        ["binding connection",f=>{f.client.state.binding={...f.binding,connectionId:"other"};},"stale_binding"],
+        ["suspension",f=>{f.client.state.binding={...f.binding,state:"suspended"};},"stale_binding"],
+        ["transient disconnect",f=>{f.client.state.connection="disconnected";f.client.emit();f.client.state.connection="connected";},"stale_binding"],
+        ["reconnect",async f=>{await f.client.connect();f.client.state.binding=f.binding;},"stale_binding"],
+        ["project",f=>{f.client.state.project={...project,id:"foreign"};},"stale_binding"],
+        ["checkpoint",(f,r)=>{r.checkpointId="foreign";},"stale_binding"],
+        ["source",(f,r)=>{r.canonicalPath=r.path="c:/foreign.aep";},"stale_binding"],
+        ["flags",(f,r)=>{r.rebindRequired=true;},"invalid_response"],
+        ["warning",(f,r)=>{r.warning=" ";},"invalid_response"],
+        ["oversized warning",(f,r)=>{r.warning="x".repeat(65537);},"invalid_response"],
+        ["backup",(f,r)=>{delete r.currentCheckpointId;},"invalid_response"],
+        ["fingerprint",(f,r)=>{r.fingerprint="not verified";},"invalid_response"],
+        ["relative backup",(f,r)=>{r.emergencyPath="relative.aep";},"invalid_response"],
+        ["backup control",(f,r)=>{r.originalPath="c:/bad\npath";},"invalid_response"],
+        ["original overlaps",(f,r)=>{r.originalPath=r.path;},"invalid_response"],
+        ["cleanup",(f,r)=>{r.cleanup={};},"invalid_response"],
+        ["wrong fallback path",(f,r)=>{
+            Object.assign(r,{recoveryCopy:true,canonicalReplaced:false,rebindRequired:true,automationSuspended:true,path:"c:/private/recovery.aep"});
+            const next={id:"foreign",path:"c:/foreign.aep",saved:true};
+            f.client.state.project=next;f.client.state.binding={...f.binding,project:next};
+        },"stale_binding"],
+    ];
+    for(const [name,change,code] of cases){
+        const f=fixture();f.client.state.lock=null;
+        const send=f.client.request;
+        const result={checkpointId:"cp",currentCheckpointId:"backup",path:project.path,canonicalPath:project.path,
+            emergencyPath:"c:/private/emergency.aep",originalPath:"c:/private/original.aep",recoveryCopy:false,
+            canonicalReplaced:true,rebindRequired:false,automationSuspended:false,fingerprint:"f".repeat(64),cleanup:null,warning:"Keep backups."};
+        f.client.request=async(d,c,e,body)=>{
+            if(e!=="/panel")return send(d,c,e,body);
+            if(body.action==="checkpoint.restore.propose")return {result:{token:"once",sourceTimestamp:1,destinationTimestamp:2,operation:"Save edits; restore."}};
+            await change(f,result);return {result};
+        };
+        await f.client.panel("checkpoint.restore.propose",{id:"cp"});
+        await assert.rejects(f.client.confirmRestore(),{code},name);
+        assert.equal(f.client.restoreApproval,null,name);
+        assert.equal(f.store.state.uncertain,true,name);
+        assert.equal(f.client.panelPending,false,name);
+    }
+});
+test("Client validates proposal operation and timestamps before retaining a single-use approval",async()=>{
+    for(const change of [
+        r=>{delete r.operation;},r=>{r.operation="";},r=>{r.operation=" \n";},r=>{r.operation={};},
+        r=>{r.operation="x".repeat(65537);},r=>{r.sourceTimestamp=1e20;},r=>{r.destinationTimestamp=NaN;}
+    ]){
+        const f=fixture();f.client.state.lock=null;
+        const result={token:"once",sourceTimestamp:1,destinationTimestamp:2,operation:"Save edits; restore."};
+        f.client.request=async()=>({result});
+        await f.client.panel("checkpoint.restore.propose",{id:"cp"});
+        change(result);
+        await assert.rejects(f.client.panel("checkpoint.restore.propose",{id:"cp"}),{code:"invalid_response"});
+        assert.equal(f.client.restoreApproval,null);
+        await assert.rejects(f.client.confirmRestore(),{code:"invalid_token"});
+    }
+});
+test("actual Client.panel restore returns canonical and fallback backups through the production services",async t=>{
+    for(const fallback of [false,true]){
+        await t.test(fallback ? "fallback" : "canonical",async t=>{
+            const f=await restoreFixture(t),{p,h,client,sessionID}=f;
+            const checkpoints=createCheckpoints({dataDir:p.dataDir}),canonical=h.project.file.fsName;
+            const checkpoint=await checkpoints.create({projectPath:canonical,projectId:h.call("inspect").result.project.id,planHash:"panel-restore"});
+            h.props[0].setValue(42);
+            await createRuntime({factories:{bridge:async()=>p.bridge,renderer:async()=>({list:async()=>[],close:async()=>{}})}});
+            for(let i=0;!client.state.binding && i<200;i++)await sleep(10);
+            const review=await client.panel("checkpoint.restore.propose",{id:checkpoint.id});
+            assert.match(review.operation,/private emergency project/);assert.equal("token" in review,false);
+            assert.equal(h.project.dirty,true);assert.equal(h.closes,0);
+            const rename=fsp.rename.bind(fsp);
+            const fault=t.mock.method(fsp,"rename",async(source,destination)=>{
+                if(fallback && source===canonical)throw Object.assign(new Error("canonical locked"),{code:"EACCES"});
+                return rename(source,destination);
+            });
+            const result=await client.confirmRestore();
+            fault.mock.restore();
+            assert.equal(result.recoveryCopy,fallback);assert.equal(result.canonicalReplaced,!fallback);
+            assert.equal(result.rebindRequired,fallback);assert.equal(result.automationSuspended,fallback);
+            assert.equal(result.canonicalPath,canonical);assert.equal(result.path,h.project.file.fsName);
+            assert.equal(h.closes,1);assert.equal(h.props[0].value,100);assert.ok(result.warning);
+            const backup=await checkpoints.verify(result.currentCheckpointId);
+            assert.equal(JSON.parse(await fsp.readFile(backup.path,"utf8")).props[0].value,42);
+            assert.equal(JSON.parse(await fsp.readFile(result.emergencyPath,"utf8")).props[0].value,42);
+            assert.deepEqual(f.commands.filter(c=>c.params.phase?.startsWith("restore_")).map(c=>c.params.phase),["restore_prepare","restore_finish"]);
+            assert.equal(p.bridge.binding(sessionID,{allowLocked:true}).lock?.state || null,fallback ? "uncertain" : null);
+            const list=await client.panel("checkpoints",{});
+            assert.equal(list.some(c=>c.id===result.currentCheckpointId),false,"backup disclosure must not broaden checkpoint scope");
+            await assert.rejects(client.confirmRestore(),{code:"invalid_token"});
+            await f.stop();
+        });
+    }
 });
 test("evalScript transports quoted JSON, times out once, ignores late success and remains locked",async()=>{
     let callback,calls=0,late=0;
@@ -140,6 +266,255 @@ test("host status rejects invalid active composition metadata before connect or 
         assert.equal(f.client.state.connection,"disconnected");
     }
 });
+test("compatibility real bridge reports authenticated mismatches without host dispatch or credential replacement",async()=>{
+    const root=fs.mkdtempSync(path.join(os.tmpdir(),"cm-panel-compat-")),dataDir=path.join(root,"bridge");
+    let bridge;
+    const source=fs.readFileSync(new URL("../panel/transport.cjs",import.meta.url),"utf8");
+    const exports={exports:{}};
+    vm.runInNewContext(source.replace('var VERSION = "0.1.0", PROTOCOL = 1','var VERSION = "0.2.0", PROTOCOL = 2'),
+        {module:exports,require:createRequire(import.meta.url),Buffer,process,setTimeout,clearTimeout});
+    const FutureClient=exports.exports.Client;
+    const releases={cookieMonsterVersion:"2.4.1",updates:{
+        plugin:{version:"0.1.0",protocol:1,url:"https://releases.example.test/plugin"},
+        panel:{version:"0.1.0",protocol:1,url:"https://releases.example.test/panel"},
+        cookieMonster:{version:"2.4.1",protocol:1,url:"https://releases.example.test/desktop"}
+    }};
+    try{
+        bridge=await createBridge({dataDir,releaseMetadata:releases});
+        const d=JSON.parse(fs.readFileSync(path.join(dataDir,"descriptor.json"),"utf8")),calls=[];
+        const store={state:{panelId:"compat-panel",credential:null,uncertain:false},save(){},descriptor:()=>({...d})};
+        const host={call:async()=>{calls.push("host");return status;}};
+        const current=new Client({store,host});
+        await current.pair(bridge.pairingCode("compat-session").code);
+        assert.equal(current.state.compatibility.cookieMonsterVersion,"2.4.1");
+        await current.connect();
+        assert.equal(current.state.compatibility.status,"compatible");
+        assert.equal(current.state.compatibility.updates.panel.url,releases.updates.panel.url);
+        await bridge.bind("compat-session",current.connectionId);
+        await bridge.lock("compat-session",{kind:"recovery-test"});
+        const before={...store.state};calls.length=0;
+        const rotations=[];
+        const future=new FutureClient({store,host,request:(d,c,e,b)=>{rotations.push(e);return request(d,c,e,b);}});
+        future.discover();
+        await assert.rejects(future.management("/rotate"),{code:"incompatible_version"});
+        assert.deepEqual(rotations,[],"mismatched rotation must be refused before dispatch");
+        assert.deepEqual(store.state,before);
+        assert.equal((await request(d,before.credential,"/compatibility",{panelId:before.panelId,protocol:1,version:"0.1.0"})).connectionId,current.connectionId);
+        await assert.rejects(future.connect(),{code:"incompatible_version"});
+        future.start();
+        for(let i=0;future.inFlight && i<200;i++)await sleep(10);
+        assert.equal(future.state.connection,"incompatible");assert.equal(future.running,false);
+        assert.equal(future.state.compatibility.panelVersion,"0.2.0");
+        assert.equal(future.state.compatibility.panelProtocol,2);
+        assert.equal(future.state.compatibility.updates.panel.version,"0.1.0");
+        assert.deepEqual(calls,[]);assert.deepEqual(store.state,before);
+        await future.tick();future.start();assert.deepEqual(calls,[]);
+        await assert.rejects(future.status(),{code:"incompatible_version"});
+        await assert.rejects(future.command({}),{code:"incompatible_version"});
+        const live=(await bridge.connections())[0];
+        assert.equal(live.connected,false);assert.equal(live.binding.state,"suspended");assert.ok(live.lock);
+        await assert.rejects(request(d,null,"/compatibility",{panelId:"compat-panel",protocol:2,version:"0.2.0"}),{code:"unauthorized"});
+
+        const unpairedStore={...store,state:{panelId:"new-panel",credential:null,uncertain:false}};
+        const unpaired=new FutureClient({store:unpairedStore,host});
+        unpaired.start();await unpaired.tick();
+        await assert.rejects(unpaired.connect(),{code:"invalid_pairing_code"});
+        await assert.rejects(unpaired.pair("invalid"),{code:"invalid_pairing_code"});
+        assert.equal(unpaired.state.compatibility,null);
+        await assert.rejects(unpaired.pair(bridge.pairingCode("new-session").code),e=>{
+            assert.equal(e.code,"incompatible_version");
+            assert.equal(e.details.compatibility.status,"incompatible");
+            return true;
+        });
+        assert.equal(unpaired.state.compatibility.cookieMonsterVersion,"2.4.1");
+        assert.equal(unpaired.state.connection,"incompatible");
+        assert.equal(unpairedStore.state.credential,null);assert.deepEqual(calls,[]);
+
+        const rejectedConnect=new FutureClient({store,host});
+        rejectedConnect.discover();
+        await assert.rejects(rejectedConnect.negotiate("/connect",{panelId:"compat-panel",protocol:2,version:"0.2.0",
+            project,activeCompId:1,aeVersion:"25.3",capabilities:{fileNetwork:true}}),{code:"incompatible_version"});
+        assert.equal(rejectedConnect.state.compatibility.pluginVersion,"0.1.0");
+        assert.deepEqual(calls,[]);
+    }finally{await bridge?.close();fs.rmSync(root,{recursive:true,force:true});}
+});
+test("explicit invalid credential recovery revokes the server secret and retains profile identity, latch and durable locks",async()=>{
+    const root=fs.mkdtempSync(path.join(os.tmpdir(),"cm-panel-recover-")),dataDir=path.join(root,"bridge");
+    let bridge,store,client;
+    const calls=[],host={pending:false,uncertain:false,call:async method=>{calls.push(method);return status;}};
+    const disk=()=>JSON.parse(fs.readFileSync(path.join(dataDir,"bridge-state.json"),"utf8"));
+    try{
+        bridge=await createBridge({dataDir,heartbeatMs:60000});
+        store=new Store(dataDir,"recovery");
+        client=new Client({store,host});
+        await client.pair(bridge.pairingCode("recovery-session").code);
+        await client.connect();
+        const identity={panelId:store.state.panelId,connectionId:client.connectionId};
+        await bridge.bind("recovery-session",identity.connectionId);
+        const lock=await bridge.lock("recovery-session",{kind:"retained-recovery"});
+        await client.heartbeat();
+        calls.length=0;
+        const original=store.state.credential;
+        await assert.rejects(client.recoverCredential(bridge.pairingCode("valid-check").code),{code:"credential_valid"});
+        assert.equal(store.state.credential,original);
+        assert.deepEqual(disk().locks,[lock]);
+
+        // Reproduce a bridge-committed rotation whose response was lost before local persistence.
+        const d=store.descriptor(),lost=await request(d,original,"/rotate",{});
+        assert.notEqual(lost.credential,original);
+        await assert.rejects(client.management("/unpair"),{code:"unauthorized"});
+        await assert.rejects(client.pair("unused"),{code:"already_paired"});
+        await client.tick();client.stop();
+        assert.equal(client.state.lastError,"unauthorized");
+        assert.equal(store.state.credential,original,"authentication failure never clears the local credential");
+        client.mark(true);host.uncertain=true;client.state.busy=true;
+        calls.length=0;
+        const before={...store.state},serverBefore=disk();
+        await assert.rejects(client.recoverCredential("invalid-code"),{code:"invalid_pairing_code"});
+        assert.deepEqual(store.state,before);assert.deepEqual(disk(),serverBefore);
+        const code=bridge.pairingCode("recovery-session").code;
+        await client.recoverCredential(code);
+        assert.equal(store.state.panelId,identity.panelId);assert.equal(client.connectionId,identity.connectionId);
+        assert.notEqual(store.state.credential,original);assert.notEqual(store.state.credential,lost.credential);
+        assert.equal(store.state.uncertain,true);assert.equal(client.state.uncertain,true);assert.equal(host.uncertain,true);
+        assert.equal(client.state.busy,true);assert.equal(client.running,false);assert.equal(client.state.binding,null);
+        assert.deepEqual(client.state.lock,lock);assert.deepEqual(disk().locks,[lock]);
+        assert.equal(disk().credentials.length,1);assert.equal(disk().credentials[0].connectionId,identity.connectionId);
+        assert.deepEqual(JSON.parse(fs.readFileSync(store.file,"utf8")),store.state);
+        assert.equal(JSON.stringify(store.state).includes(code),false);
+        for(const secret of [original,lost.credential])
+            await assert.rejects(request(d,secret,"/compatibility",{panelId:identity.panelId,protocol:1,version:"0.1.0"}),{code:"unauthorized"});
+        await assert.rejects(request(d,null,"/pair",{panelId:identity.panelId,protocol:1,version:"0.1.0",code}),{code:"invalid_pairing_code"});
+        await client.tick();
+        await assert.rejects(client.connect(),{code:"outcome_uncertain"});
+        assert.deepEqual(calls,[],"credential recovery never dispatches AE work");
+        assert.equal((await bridge.connections())[0].connected,false);
+
+        const saved={...store.state};
+        store.close();await bridge.close();
+        bridge=await createBridge({dataDir,heartbeatMs:60000});
+        store=new Store(dataDir,"recovery");assert.deepEqual(store.state,saved);
+        client=new Client({store,host});await client.tick();
+        assert.equal((await bridge.connections()).length,0);assert.deepEqual(calls,[]);
+        assert.equal(disk().locks[0].id,lock.id);assert.equal(disk().locks[0].connectionId,identity.connectionId);
+        assert.equal(disk().locks[0].state,"uncertain");
+        const verified=await request(store.descriptor(),saved.credential,"/compatibility",{panelId:identity.panelId,protocol:1,version:"0.1.0"});
+        assert.equal(verified.connectionId,identity.connectionId);
+        assert.equal((await bridge.connections())[0].lock.id,lock.id);
+        // Local reconciliation and rebinding remain separate, explicit actions.
+        host.uncertain=false;client.start=()=>{};await client.reconcile();await client.connect();
+        assert.equal(client.connectionId,identity.connectionId);
+        const rebound=await bridge.bind("recovered-session",identity.connectionId);
+        assert.equal(rebound.lock.id,lock.id);assert.equal(rebound.lock.state,"uncertain");
+        assert.throws(()=>bridge.binding("recovered-session"),{code:"target_locked"});
+    }finally{client?.stop();store?.close();await bridge?.close();fs.rmSync(root,{recursive:true,force:true});}
+});
+test("credential recovery fails closed for transport, scope, persistence and concurrent host work",async()=>{
+    for(const mode of ["disconnected","malformed","stale-probe","stale-pair","save-failed","pending","panel-pending","valid"]){
+        const f=fixture(),before={...f.store.state},lock=f.client.state.lock,requests=[];
+        f.client.mark(true);f.host.uncertain=true;f.client.state.busy=true;
+        if(mode==="pending")f.host.pending=true;
+        if(mode==="panel-pending")f.client.panelPending=true;
+        f.client.request=async(d,c,e,b)=>{
+            requests.push(e);
+            if(e==="/compatibility"){
+                if(mode==="disconnected")throw Object.assign(new Error("offline"),{code:"disconnected"});
+                if(mode==="valid")return {connectionId:"connection",protocol:1,version:"0.1.0",updateUrl:descriptor.updateUrl,compatibility:compatibility()};
+                if(mode==="stale-probe")f.client.connectionGeneration++;
+                throw Object.assign(new Error("invalid credential"),{code:"unauthorized"});
+            }
+            assert.equal(e,"/pair");assert.equal(c,null);assert.equal(b.panelId,before.panelId);
+            assert.equal(f.store.state.credential,before.credential,"never clear credential before server replacement");
+            if(mode==="stale-pair")f.client.connectionGeneration++;
+            if(mode==="save-failed")f.store.save=()=>{throw Object.assign(new Error("disk full"),{code:"ENOSPC"});};
+            return mode==="malformed" ? {} : {connectionId:"connection",credential:"b".repeat(43),protocol:1,version:"0.1.0",updateUrl:descriptor.updateUrl,compatibility:compatibility()};
+        };
+        const expected={disconnected:"disconnected",malformed:"invalid_response","stale-probe":"stale_binding","stale-pair":"stale_binding","save-failed":"ENOSPC",pending:"host_busy","panel-pending":"host_busy",valid:"credential_valid"}[mode];
+        await assert.rejects(f.client.recoverCredential("FRESH"),{code:expected},mode);
+        assert.equal(f.store.state.credential,before.credential,mode);assert.equal(f.store.state.panelId,before.panelId,mode);
+        assert.equal(f.store.state.uncertain,true,mode);assert.equal(f.host.uncertain,true,mode);
+        assert.equal(f.client.state.lock,lock,mode);assert.equal(f.client.running,false,mode);
+        assert.equal(f.events.some(e=>e[0]==="host"),false,mode);
+        if(["disconnected","stale-probe","pending","panel-pending","valid"].includes(mode))assert.equal(requests.includes("/pair"),false,mode);
+    }
+});
+test("compatibility validation rejects injected URLs, inconsistent fields and unbounded versions",()=>{
+    const {compatibilityMetadata:validate}=transport;
+    const good=compatibility();
+    assert.deepEqual(validate(good),good);
+    assert.equal(good.cookieMonsterVersion,null);
+    const configured=()=>({...compatibility(),...releaseMetadata({cookieMonsterVersion:"2.4.1",updates:{
+        panel:{version:"0.1.0",protocol:1,url:"https://releases.example.test/panel"}
+    }})});
+    assert.equal(validate(configured()).updates.panel.status,"configured");
+    for(const url of ["javascript:alert(1)","http://example.test/a","file:///C:/secret","//example.test/a",
+        "https://user:secret@example.test/a","https://example.test/a?token=secret","https://example.test/a#fragment",
+        "https://example.test/%0aevil","https://example.test/\\evil","https://example.test/a b","https://example.test/a\n",{}, "https://"+"a".repeat(2050)]){
+        const m=configured();m.updates.panel.url=url;
+        assert.throws(()=>validate(m),{code:"invalid_response"});
+    }
+    for(const change of [
+        m=>{m.pluginVersion="<script>";},m=>{m.panelVersion="0.1.0\n";},m=>{m.cookieMonsterVersion="1".repeat(65);},
+        m=>{m.status="incompatible";},m=>{m.protocol="1";},m=>{m.panelProtocol=null;},
+        m=>{m.cookieMonsterVersionStatus="not_configured";},m=>{m.releaseSourceUrl="https://evil.test";},
+        m=>{m.updates.panel.version="9.0.0";},m=>{m.updates.panel.protocol=2;},m=>{m.updates.panel.status="approved";},
+        m=>{m.updates.plugin.url="https://evil.test";},m=>{m.updates.extra={};},m=>{m.secret="injected";}
+    ]){
+        const m=configured();change(m);assert.throws(()=>validate(m),{code:"invalid_response"});
+    }
+});
+test("compatibility negotiation discards malformed and stale metadata without altering pairing or recovery state",async()=>{
+    for(const mode of ["missing","unsafe-url","foreign-peer","outer-version","stale-credential","stale-descriptor","rejected-invalid"]){
+        const f=fixture(),before={...f.store.state};
+        f.store.descriptor=()=>({...descriptor,version:"9.0"});
+        f.client.state.compatibility=compatibility();
+        f.client.request=async()=>{
+            const m=compatibility();
+            if(mode==="missing")return {};
+            if(mode==="unsafe-url")m.updates.panel={status:"configured",version:"0.1.0",protocol:1,url:"javascript:alert(1)"};
+            if(mode==="foreign-peer"){m.panelVersion="0.2.0";m.status="incompatible";}
+            if(mode==="stale-credential")f.store.state.credential="b".repeat(43);
+            if(mode==="stale-descriptor")f.client.descriptor.port++;
+            if(mode==="rejected-invalid")throw Object.assign(new Error("mismatch"),{code:"incompatible_version",details:{compatibility:{secret:"NO"}}});
+            return {connectionId:"connection",protocol:1,version:mode==="outer-version" ? "9.0" : "0.1.0",updateUrl:descriptor.updateUrl,compatibility:m};
+        };
+        await assert.rejects(f.client.connect(),{code:mode.startsWith("stale-") ? "stale_binding" : "invalid_response"},mode);
+        assert.equal(f.client.state.compatibility,null,mode);
+        assert.equal(f.client.running,false,mode);
+        assert.equal(f.events.some(e=>e[0]==="host"),false,mode);
+        assert.equal(f.store.state.uncertain,before.uncertain,mode);
+        assert.equal(f.store.state.panelId,before.panelId,mode);
+    }
+});
+test("compatibility HTTP errors retain only validated negotiation metadata",async t=>{
+    let metadata={...compatibility(),status:"incompatible",panelVersion:"0.2.0",panelProtocol:2},code="incompatible_version";
+    const server=http.createServer((req,res)=>{
+        res.writeHead(409,{"Content-Type":"application/json"});
+        res.end(JSON.stringify({error:{code,message:"DO NOT DISPLAY",details:{compatibility:metadata,secret:"DO NOT RETAIN"}}}));
+    });
+    server.listen(0,"127.0.0.1");await once(server,"listening");t.after(()=>server.close());
+    const d={...descriptor,port:server.address().port};
+    await assert.rejects(request(d,"a".repeat(43),"/connect",{}),e=>{
+        assert.deepEqual(e.details,{compatibility:metadata});assert.equal(e.message,"Bridge rejected request");return true;
+    });
+    await assert.rejects(request(d,"a".repeat(43),"/panel",{}),e=>{assert.equal(e.details,undefined);return true;});
+    metadata={secret:"NO"};
+    await assert.rejects(request(d,"a".repeat(43),"/connect",{}),{code:"invalid_response"});
+    code="invalid_pairing_code";
+    await assert.rejects(request(d,null,"/pair",{}),e=>{assert.equal(e.details,undefined);return true;});
+});
+test("compatibility descriptor mismatch probes with credentials and stops before host dispatch",async()=>{
+    const f=fixture();f.store.descriptor=()=>({...descriptor,version:"9.0"});
+    f.client.request=async(d,c,endpoint,body)=>{
+        f.events.push([endpoint,body,c]);
+        throw Object.assign(new Error("Mismatch"),{code:"incompatible"});
+    };
+    f.client.running=true;
+    await f.client.tick();
+    assert.deepEqual(f.events.filter(e=>e[0]==="/compatibility"),[["/compatibility",{panelId:"panel",protocol:1,version:"0.1.0"},f.store.state.credential]]);
+    assert.equal(f.events.some(e=>e[0]==="host"),false);
+    assert.equal(f.client.state.connection,"incompatible");assert.equal(f.client.running,false);
+});
 test("descriptor mismatch hard-stops; reconnect drops binding until fresh heartbeat",async()=>{
     const f=fixture();f.store.descriptor=()=>({...descriptor,version:"9.0"});
     await f.client.tick();assert.equal(f.client.state.connection,"incompatible");assert.equal(f.events.some(e=>e[0]==="host"),false);
@@ -148,9 +523,11 @@ test("descriptor mismatch hard-stops; reconnect drops binding until fresh heartb
 });
 test("pair, rotate, unpair use frozen schemas and do not persist pairing code",async()=>{
     const f=fixture();f.store.state.credential=null;
-    f.client.request=async(d,c,endpoint,body)=>{f.events.push([endpoint,body,c]);return endpoint==="/unpair" ? {ok:true} : {credential:"b".repeat(43),connectionId:"conn",protocol:1,version:"0.1.0",updateUrl:descriptor.updateUrl};};
+    f.client.request=async(d,c,endpoint,body)=>{f.events.push([endpoint,body,c]);return endpoint==="/unpair" ? {ok:true} : {credential:"b".repeat(43),connectionId:"conn",protocol:1,version:"0.1.0",updateUrl:descriptor.updateUrl,compatibility:compatibility()};};
     await f.client.pair("ABCD");assert.deepEqual(f.events.find(e=>e[0]==="/pair")[1],{code:"ABCD",protocol:1,version:"0.1.0",panelId:"panel"});
     assert.equal(JSON.stringify(f.store.state).includes("ABCD"),false);
+    await assert.rejects(f.client.pair("OTHER"),{code:"already_paired"});
+    assert.equal(f.events.filter(e=>e[0]==="/pair").length,1);
     await f.client.management("/rotate");assert.equal(f.store.state.credential,"b".repeat(43));
     await f.client.management("/unpair");assert.equal(f.store.state.credential,null);
 });
@@ -172,17 +549,137 @@ test("native HTTP is loopback-only, no Origin, GET poll has no body; malformed/a
 test("actual credential store survives reopen, enforces exclusive owner and Windows owner-only ACL",()=>{
     const dir=fs.mkdtempSync(path.join(os.tmpdir(),"cm-panel-store-"));let store;
     try{
-        store=new Store(dir);store.state.credential="a".repeat(43);store.state.uncertain=true;store.save();
-        assert.throws(()=>new Store(dir),{code:"panel_in_use"});
+        store=new Store(dir,"primary");store.state.credential="a".repeat(43);store.state.uncertain=true;store.save();
+        assert.throws(()=>new Store(dir,"primary"),{code:"panel_in_use"});
         const file=store.file;
         if(process.platform==="win32"){
             const p=Buffer.from(file).toString("base64");
             const script="$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"+p+"'));$acl=[System.IO.File]::GetAccessControl($p);$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$rules=@($acl.Access);if($rules.Count -ne 1 -or $rules[0].IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ne $sid){exit 9}";
             execFileSync("powershell.exe",["-NoProfile","-NonInteractive","-EncodedCommand",Buffer.from(script,"utf16le").toString("base64")],{windowsHide:true});
         }else assert.equal(fs.statSync(file).mode & 0o777,0o600);
-        store.close();store=new Store(dir);assert.equal(store.state.credential,"a".repeat(43));assert.equal(store.state.uncertain,true);
+        store.close();store=new Store(dir,"primary");assert.equal(store.state.credential,"a".repeat(43));assert.equal(store.state.uncertain,true);
     }finally{store?.close();fs.rmSync(dir,{recursive:true,force:true});}
 });
+test("two actual profiles pair concurrently with one bridge and preserve independent identities across reopen/restart",async()=>{
+    const root=fs.mkdtempSync(path.join(os.tmpdir(),"cm-panel-pairings-")),dir=path.join(root,"bridge");
+    let bridge,a,b;
+    try{
+        bridge=await createBridge({dataDir:dir,heartbeatMs:60000});
+        a=new Store(dir,"artist-a");b=new Store(dir,"artist-b");
+        const make=store=>new Client({store,host:{call:async()=>({...status,project:{...project,id:store.profile,path:path.join(dir,store.profile+".aep")}})}});
+        let ca=make(a),cb=make(b);
+        await Promise.all([ca.pair(bridge.pairingCode("session-a").code),cb.pair(bridge.pairingCode("session-b").code)]);
+        assert.notEqual(a.state.panelId,b.state.panelId);assert.notEqual(a.state.credential,b.state.credential);
+        await Promise.all([ca.connect(),cb.connect()]);
+        const connections=await bridge.connections();
+        assert.equal(connections.length,2);assert.ok(connections.every(c=>c.connected));
+        const ids=new Map(connections.map(c=>[c.panelId,c.connectionId]));
+        await bridge.bind("session-a",ids.get(a.state.panelId));
+        await bridge.bind("session-b",ids.get(b.state.panelId));
+        await ca.management("/rotate");
+        ca.mark(true);
+        const savedA={...a.state},savedB={...b.state};
+        assert.equal(savedB.uncertain,false);
+        await assert.rejects(ca.pair("ignored"),{code:"outcome_uncertain"});
+        assert.throws(()=>new Store(dir,"artist-a"),{code:"panel_in_use"});
+        a.close();b.close();
+        a=new Store(dir,"artist-a");b=new Store(dir,"artist-b");
+        assert.deepEqual(a.state,savedA);assert.deepEqual(b.state,savedB);
+        a.state.panelId=b.state.panelId;
+        assert.throws(()=>a.save(),{code:"unsafe_storage"});a.state.panelId=savedA.panelId;
+        await bridge.close();bridge=await createBridge({dataDir:dir,heartbeatMs:60000});
+        ca=make(a);cb=make(b);
+        assert.equal(ca.state.uncertain,true);await ca.tick();
+        assert.equal((await bridge.connections()).length,0,"uncertain profile never reconnects automatically");
+        // Explicit inspected-outcome reconciliation in this host double clears only A's local latch.
+        ca.host.call=async(method)=>method==="reconcile" ? {} : {...status,project:{...project,id:"artist-a",path:path.join(dir,"artist-a.aep")}};
+        ca.start=()=>{};
+        await ca.reconcile();
+        await Promise.all([ca.connect(),cb.connect()]);
+        const reopened=await bridge.connections();
+        assert.equal(reopened.length,2);
+        for(const c of reopened){assert.equal(c.connectionId,ids.get(c.panelId));assert.equal(c.binding,null);}
+        await cb.management("/unpair");
+        assert.equal(a.state.credential,savedA.credential);assert.equal(b.state.credential,null);
+        assert.equal(a.state.uncertain,false);
+    }finally{a?.close();b?.close();await bridge?.close();fs.rmSync(root,{recursive:true,force:true});}
+});
+
+test("actual process claims exclude a live same-profile owner, reclaim crash/PID-reuse locks, and preserve uncertain state",async()=>{
+    const dir=fs.mkdtempSync(path.join(os.tmpdir(),"cm-panel-crash-")),children=[];
+    const modulePath=fileURLToPath(new URL("../panel/transport.cjs",import.meta.url));
+    let store;
+    function launch(profile){
+        const code=`const {Store}=require(process.argv[1]);let store;
+            process.on("message",m=>{if(m==="close"){store?.close();process.exit(0);}});
+            try {store=new Store(process.argv[2],process.argv[3]);store.state.credential="c".repeat(43);store.state.uncertain=true;store.save();process.send({state:store.state,lock:store.lock});}
+            catch(e){process.send({error:e.code},()=>process.exit(0));}`;
+        const child=spawn(process.execPath,["--input-type=commonjs","-e",code,modulePath,dir,profile],{stdio:["ignore","ignore","pipe","ipc"],windowsHide:true});
+        children.push(child);
+        return {child,result:once(child,"message",{signal:AbortSignal.timeout(30000)}).then(([r])=>r)};
+    }
+    try{
+        const first=launch("primary"),r=await first.result;assert.ok(r.state,JSON.stringify(r));
+        const second=launch("secondary"),other=await second.result;assert.ok(other.state,JSON.stringify(other));
+        assert.notEqual(r.state.panelId,other.state.panelId);
+        const competitor=launch("primary");assert.equal((await competitor.result).error,"panel_in_use");
+        const dead=once(first.child,"exit");first.child.kill("SIGKILL");await dead;
+        store=new Store(dir,"primary");assert.deepEqual(store.state,r.state);assert.equal(fs.existsSync(r.lock),false);
+        const file=store.file,owners=path.dirname(store.lock);
+        store.close();
+        // A live PID with a different creation stamp is not the owner of this unique stale claim.
+        const reused=path.join(owners,process.pid+"-"+"0".repeat(64)+"-"+"a".repeat(48)+".lock");
+        fs.writeFileSync(reused,"");
+        store=new Store(dir,"primary");assert.equal(fs.existsSync(reused),false);assert.deepEqual(store.state,r.state);
+        const oldStore=store;store.close();store=new Store(dir,"primary");oldStore.close();
+        assert.ok(fs.existsSync(store.lock),"late close must not unlink a replacement owner's claim");
+        assert.throws(()=>oldStore.save(),{code:"ownership_lost"});
+        store.close();
+        const unknown=path.join(owners,"incomplete-owner");fs.writeFileSync(unknown,"");
+        assert.throws(()=>new Store(dir,"primary"),{code:"ownership_unknown"});
+        assert.ok(fs.existsSync(unknown));assert.deepEqual(JSON.parse(fs.readFileSync(file,"utf8")),r.state);
+        fs.unlinkSync(unknown);
+        fs.unlinkSync(file);
+        assert.throws(()=>new Store(dir,"primary"),{code:"profile_state_missing"});
+    }finally{
+        store?.close();
+        await Promise.all(children.map(async child=>{if(child.exitCode === null && child.signalCode === null){const exit=once(child,"exit");child.kill("SIGKILL");await exit;}}));
+        fs.rmSync(dir,{recursive:true,force:true});
+    }
+});
+
+test("legacy migration is explicit and in-place; missing/corrupt/uncertain state is never adopted by named profiles",()=>{
+    const dir=fs.mkdtempSync(path.join(os.tmpdir(),"cm-panel-legacy-"));
+    const base=path.join(dir,"panel-private"),file=path.join(base,"credential.json"),lock=path.join(base,"owner.json");
+    const state={panelId:"previous-panel",credential:"d".repeat(43),uncertain:true};
+    let legacy,named;
+    try{
+        for(const profile of [undefined,"","../escape","Uppercase","a/b","a".repeat(65)])assert.throws(()=>new Store(dir,profile),{code:"profile_required"});
+        assert.throws(()=>new Store(dir,"legacy"),{code:"legacy_missing"});
+        named=new Store(dir,"fresh");named.close();
+        fs.writeFileSync(lock,JSON.stringify({pid:process.pid}));
+        assert.throws(()=>new Store(dir,"other"),{code:"profile_state_missing"});
+        fs.unlinkSync(lock);
+        fs.writeFileSync(file,JSON.stringify(state));
+        assert.throws(()=>new Store(dir,"other"),{code:"legacy_uncertain"});
+        fs.writeFileSync(lock,JSON.stringify({pid:process.pid}));
+        assert.throws(()=>new Store(dir,"legacy"),{code:"panel_in_use"});
+        assert.equal(JSON.parse(fs.readFileSync(lock,"utf8")).pid,process.pid);
+        fs.unlinkSync(lock);
+        legacy=new Store(dir,"legacy");assert.equal(legacy.file,file);assert.deepEqual(legacy.state,state);
+        assert.throws(()=>new Store(dir,"legacy"),{code:"panel_in_use"});
+        assert.throws(()=>new Store(dir,"other"),{code:"legacy_uncertain"});
+        legacy.state.uncertain=false;legacy.save();legacy.close();
+        legacy=new Store(dir,"legacy");assert.equal(legacy.state.credential,state.credential);assert.equal(legacy.state.panelId,state.panelId);
+        named=new Store(dir,"other");assert.equal(named.state.credential,null);assert.notEqual(named.state.panelId,state.panelId);
+        named.close();legacy.close();
+        fs.writeFileSync(file,'{"uncertain":true}');
+        assert.throws(()=>new Store(dir,"legacy"),{code:"unsafe_storage"});
+        assert.throws(()=>new Store(dir,"other"),{code:"unsafe_storage"});
+        assert.equal(fs.readFileSync(file,"utf8"),'{"uncertain":true}');
+    }finally{legacy?.close();named?.close();fs.rmSync(dir,{recursive:true,force:true});}
+});
+
 test("actual image normalizer uses PNG for alpha/JPEG otherwise, scales, bounds and removes owned temporary output",async()=>{
     for(const alpha of [true,false]){
         const dir=path.join(os.tmpdir(),"cookiemonster-ae-"+Date.now()+"-"+Math.floor(Math.random()*1e9));fs.mkdirSync(dir);

@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto"
-import { realpath, copyFile, stat, unlink } from "node:fs/promises"
+import { realpath, stat, lstat, copyFile } from "node:fs/promises"
 import { constants, createReadStream } from "node:fs"
 import path from "node:path"
 import { AEError, fail, hash, canonical, assertObject, assertString, PROPOSAL_TTL } from "./protocol.mjs"
@@ -118,39 +118,14 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
     return verified
   }
 
-  async function restoreCheckpoint(sessionID, b, checkpoint, expected) {
-    const verified = await checkpoints.verify(checkpoint.id)
-    if (!await checkpointMatches(verified, b) || verified.hash !== checkpoint.hash)
-      fail("checkpoint_invalid", "Checkpoint changed or belongs to another project")
-    // ponytail: host exposes no atomic close/replace/open transaction. Open a verified
-    // private copy instead; never replace canonical bytes behind a dirty or unknown host.
-    const recoveryPath = path.join(bridge.dataDir, "workflow-recovery-" + randomUUID() +
-      (path.extname(verified.path).toLowerCase() === ".aepx" ? ".aepx" : ".aep"))
-    let created = false, dispatched = false
-    try {
-      await copyFile(verified.path, recoveryPath, constants.COPYFILE_EXCL)
-      created = true
-      const digest = createHash("sha256")
-      for await (const chunk of createReadStream(recoveryPath)) digest.update(chunk)
-      if (digest.digest("hex") !== verified.hash) fail("checkpoint_invalid", "Recovery copy bytes did not verify")
-      await revision(sessionID, { binding: b, fingerprint: expected }, true)
-      current(sessionID, b, { write: true, allowLocked: true })
-      dispatched = true
-      const opened = await bridge.call(sessionID, "open", { path: recoveryPath }, { allowLocked: true })
-      if (!opened?.project?.path || await realpath(opened.project.path) !== await realpath(recoveryPath))
-        fail("restore_failed", "AE did not confirm opening the verified recovery copy")
-      return { checkpointId: checkpoint.id, path: recoveryPath, canonicalPath: b.project.path,
-        recoveryCopy: true, rebindRequired: true, canonicalReplaced: false,
-        warning: "Recovery copy opened; original file was not replaced. Save As to the intended canonical path, then explicitly rebind and review reconciliation. The original target remains locked." }
-    } finally {
-      // A timed-out open may still complete. Never delete a potentially live project.
-      if (created && !dispatched) await unlink(recoveryPath)
-    }
+  function checkpointIdentity(checkpoint) {
+    return hash(Object.fromEntries(["id", "projectId", "projectPath", "path", "planHash", "createdAt", "size", "hash"]
+      .map(key => [key, checkpoint[key]])))
   }
 
   async function fileHash(file) {
-    const before = await stat(file)
-    if (!before.isFile() || before.size === 0 || await realpath(file) !== file)
+    const before = await lstat(file)
+    if (!before.isFile() || before.nlink !== 1 || before.size === 0 || await realpath(file) !== file)
       fail("checkpoint_invalid", "Recovery requires a nonempty canonical regular file")
     const digest = createHash("sha256")
     for await (const chunk of createReadStream(file)) digest.update(chunk)
@@ -482,31 +457,136 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
       return exclusive(sessionID, async () => {
         assertString(checkpointId, "checkpointId", 256)
         const b = current(sessionID, null, { write: true })
+        // The parent bridge must validate both phases and durably follow their project transitions.
+        if (bridge.canonicalRestore !== true) fail("restore_unavailable", "Canonical restore requires the bridge's guarded manual recovery phases")
         const initial = await snapshot(sessionID, b)
         const checkpoint = await checkpoints.verify(checkpointId)
-        if (!await checkpointMatches(checkpoint, b))
+        if (checkpoint.id !== checkpointId || !await checkpointMatches(checkpoint, b))
           fail("checkpoint_invalid", "Checkpoint is unverified or belongs to another project")
-        const destination = await stat(b.project.path)
+        const destination = await lstat(b.project.path)
+        const destinationHash = await fileHash(b.project.path)
         const sourceTimestamp = Date.parse(checkpoint.createdAt)
         if (!Number.isFinite(sourceTimestamp)) fail("checkpoint_invalid", "Checkpoint timestamp is invalid")
+        const expiresAt = now() + PROPOSAL_TTL
+        const identity = checkpointIdentity(checkpoint)
+        let restoreLock = null
+        const checkApproval = async (binding, expected, verifyCheckpoint = true) => {
+          alive({ expiresAt })
+          current(sessionID, binding, { write: true, allowLocked: true })
+          await revision(sessionID, { binding, fingerprint: expected }, true)
+          if (verifyCheckpoint && checkpointIdentity(await checkpoints.verify(checkpointId)) !== identity)
+            fail("checkpoint_changed", "Approved checkpoint identity or timestamp changed")
+          alive({ expiresAt })
+          const latest = current(sessionID, binding, { write: true, allowLocked: true })
+          if (restoreLock && (latest.lock?.state !== "executing" || latest.lock.id !== restoreLock.id ||
+              hash(latest.lock.reason) !== hash(restoreLock.reason)))
+            fail("outcome_uncertain", "Restore lock changed; preserve recovery files without opening or retrying")
+        }
         current(sessionID, b, { write: true })
-        await permit(ask, `Restore checkpoint ${checkpointId}.\nSource: ${checkpoint.createdAt}\nDestination file: ${destination.mtime.toISOString()} (${b.project.path})\nFirst save and verify a checkpoint of the current state, including unsaved edits. Then open a verified recovery copy through AE's dirty-state guard. The canonical file is NOT replaced; Save As and reviewed reconciliation are required.`, {
+        await permit(ask, `Restore checkpoint ${checkpointId}.
+Source: ${checkpoint.createdAt}
+Destination file: ${destination.mtime.toISOString()} (${b.project.path})
+Save current unsaved edits to a private emergency project and verify a protected checkpoint first. Then restore the original path, retaining its displaced file, and close/reopen through the exact saved-state guard. If canonical publication fails, open a verified recovery copy and keep automation locked. Never retry an uncertain host call.`, {
           kind: "restore", checkpoint, binding: b, sourceTimestamp, destinationTimestamp: destination.mtimeMs,
-          fingerprint: initial.fingerprint, recoveryCopy: true,
+          destinationIdentity: hash({ path: b.project.path, hash: destinationHash,
+            ...Object.fromEntries(["dev", "ino", "size", "mtimeMs", "ctimeMs"].map(key => [key, destination[key]])) }),
+          fingerprint: initial.fingerprint, recoveryCopy: false,
         })
-        current(sessionID, b, { write: true })
-        await revision(sessionID, { binding: b, fingerprint: initial.fingerprint })
-        const unchanged = await stat(b.project.path)
-        if (unchanged.ino !== destination.ino || unchanged.size !== destination.size ||
-            unchanged.mtimeMs !== destination.mtimeMs || unchanged.ctimeMs !== destination.ctimeMs)
+        await checkApproval(b, initial.fingerprint)
+        const unchanged = await lstat(b.project.path)
+        if (["dev", "ino", "size", "mtimeMs", "ctimeMs"].some(key => unchanged[key] !== destination[key]) ||
+            await fileHash(b.project.path) !== destinationHash)
           fail("stale_project", "Destination file changed during restore approval")
-        await bridge.lock(sessionID, { kind: "restore", checkpointId })
-        await checkpoints.pin(checkpointId, true)
-        // Any failure keeps the lock and recovery checkpoints. No canonical disk replacement.
-        const currentCheckpoint = await saveCheckpoint(sessionID, initial, hash({ checkpointId, fingerprint: initial.fingerprint }))
-        await bridge.recordOutcome(sessionID, { outcome: "recovery_copy", checkpointId, currentCheckpointId: currentCheckpoint.id })
-        const result = await restoreCheckpoint(sessionID, b, checkpoint, initial.fingerprint)
-        return { ...result, currentCheckpointId: currentCheckpoint.id }
+        const transaction = { id: randomUUID(), sessionID, bindingID: b.id }
+        const emergencyPath = path.join(bridge.dataDir, "workflow-emergency-" + randomUUID() + path.extname(checkpoint.projectPath))
+        const planHash = hash({ identity, fingerprint: initial.fingerprint, destinationHash, expiresAt })
+        await bridge.lock(sessionID, { kind: "restore", checkpointId, planHash, fingerprint: initial.fingerprint })
+        restoreLock = current(sessionID, b, { allowLocked: true }).lock
+        if (!restoreLock || restoreLock.state !== "executing")
+          fail("outcome_uncertain", "Restore lock was not confirmed")
+        let currentCheckpoint, restored
+        try {
+          await checkpoints.protect(checkpointId, transaction.id)
+          await checkApproval(b, initial.fingerprint)
+          const saved = bounded(await bridge.call(sessionID, "execute", {
+            phase: "restore_prepare", transaction, recoveryId: transaction.id, expected: initial.data, path: emergencyPath,
+          }, { allowLocked: true }))
+          const recoveryBinding = current(sessionID, null, { write: true, allowLocked: true })
+          if (recoveryBinding.id !== b.id || recoveryBinding.connectionId !== b.connectionId ||
+              saved.status !== "recovery_saved" || saved.project?.path !== emergencyPath ||
+              !sameProject(saved.project, recoveryBinding.project) || !sameProject(saved.snapshot.project, saved.project))
+            fail("invalid_host_result", "Manual recovery save identity was not confirmed")
+          const normalized = clone(saved.snapshot)
+          normalized.project = initial.data.project
+          if (recoveryScene(normalized) !== recoveryScene(initial.data) || saved.snapshot.revision !== initial.data.revision)
+            fail("invalid_host_result", "Current state changed while saving")
+          const created = await checkpoints.create({ projectPath: emergencyPath, projectId: saved.project.id, planHash, pinned: true })
+          currentCheckpoint = await checkpoints.verify(created.id)
+          if (!await checkpointMatches(currentCheckpoint, recoveryBinding) || currentCheckpoint.planHash !== planHash ||
+              await fileHash(emergencyPath) !== currentCheckpoint.hash)
+            fail("checkpoint_invalid", "Current-state backup did not verify")
+          await checkpoints.protect(currentCheckpoint.id, transaction.id)
+          await bridge.recordOutcome(sessionID, { outcome: "prepared", planHash, checkpointId, currentCheckpointId: currentCheckpoint.id })
+          const beforeReplace = () => checkApproval(recoveryBinding, hash(saved.snapshot))
+          await beforeReplace()
+          restored = await checkpoints.restore(checkpointId, {
+            canonicalPath: checkpoint.projectPath, expectedCheckpoint: checkpoint,
+            expectedDestination: { ...destination, hash: destinationHash },
+            beforeReplace: () => checkApproval(recoveryBinding, hash(saved.snapshot), false),
+          })
+          if (restored.recoveryCopy !== true && restored.recoveryCopy !== false)
+            fail("invalid_host_result", "Storage did not confirm the restore outcome")
+          let openPath = restored.path
+          if (restored.recoveryCopy) {
+            openPath = path.join(bridge.dataDir, "workflow-recovery-" + randomUUID() + path.extname(checkpoint.projectPath))
+            await copyFile(checkpoint.path, openPath, constants.COPYFILE_EXCL)
+          } else if (openPath !== checkpoint.projectPath) fail("invalid_host_result", "Unexpected canonical restore path")
+          // A failed freshness guard is not permission to open a fallback over newer edits.
+          await beforeReplace()
+          if (await fileHash(openPath) !== checkpoint.hash || await fileHash(emergencyPath) !== currentCheckpoint.hash)
+            fail("checkpoint_changed", "Recovery files changed before open")
+          await bridge.recordOutcome(sessionID, { outcome: "dispatched", planHash, checkpointId, currentCheckpointId: currentCheckpoint.id })
+          await beforeReplace()
+          const opened = bounded(await bridge.call(sessionID, "execute", {
+            phase: "restore_finish", transaction, recoveryId: transaction.id, expected: saved.snapshot, path: openPath,
+            verifiedCheckpoint: { id: currentCheckpoint.id, hash: currentCheckpoint.hash, size: currentCheckpoint.size },
+          }, { allowLocked: true }))
+          const finalBinding = current(sessionID, null, { allowLocked: true })
+          if (finalBinding.id !== b.id || finalBinding.connectionId !== b.connectionId || opened.status !== "recovered" ||
+              opened.project?.path !== openPath || !sameProject(opened.project, finalBinding.project))
+            fail("invalid_host_result", "Manual restore open identity was not confirmed")
+          const inspected = await snapshot(sessionID, finalBinding, true)
+          if (hash(opened.snapshot) !== inspected.fingerprint || await fileHash(openPath) !== checkpoint.hash)
+            fail("invalid_host_result", "Restored project changed before verification")
+          if (restored.recoveryCopy) {
+            await bridge.recordOutcome(sessionID, { outcome: "recovery_copy", planHash, checkpointId,
+              currentCheckpointId: currentCheckpoint.id, expectedFingerprint: inspected.fingerprint })
+            await bridge.markUncertain(sessionID, "Recovery copy opened; original target still requires explicit recovery")
+          } else {
+            current(sessionID, b, { allowLocked: true })
+            await bridge.recordOutcome(sessionID, { outcome: "confirmed", planHash, checkpointId,
+              currentCheckpointId: currentCheckpoint.id, expectedFingerprint: inspected.fingerprint })
+            await bridge.unlock(sessionID)
+          }
+          // Retain holds on failures/fallback; successful cleanup never rolls back the restore.
+          const cleanup = restored.recoveryCopy ? null : await Promise.all([
+            checkpoints.protect(checkpointId, transaction.id, false),
+            checkpoints.protect(currentCheckpoint.id, transaction.id, false),
+          ]).then(() => null, () => "Recovery checkpoints remain protected; cleanup failed")
+          return { ...restored, path: openPath, canonicalPath: checkpoint.projectPath,
+            checkpointId, currentCheckpointId: currentCheckpoint.id, emergencyPath,
+            canonicalReplaced: !restored.recoveryCopy, rebindRequired: restored.recoveryCopy,
+            automationSuspended: restored.recoveryCopy, fingerprint: inspected.fingerprint, cleanup,
+            warning: restored.recoveryCopy
+              ? "Recovery copy opened. Original bytes are retained at the canonical path or originalPath. Do not overwrite newer edits. Review the emergency backup, Save As to the intended path, explicitly rebind and reconcile; automation remains locked."
+              : "Current-state checkpoint and displaced originalPath are retained. Review them before explicit cleanup." }
+        } catch (error) {
+          await bridge.markUncertain(sessionID, "Manual restore was not confirmed; retain all recovery files").catch(() => {})
+          throw new AEError(uncertain(error) ? "outcome_uncertain" : error.code || "restore_failed", error.message, {
+            ...error.details, checkpointId, currentCheckpointId: currentCheckpoint?.id || null,
+            emergencyPath, originalPath: restored?.originalPath || null, canonicalReplaced: restored?.recoveryCopy === false,
+          })
+        }
       })
     },
   }

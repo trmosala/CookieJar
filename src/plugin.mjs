@@ -10,14 +10,14 @@ import { createRenderer } from "./render.mjs"
 import { createDiagnostics } from "./diagnostics.mjs"
 import { capture, captureArgs, safeRefusals } from "./capture.mjs"
 import { AE_PERMISSIONS } from "./config.mjs"
-import { fail, hash, PROPOSAL_TTL } from "./protocol.mjs"
+import { fail, hash, PROPOSAL_TTL, releaseMetadata } from "./protocol.mjs"
 
 const text = z.string().min(1).max(256)
 const filePath = z.string().min(1).max(32767).refine(p => path.isAbsolute(p) && !/[\0\r\n]/.test(p) && !p.split(/[\\/]/).includes(".."), "Use an absolute local path without traversal")
 const id = z.number().int().positive()
 const privileged = ["ae_bind", "ae_release", "ae_execute", "ae_grant", "ae_capture", "ae_raw_enable",
   "ae_raw_propose", "ae_raw_execute", "ae_checkpoints", "ae_restore", "ae_render_submit", "ae_render_cancel",
-  "ae_reconcile", "ae_templates", "ae_render_recover"]
+  "ae_reconcile", "ae_templates", "ae_render_recover", "ae_render_retire"]
 const same = (a, b) => a?.id === b?.id && a?.connectionId === b?.connectionId &&
   a?.project?.id === b?.project?.id && a?.project?.path === b?.project?.path
 const clone = value => structuredClone(value)
@@ -272,9 +272,12 @@ async function jobAccess(r, c, jobId) {
     r.jobs.set(jobId, { sessionID: c.sessionID, bindingID: b.id })
     r.recovered.delete(jobId)
   }
+  // A status read may finish after retirement or release removed its ownership.
+  // Never repopulate runtime scope from that stale observation.
+  current(r, c, b, { allowLocked: true })
+  if (owner && r.jobs.get(jobId) !== owner) fail("render_scope", "Render ownership changed during inspection")
   // Functional job identity only; no session IDs, prompts or audit history.
   r.jobScopes.set(jobId, Object.freeze({ ...source }))
-  current(r, c, b, { allowLocked: true })
   return sourceScope(job) ? job : unknownJob(job)
 }
 
@@ -301,15 +304,18 @@ export function createTools(runtime) {
     } }
   }
   tool("ae_pair", "Create a short-lived plain visible pairing code. Enter it only in the AE panel.", {}, async (_, c) => r.bridge.pairingCode(c.sessionID))
-  tool("ae_connections", "List connections without disclosing other sessions' bindings.", {}, async (_, c) => {
+  tool("ae_connections", "List connections and reported panel compatibility without other sessions' bindings. includeCompatibility adds runtime versions, trusted update guidance and this session's pending pairing mismatches, even with no connections.", {
+    includeCompatibility: z.boolean().default(false),
+  }, async (a, c) => {
     const list = await r.bridge.connections()
     c.check()
-    return list.map(({ id, connectionId, aeVersion, project, capabilities, activeCompId, connected, busy, binding, lock }) => ({
-      id, connectionId, aeVersion, project, capabilities, activeCompId, connected, busy,
-      mutationEligible: !!(connected && project.saved && project.path && capabilities.fileNetwork && !busy && !lock),
+    const connections = list.map(({ id, connectionId, aeVersion, project, capabilities, activeCompId, connected, busy, binding, lock, compatibility }) => ({
+      id, connectionId, aeVersion, project, capabilities, activeCompId, connected, busy, compatibility,
+      mutationEligible: !!(connected && project?.saved && project.path && capabilities?.fileNetwork && !busy && !lock),
       owned: !!binding && binding.sessionID !== c.sessionID,
       binding: binding?.sessionID === c.sessionID ? binding : null,
     }))
+    return a.includeCompatibility ? { compatibility: r.bridge.compatibility(c.sessionID), connections } : connections
   })
   tool("ae_bind", "Explicitly bind this session to an AE connection; takeover requires review.", { connectionId: text, takeover: z.boolean().default(false) }, async (a, c, ask) => {
     const before = clone((await r.bridge.connections()).find(b => b.connectionId === a.connectionId))
@@ -410,6 +416,37 @@ export function createTools(runtime) {
       fail("render_process_identity", "Manual manifest recovery required; process control is unavailable")
     return r.renderer.cancel(a.jobId)
   })
+  tool("ae_render_retire", "Review and permanently retire a terminal render's recovery records and private artifacts; preserves published outputs and source checkpoints.", { jobId: text }, async (a, c, ask) => {
+    const b = current(r, c, null, { allowLocked: true })
+    r.permissionPolicy("ae_render_retire")
+    const job = await jobAccess(r, c, a.jobId)
+    if (job.metadataOnly) fail("render_retire_refused", "Manual manifest recovery required; retirement is unavailable")
+    const owner = r.jobs.get(a.jobId), source = sourceScope(job)
+    const check = () => {
+      current(r, c, b, { allowLocked: true })
+      r.permissionPolicy("ae_render_retire")
+      const latest = r.jobScopes.get(a.jobId)
+      if (!owner || r.jobs.get(a.jobId) !== owner || !source || !latest ||
+          latest.projectId !== source.projectId || latest.projectPath !== source.projectPath)
+        fail("render_scope", "Render ownership or project scope changed during retirement")
+    }
+    check()
+    const preview = await r.renderer.retire(a.jobId)
+    check()
+    await ask(`Retire render ${a.jobId}. ${preview.warning}`, { ...preview, binding: b })
+    check()
+    const latest = await jobAccess(r, c, a.jobId)
+    if (latest.metadataOnly) fail("render_retire_refused", "Manual manifest recovery required; retirement is unavailable")
+    check()
+    // The non-persisted guard also runs under the renderer gate, after async checks.
+    const result = await r.renderer.retire(a.jobId, { approval: preview.approval, check })
+    if (result?.retired !== true) fail("render_retire_refused", "Renderer did not confirm retirement")
+    // Cleanup must still happen if release/abort arrived after the final deletion.
+    r.jobs.delete(a.jobId)
+    r.recovered.delete(a.jobId)
+    r.jobScopes.delete(a.jobId)
+    return result
+  })
   tool("ae_render_list", "List owned and recoverable render IDs only for the bound project; listing never claims ownership.", {},
     (_, c) => jobList(r, c))
   tool("ae_diagnostics", "Export allowlisted metadata only, with per-runtime salted identities and no activity payloads.", {}, async (_, c) => {
@@ -417,9 +454,10 @@ export function createTools(runtime) {
     const all = await r.renderer.list()
     const jobs = all.filter(job => r.jobs.get(job.jobId)?.sessionID === c.sessionID)
     const unscopableRenderCount = all.filter(job => !jobScope(r, job)).length
-    const checkpoints = connections.length ? await checkpointList(r, c) : []
+    const checkpoints = connections.some(item => item.connected && item.binding?.state === "active") ? await checkpointList(r, c) : []
     c.check()
-    return r.diagnostics.export({ sessionID: c.sessionID, connections, jobs, checkpoints, unscopableRenderCount })
+    return r.diagnostics.export({ sessionID: c.sessionID, connections, jobs, checkpoints, unscopableRenderCount,
+      compatibility: r.bridge.compatibility(c.sessionID) })
   })
   tool("ae_reconcile", "Review uncertain outcome evidence before unlocking; never retries a command.", {},
     (_, c, ask) => r.workflow.reconcile(c.sessionID, ask))
@@ -601,18 +639,21 @@ async function panel(r, input) {
   const checkpoints = await checkpointList(r, c)
   current(r, c, b, { allowLocked: true })
   const unscopableRenderCount = all.filter(job => !jobScope(r, job)).length
-  return r.diagnostics.export({ sessionID, connections, jobs: visible, checkpoints, unscopableRenderCount })
+  return r.diagnostics.export({ sessionID, connections, jobs: visible, checkpoints, unscopableRenderCount,
+    compatibility: r.bridge.compatibility(sessionID) })
 }
 
 // No listeners, filesystem access, or runtime creation at import time.
 let shared
 export async function server(_input, options = {}) {
+  const releaseHash = hash(releaseMetadata(options.releaseMetadata))
   if (shared?.closing) await shared.closing
   if (!shared) {
-    const entry = { refs: 0, owners: new Map(), options: { ...options } }
+    const entry = { refs: 0, owners: new Map(), options: { ...options }, releaseHash }
     entry.promise = createRuntime(options).catch(error => { if (shared === entry) shared = undefined; throw error })
     shared = entry
-  } else if ((options.dataDir && options.dataDir !== shared.options.dataDir) ||
+  } else if (releaseHash !== shared.releaseHash ||
+      (options.dataDir && options.dataDir !== shared.options.dataDir) ||
       (options.aerenderPath && options.aerenderPath !== shared.options.aerenderPath))
     fail("runtime_config", "All directory-scoped instances must use the same runtime configuration")
   const entry = shared
