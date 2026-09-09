@@ -12,7 +12,7 @@ const { Client, HostRPC, Store, request, normalizeCapture } = transport;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const descriptor = {port:12345,instanceId:"instance",protocol:1,version:"0.1.0",updateUrl:"https://github.com/trmosala/CookieJar/releases"};
 const project = {id:"path:c:/test.aep",path:"c:/test.aep",saved:true};
-const status = {project,capabilities:{fileNetwork:true},aeVersion:"25.3",busy:false,uncertain:false};
+const status = {project,activeCompId:1,capabilities:{fileNetwork:true},aeVersion:"25.3",busy:false,uncertain:false};
 function fixture(overrides={}) {
     const events=[],store={state:{panelId:"panel",credential:"a".repeat(43),uncertain:false},save(){events.push(["save",this.state.uncertain]);},descriptor(){return {...descriptor};}};
     let command=null;
@@ -130,6 +130,15 @@ test("binding and lock checks refuse writes before evalScript; hidden capture re
     f.client.beforeCapture=async()=>{throw Object.assign(new Error("Hidden"),{code:"unsafe_state"});};
     await f.client.command({id:"cap",method:"capture",params:{},sessionID:"session"});
     assert.equal(f.events.some(e=>e[0]==="host"),false);
+});
+test("host status rejects invalid active composition metadata before connect or heartbeat",async()=>{
+    for(const activeCompId of [undefined,0,-1,1.5,"1",{},NaN,Number.MAX_SAFE_INTEGER+1]){
+        const f=fixture();f.host.call=async()=>({...status,activeCompId});
+        await assert.rejects(f.client.connect(),{code:"invalid_host_result"});
+        await f.client.tick();
+        assert.equal(f.events.some(e=>e[0]==="/connect" || e[0]==="/heartbeat"),false);
+        assert.equal(f.client.state.connection,"disconnected");
+    }
 });
 test("descriptor mismatch hard-stops; reconnect drops binding until fresh heartbeat",async()=>{
     const f=fixture();f.store.descriptor=()=>({...descriptor,version:"9.0"});

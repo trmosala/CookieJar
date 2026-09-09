@@ -43,8 +43,14 @@ function capabilities(value) {
   return clone(value)
 }
 
+function activeComp(value = null) {
+  if (value !== null && (!Number.isSafeInteger(value) || value <= 0))
+    fail("invalid_payload", "Invalid active composition ID")
+  return value
+}
+
 function sameProject(a, b) {
-  return a?.id === b?.id && a?.path === b?.path
+  return a?.id === b?.id && a?.path === b?.path && a?.saved === b?.saved
 }
 
 export async function createBridge(options = {}) {
@@ -180,6 +186,7 @@ async function startBridge({
   }
   async function suspend(connection, reason) {
     connection.connected = false
+    connection.activeCompId = null
     const pending = connection.pending
     if (pending) {
       connection.pending = null
@@ -202,13 +209,16 @@ async function startBridge({
         await suspend(connection, "Heartbeat expired; command outcome may be uncertain")
     for (const [code, entry] of pairing) if (entry.expiresAt <= now()) pairing.delete(code)
   }
-  function binding(sessionID, { write = false, allowLocked = false } = {}) {
+  function binding(sessionID, { write = false, allowLocked = false, allowSuspended = false } = {}) {
     healthy()
     const b = bindings.get(sessionID)
     if (!b) fail("not_bound", "Bind this session to an AE connection first")
     const c = live.get(b.connectionId)
-    if (b.state !== "active" || !c?.connected || now() - c.seen > heartbeatMs || !sameProject(b.project, c.project))
+    if (b.state !== "active" || !c?.connected || now() - c.seen > heartbeatMs || !sameProject(b.project, c.project)) {
+      // Metadata for release only; host calls never opt out of suspension.
+      if (allowSuspended && !write) return view({ ...b, state: "suspended" })
       fail("binding_suspended", "Connection or project changed; explicitly rebind")
+    }
     const lock = targetLock(c.id, c.project)
     if (lock && !allowLocked) fail("target_locked", "Target is locked pending reconciliation", { lock: clone(lock) })
     if (write && (!c.project.saved || !c.project.path)) fail("unsaved_project", "Save the project before writing")
@@ -494,15 +504,15 @@ async function startBridge({
     }
     let c = live.get(credential.connectionId)
     if (endpoint === "/connect") {
-      schema(body, ["protocol", "version", "panelId", "project", "aeVersion", "capabilities"])
+      schema(body, ["protocol", "version", "panelId", "project", "aeVersion", "capabilities"], ["activeCompId"])
       negotiate(body)
       if (body.panelId !== credential.panelId) fail("unauthorized", "Credential belongs to a different panel")
       const p = project(body.project)
-      const caps = capabilities(body.capabilities)
+      const caps = capabilities(body.capabilities), activeCompId = activeComp(body.activeCompId)
       assertString(body.aeVersion, "aeVersion", 128)
       if (c) await suspend(c, "Panel reconnected; explicitly rebind")
       c = { id: credential.connectionId, epoch: randomUUID(), panelId: credential.panelId, project: p, capabilities: caps,
-        aeVersion: body.aeVersion, connected: true, seen: now(), busy: false, pending: null }
+        aeVersion: body.aeVersion, activeCompId, connected: true, seen: now(), busy: false, pending: null }
       live.set(c.id, c)
       return { connectionId: c.id, ...info }
     }
@@ -553,14 +563,15 @@ async function startBridge({
       }
     }
     if (endpoint === "/heartbeat") {
-      schema(body, ["project", "capabilities", "busy"])
+      schema(body, ["project", "capabilities", "busy"], ["activeCompId"])
       const p = project(body.project)
-      const caps = capabilities(body.capabilities)
+      const caps = capabilities(body.capabilities), activeCompId = activeComp(body.activeCompId)
       if (typeof body.busy !== "boolean") fail("invalid_payload", "busy must be boolean")
       if (!sameProject(p, c.project)) {
-        await suspend(c, "Project identity or path changed; explicitly rebind")
+        await suspend(c, "Project identity, path or saved state changed; explicitly rebind")
         c.connected = true
       }
+      if (Object.hasOwn(body, "activeCompId")) c.activeCompId = activeCompId
       c.project = p
       c.capabilities = caps
       c.busy = body.busy
@@ -656,8 +667,10 @@ async function startBridge({
       fail("invalid_reply", "Connection changed while persisting reply")
     let result = null
     if (!body.error) {
-      try { result = clone(body.result) }
-      catch { body.error = { code: "invalid_host_result", message: "Host reply is not finite JSON" } }
+      try {
+        result = clone(body.result)
+        if (pending.command.method === "inspect" && result?.activeCompId !== undefined) activeComp(result.activeCompId)
+      } catch { body.error = { code: "invalid_host_result", message: "Host reply is not finite JSON or has invalid metadata" } }
     }
     c.pending = null
     clearTimeout(pending.timer)

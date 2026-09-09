@@ -184,6 +184,57 @@ test("native loopback authentication, schemas, pairing replay/expiry, rotation a
   assert.equal((await p.send("/poll")).status, 401)
 })
 
+test("discovery accepts validated active composition metadata and clears it across project and connection changes", async t => {
+  const p = await panelFixture(t)
+  const connect = activeCompId => p.send("/connect", { protocol: 1, version: "0.1.0", panelId: "test-panel",
+    project: p.state.project, aeVersion: "26.0-test", capabilities: p.state.capabilities, activeCompId })
+  const heartbeat = activeCompId => p.send("/heartbeat", {
+    project: p.state.project, capabilities: p.state.capabilities, busy: false, activeCompId,
+  })
+  const connection = async () => (await p.bridge.connections())[0]
+  assert.equal((await connect(7)).status, 200)
+  assert.equal((await connection()).activeCompId, 7)
+  for (const invalid of [0, -1, 1.5, "7", {}, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal((await heartbeat(invalid)).body.error.code, "invalid_payload")
+    assert.equal((await connect(invalid)).body.error.code, "invalid_payload")
+    assert.equal((await connection()).activeCompId, 7)
+  }
+  assert.equal((await heartbeat(null)).status, 200)
+  assert.equal((await connection()).activeCompId, null)
+  await heartbeat(8)
+  await p.heartbeat()
+  assert.equal((await connection()).activeCompId, 8)
+  await p.bridge.bind("session", p.connectionId)
+  p.state.project.path = path.join(p.dataDir, "save-as.aep")
+  await p.heartbeat()
+  assert.equal((await connection()).activeCompId, null)
+  assert.equal((await connection()).binding.state, "suspended")
+  await heartbeat(9)
+  await p.send("/disconnect", {})
+  assert.equal((await connection()).activeCompId, null)
+  await p.connect()
+  assert.equal((await connection()).connectionId, p.connectionId)
+  assert.equal((await connection()).activeCompId, null)
+  assert.throws(() => p.bridge.binding("session"), { code: "binding_suspended" })
+})
+
+test("saved-state changes suspend inspection bindings until explicit rebind, including a saved-state round trip", async t => {
+  const p = await panelFixture(t)
+  const original = p.bridge.binding("session")
+  p.state.project.saved = false
+  assert.equal((await p.heartbeat()).body.binding.state, "suspended")
+  const suspended = p.bridge.binding("session", { allowSuspended: true, allowLocked: true })
+  assert.equal(suspended.id, original.id)
+  assert.equal(suspended.state, "suspended")
+  assert.throws(() => p.bridge.binding("session", { allowSuspended: true, write: true }), { code: "binding_suspended" })
+  p.state.project.saved = true
+  await p.heartbeat()
+  await assert.rejects(p.bridge.call("session", "inspect"), { code: "binding_suspended" })
+  await assert.rejects(p.bridge.lock("session", "write"), { code: "binding_suspended" })
+  await p.bridge.bind("session", p.connectionId)
+  assert.notEqual(p.bridge.binding("session", { write: true }).id, original.id)
+})
+
 test("exclusive binding, takeover, heartbeat loss, project switch, Save As and unsaved writes", async t => {
   let clock = Date.now()
   const p = await panelFixture(t, { now: () => clock, heartbeatMs: 100 })

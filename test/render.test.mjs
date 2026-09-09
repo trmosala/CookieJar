@@ -84,9 +84,9 @@ async function setup(t, platform = "win32") {
         async start(command) {
           const childIdentity = { pid: nextPID++, startTime: randomUUID(), executable: command.executable, command: JSON.stringify(command) }
           live.set(childIdentity.pid, childIdentity)
-          let finish
-          const exited = new Promise(resolve => { finish = resolve })
-          children.set(path.basename(jobDir), { identity: childIdentity, finish, command, jobDir, done: false })
+          let finish, crash
+          const exited = new Promise((resolve, reject) => { finish = resolve; crash = reject })
+          children.set(path.basename(jobDir), { identity: childIdentity, finish, crash, command, jobDir, done: false })
           return { pid: childIdentity.pid, identity: childIdentity, exited }
         },
       }
@@ -321,6 +321,135 @@ for (const platform of ["win32", "darwin"]) {
     assert.equal(await exists(job.reservationPath), true)
   })
 }
+
+test("reused supervisor PID does not hide a matching orphan child after restart", async t => {
+  const f = await setup(t)
+  const job = await f.service.submit(f.input)
+  const child = await f.started(job.jobId)
+  await until(() => exists(path.join(f.jobDir(job.jobId), "process.json")))
+  await fs.writeFile(path.join(job.stageDir, "movie.mov"), "partial")
+  child.crash(new Error("Supervisor lost its exit channel"))
+  const worker = f.workers.get(job.jobId)
+  await worker.task
+  assert.match(worker.error.message, /exit channel/)
+  const unrelated = { ...worker.identity, startTime: "reused", command: "unrelated application" }
+  f.live.set(unrelated.pid, unrelated)
+  await fs.unlink(job.logPath)
+  await f.service.close()
+  let recovered = await f.open()
+  const status = await recovered.status(job.jobId)
+  assert.equal(status.state, "running")
+  assert.equal(status.controllable, true)
+  assert.equal(status.progress.available, false)
+  assert.equal(status.progress.percent, null)
+  const inspect = f.adapter.inspect
+  let childInspection = "matching"
+  f.adapter.inspect = async pid => {
+    if (pid === unrelated.pid || pid === child.identity.pid && childInspection === "inaccessible") {
+      throw Object.assign(new Error("Process identity inaccessible"), { code: "render_process" })
+    }
+    if (pid === child.identity.pid && childInspection === "absent") return null
+    if (pid === child.identity.pid && childInspection === "reused") {
+      return { ...child.identity, startTime: "reused-child", command: "unrelated child" }
+    }
+    return inspect(pid)
+  }
+  await recovered.close()
+  recovered = await f.open()
+  assert.equal((await recovered.status(job.jobId)).state, "running")
+  assert.equal((await recovered.status(job.jobId)).controllable, true)
+  for (const outcome of ["inaccessible", "reused", "absent"]) {
+    childInspection = outcome
+    const blocked = await recovered.status(job.jobId)
+    assert.equal(blocked.state, "unknown", outcome)
+    assert.equal(blocked.controllable, false)
+    assert.deepEqual(blocked.deliverables, [])
+    await assert.rejects(recovered.cancel(job.jobId), { code: "render_process_identity" })
+    assert.equal(await exists(path.join(f.jobDir(job.jobId), "cancel.json")), false)
+    assert.equal(await exists(job.checkpoint.path), true)
+    assert.equal(await exists(job.reservationPath), true)
+    assert.deepEqual(f.killed, [])
+  }
+  childInspection = "matching"
+  await recovered.cancel(job.jobId)
+  assert.deepEqual(f.killed, [child.identity])
+  assert.deepEqual(f.live.get(unrelated.pid), unrelated)
+  const final = await recovered.status(job.jobId)
+  assert.equal(final.state, "unknown")
+  assert.deepEqual(final.deliverables, [])
+  assert.equal(await exists(job.checkpoint.path), true)
+  assert.equal(await exists(job.reservationPath), true)
+  assert.equal(await fs.readFile(path.join(job.stageDir, "movie.mov"), "utf8"), "partial")
+})
+
+test("unavailable supervisor inspection cannot authorize receipt cleanup or exit recovery", async t => {
+  const f = await setup(t)
+  const job = await f.service.submit(f.input)
+  await f.finish(job.jobId)
+  const jobDir = f.jobDir(job.jobId)
+  const manifest = await load(path.join(jobDir, "manifest.json"))
+  const receiptPath = path.join(jobDir, "receipt.json")
+  const receipt = await load(receiptPath)
+  const worker = f.workers.get(job.jobId)
+  const inspect = f.adapter.inspect
+  f.adapter.inspect = async pid => {
+    if (pid === worker.identity.pid) {
+      throw Object.assign(new Error("Supervisor identity inaccessible"), { code: "render_process" })
+    }
+    return inspect(pid)
+  }
+  await f.service.close()
+  const recovered = await f.open()
+  for (const version of [2, 1]) {
+    await save(path.join(jobDir, "manifest.json"), { ...manifest, version })
+    const result = await recovered.result(job.jobId)
+    assert.equal(result.state, "unknown")
+    assert.equal(result.verified, false)
+    assert.deepEqual(result.outputs, [])
+    await fs.unlink(receiptPath)
+    const status = await recovered.status(job.jobId)
+    assert.equal(status.state, "unknown")
+    assert.equal(status.controllable, false)
+    assert.equal(await exists(receiptPath), false, "Do not finalize an exit with an uninspectable supervisor")
+    assert.equal(await exists(path.join(jobDir, "checkpoint-release.json")), false)
+    assert.equal(await exists(job.checkpoint.path), true)
+    assert.equal(await exists(job.reservationPath), true)
+    assert.equal(await exists(job.stageDir), true)
+    assert.equal(await exists(job.quarantineDir), false)
+    assert.equal(await fs.readFile(f.input.outputPath, "utf8"), "rendered bytes")
+    assert.deepEqual(f.killed, [])
+    await save(receiptPath, receipt)
+  }
+})
+
+test("failed cancellation retries only on a fresh explicit request after reconnect", async t => {
+  const f = await setup(t)
+  let attempts = 0
+  f.adapter.terminate = async identity => {
+    assert.ok(sameIdentity(identity, await f.adapter.inspect(identity.pid)))
+    attempts++
+    if (attempts === 1) throw new Error("Temporary process control failure")
+    return { requested: true, method: "test-close-window" }
+  }
+  const job = await f.service.submit(f.input)
+  await f.started(job.jobId)
+  await f.service.cancel(job.jobId)
+  await until(async () => (await f.service.status(job.jobId)).cancellation?.method === "control-unavailable")
+  await delay(250)
+  assert.equal(attempts, 1, "A failed request must not become an automatic retry loop")
+  await f.service.close()
+  const recovered = await f.open()
+  await recovered.cancel(job.jobId)
+  await until(() => attempts === 2)
+  await until(async () => (await recovered.status(job.jobId)).cancellation?.requested)
+  await recovered.cancel(job.jobId)
+  await delay(250)
+  assert.equal(attempts, 2, "A successful termination request must not be repeated")
+  await f.finish(job.jobId, { code: 1, quiescent: false })
+  const status = await recovered.status(job.jobId)
+  assert.equal(status.state, "unknown", "A request is not proof of descendant shutdown")
+  assert.equal(await exists(job.reservationPath), true)
+})
 
 test("checkpoint hash is rechecked and modified checkpoints are refused", async t => {
   const f = await setup(t)

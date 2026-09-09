@@ -189,7 +189,7 @@ function Client(options) {
     this.store=options.store;this.host=options.host;this.normalize=options.normalize;this.changed=options.changed || function(){};
     this.beforeCapture=options.beforeCapture || function(){return Promise.reject(error("unsafe_state","Visible capture indicator could not be confirmed"));};
     this.request=options.request || request;this.descriptor=null;this.running=false;this.timer=null;this.inFlight=false;
-    this.state={connection:this.store.state.credential ? "paired" : "unpaired",project:null,capabilities:{fileNetwork:false},binding:null,lock:null,busy:false,capture:null,uncertain:this.store.state.uncertain,aeVersion:"",bridgeVersion:"",lastError:""};
+    this.state={connection:this.store.state.credential ? "paired" : "unpaired",project:null,activeCompId:null,capabilities:{fileNetwork:false},binding:null,lock:null,busy:false,capture:null,uncertain:this.store.state.uncertain,aeVersion:"",bridgeVersion:"",lastError:""};
 }
 Client.prototype.context=function(){
     var b=this.state.binding,p=this.state.project,d=this.descriptor;
@@ -283,15 +283,16 @@ Client.prototype.management=function(endpoint){
 Client.prototype.status=function(){
     var self=this;
     return self.host.call("status",{}).then(function(s){
-        if(!record(s) || !record(s.project) || !record(s.capabilities) || typeof s.capabilities.fileNetwork!=="boolean" || !text(s.aeVersion,128))throw error("invalid_host_result","Host status incomplete");
-        self.state.project=s.project;self.state.capabilities=s.capabilities;self.state.aeVersion=s.aeVersion;
+        if(!record(s) || !record(s.project) || !record(s.capabilities) || typeof s.capabilities.fileNetwork!=="boolean" || !text(s.aeVersion,128) ||
+            !(s.activeCompId === null || (Number.isSafeInteger(s.activeCompId) && s.activeCompId>0)))throw error("invalid_host_result","Host status incomplete");
+        self.state.project=s.project;self.state.activeCompId=s.activeCompId;self.state.capabilities=s.capabilities;self.state.aeVersion=s.aeVersion;
         if(s.uncertain) { self.mark(true); throw error("outcome_uncertain","Host requires recovery"); }
         self.emit();return s;
     });
 };
 Client.prototype.heartbeat=function(){
     var self=this;
-    return self.send("/heartbeat",{project:self.state.project,capabilities:self.state.capabilities,busy:self.state.busy || self.state.uncertain}).then(function(r){
+    return self.send("/heartbeat",{project:self.state.project,activeCompId:self.state.activeCompId,capabilities:self.state.capabilities,busy:self.state.busy || self.state.uncertain}).then(function(r){
         if(!record(r) || !Object.prototype.hasOwnProperty.call(r,"binding") || !Object.prototype.hasOwnProperty.call(r,"lock") || !(r.binding=== null || record(r.binding)) || !(r.lock=== null || record(r.lock)))throw error("invalid_response","Malformed heartbeat");
         self.state.binding=r.binding;self.state.lock=r.lock;self.emit();return r;
     });
@@ -300,7 +301,7 @@ Client.prototype.connect=function(){
     var self=this;
     self.discover();
     return self.status().then(function(s){
-        return self.send("/connect",{protocol:PROTOCOL,version:VERSION,panelId:self.store.state.panelId,project:s.project,aeVersion:s.aeVersion,capabilities:s.capabilities});
+        return self.send("/connect",{protocol:PROTOCOL,version:VERSION,panelId:self.store.state.panelId,project:s.project,activeCompId:s.activeCompId,aeVersion:s.aeVersion,capabilities:s.capabilities});
     }).then(function(r){
         if(r.protocol!==PROTOCOL || r.version!==VERSION)throw error("incompatible_version","Bridge negotiation mismatch");
         self.state.connection="connected";self.state.binding=null;self.state.lock=null;self.emit();

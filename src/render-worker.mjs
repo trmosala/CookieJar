@@ -478,9 +478,14 @@ export async function runWorker(jobDir, adapter = createProcessAdapter()) {
       jobId: job.jobId, commandHash: job.commandHash, pid: child.pid, identity: child.identity, at: timestamp(),
     })
     let finished = false
+    let cancellationRequest = null
     const exited = child.exited.then(value => { finished = true; return value })
     while (!finished) {
-      if (!cancellation && await exists(path.join(jobDir, "cancel.json"))) {
+      // Retry failed control only for a new explicit request, never on every poll.
+      const request = !cancellation?.requested && await exists(path.join(jobDir, "cancel.json"))
+        ? await load(path.join(jobDir, "cancel.json")) : null
+      if (request && hash(request) !== cancellationRequest) {
+        cancellationRequest = hash(request)
         cancellation = { requested: false, method: "identity-unavailable" }
         if (child.identity) {
           try {

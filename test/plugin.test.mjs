@@ -375,6 +375,59 @@ test("real corrupt manifests remain unscopable after restart and expose only agg
   }
 })
 
+test("chat discovery retains active composition and reports unsaved mutation eligibility without leaking ownership", async t => {
+  const { p, tools } = await fixture(t)
+  p.state.activeCompId = 1
+  await tools.ae_inspect.execute({}, context())
+  const list = async sessionID => JSON.parse(await tools.ae_connections.execute({}, context(() => assert.fail("read-only discovery"), sessionID)))
+  const [owned] = await list("session")
+  assert.equal(owned.activeCompId, 1)
+  assert.equal(owned.mutationEligible, true)
+  assert.equal(owned.aeVersion, "26.0-test")
+  assert.deepEqual(owned.project, p.state.project)
+  assert.deepEqual(owned.capabilities, p.state.capabilities)
+  const [foreign] = await list("other")
+  assert.equal(foreign.activeCompId, 1)
+  assert.equal(foreign.owned, true)
+  assert.equal(foreign.binding, null)
+  assert.ok(!JSON.stringify(foreign).includes(p.bridge.binding("session").id))
+  await p.stop()
+  p.state.project = { id: "unsaved", path: null, saved: false }
+  await p.heartbeat()
+  await tools.ae_bind.execute({ connectionId: p.connectionId }, context(request => {
+    assert.match(request.patterns[0], /inspection.only/i)
+  }))
+  await p.start(command => simulatedHost(command, p))
+  const inspected = JSON.parse(await tools.ae_inspect.execute({}, context()))
+  assert.equal(inspected.project.saved, false)
+  assert.equal((await list("session"))[0].mutationEligible, false)
+  await assert.rejects(tools.ae_propose.execute({ actions: [{ type: "layer.create", name: "No write" }] }, context()), { code: "unsaved_project" })
+  assert.equal(p.log.some(command => ["save", "execute", "preflight"].includes(command.method)), false)
+})
+
+test("chat release works while suspended, retains recovery locks, and refuses a replacement binding during approval", async t => {
+  const { p, tools } = await fixture(t)
+  await p.stop()
+  await p.bridge.lock("session", "retain recovery")
+  await p.send("/disconnect", {})
+  await assert.rejects(tools.ae_release.execute({}, context(() => false)), { code: "permission_denied" })
+  let reviewed
+  assert.deepEqual(JSON.parse(await tools.ae_release.execute({}, context(request => {
+    reviewed = request.metadata.binding
+    assert.equal(reviewed.state, "suspended")
+    assert.equal(request.permission, "ae_release")
+  }))), { released: true })
+  assert.equal((await p.bridge.connections())[0].binding, null)
+  assert.equal((await p.bridge.connections())[0].lock.id, reviewed.lock.id)
+  await p.connect()
+  await tools.ae_bind.execute({ connectionId: p.connectionId }, context())
+  const before = p.bridge.binding("session", { allowLocked: true })
+  await assert.rejects(tools.ae_release.execute({}, context(async () => {
+    await p.bridge.bind("session", p.connectionId)
+  })), error => ["aborted", "stale_binding"].includes(error.code))
+  assert.notEqual(p.bridge.binding("session", { allowLocked: true }).id, before.id)
+})
+
 test("bind passes the reviewed project and owner through the bridge await boundary", async t => {
   const { p, r, tools } = await fixture(t)
   const original = p.bridge.bind, reviewed = p.bridge.binding("session")

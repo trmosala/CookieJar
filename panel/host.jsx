@@ -818,7 +818,7 @@ var CookieMonsterAE = (function () {
             if(recovery && request.method!=="status" && request.method!=="inspect" && request.method!=="reconcile" &&
                 !(request.method==="execute" && (p.phase==="recovery_prepare" || p.phase==="recovery_finish")))
                 fail("unsafe_state","Stopped execution permits only inspected recovery");
-            if(request.method==="status"){object(p,"");result={project:project(),aeVersion:String(app.version),capabilities:capability(),busy:busy,uncertain:uncertain};}
+            if(request.method==="status"){object(p,"");result={project:project(),activeCompId:app.project.activeItem instanceof CompItem ? app.project.activeItem.id : null,aeVersion:String(app.version),capabilities:capability(),busy:busy,uncertain:uncertain};}
             else if(request.method==="inspect"){object(p,"");result=inspect();}
             else if(request.method==="preflight"){
                 object(p,"actions","actions");ready(true);var snapshot=inspect();result=validate(p.actions);plan={actions:stringify(result.actions),snapshot:stringify(snapshot),imports:importPins(result.actions)};

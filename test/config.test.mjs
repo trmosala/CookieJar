@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { copyFile, cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { build, files } from "../scripts/build.mjs";
@@ -73,6 +73,38 @@ test("bundled config preserves browser entries/policy, isolates invalid artifact
   await assert.rejects(exec(process.execPath, [cli, input, invalid, join(dir, "bad-output.json")]));
   await assert.rejects(readFile(join(dir, "bad-output.json")), { code: "ENOENT" });
   assert.deepEqual(JSON.parse(await readFile(input, "utf8")), before);
+});
+
+test("multiple bundles preserve options through path aliases and omit failed optional defaults", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "cm-ae-multiple-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  for (const name of ["cm-browser", "cm-ae"]) {
+    await mkdir(join(dir, name));
+    await writeFile(join(dir, name, "plugin.mjs"), 'throw new Error("MUST NOT RUN");\n');
+  }
+  const alias = join(dir, "ae-alias");
+  await symlink(join(dir, "cm-ae"), alias, process.platform === "win32" ? "junction" : "dir");
+  const artifacts = [
+    { id: "browser", path: join(dir, "cm-browser", "plugin.mjs"), permissions: { browser_click: "ask" } },
+    { id: "cm-ae", path: join(dir, "cm-ae", "plugin.mjs"), permissions: AE_PERMISSIONS },
+    { id: "missing", path: join(dir, "missing.mjs"), permissions: { missing_tool: "allow" }, optional: true },
+  ];
+  const fresh = await mergeBundledPlugins({}, artifacts);
+  assert.equal(fresh.config.plugin.length, 2);
+  assert.equal(fresh.config.permission.browser_click, "ask");
+  assert.equal(fresh.config.permission.ae_execute, "ask");
+  assert.equal(Object.hasOwn(fresh.config.permission, "missing_tool"), false);
+  assert.deepEqual(fresh.diagnostics.map(({ id, severity, code }) => [id, severity, code]),
+    [["missing", "warning", "ARTIFACT_UNAVAILABLE"]]);
+
+  const entry = [pathToFileURL(join(alias, "plugin.mjs")).href, { enabled: false }];
+  const original = { plugin: [entry], permission: { browser_click: "deny" } };
+  const before = structuredClone(original);
+  const merged = await mergeBundledPlugins(original, artifacts);
+  assert.deepEqual(original, before);
+  assert.deepEqual(merged.config.plugin, [entry, fresh.config.plugin[0]]);
+  assert.equal(merged.config.permission.browser_click, "deny");
+  assert.deepEqual((await mergeBundledPlugins(merged.config, artifacts)).config, merged.config);
 });
 
 test("packaging verifies inventory and hashes, rejects unsafe inputs, and signing fails without credentials", async (t) => {

@@ -338,7 +338,15 @@ test("actual bridge and panel transport dispatch host source, unlock after reply
         await client.pair(bridge.pairingCode("integration-session").code);
         await client.connect();
         const connection=(await bridge.connections())[0];
+        assert.equal(connection.activeCompId,f.comp.id,"connect publishes the active composition before inspection");
         await bridge.bind("integration-session",connection.id);
+        const bindingId=bridge.binding("integration-session").id;
+        for(const active of [,new f.FootageItem(new f.File("C:/Project/asset.png")),f.comp]){
+            f.project.activeItem=active;
+            await client.tick();
+            assert.equal((await bridge.connections())[0].activeCompId,active===f.comp ? f.comp.id : null);
+            assert.equal(bridge.binding("integration-session").id,bindingId,"selection changes do not suspend the binding");
+        }
         async function rpc(method,params={}){
             let completed=false;
             const pending=bridge.call("integration-session",method,params,{allowLocked:true}).then(result=>{completed=true;return {result};},error=>{completed=true;return {error};});

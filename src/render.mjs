@@ -101,9 +101,11 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
     } finally { await fs.rmdir(lock) }
   }
   async function releaseCheckpoint(job, worker) {
+    // Inspection errors must also block legacy receipt cleanup and reservation release.
+    const workerLive = worker?.identity ? await adapter.inspect(worker.identity.pid) : null
     // Version 1 used a shared boolean pin without ownership. Never guess its owner.
     if (job.version !== 2) return { ownership: "shared", state: "preserved" }
-    if (worker?.identity && sameIdentity(worker.identity, await adapter.inspect(worker.identity.pid))) {
+    if (sameIdentity(worker?.identity, workerLive)) {
       return { ownership: "integration", state: "held", reason: "Supervisor has not exited yet" }
     }
     const recordPath = path.join(directory(job.jobId), "checkpoint-release.json")
@@ -215,9 +217,13 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
           await release(job)
         }
       } else {
-        const workerLive = worker?.identity ? await adapter.inspect(worker.identity.pid) : null
+        let workerLive = null, workerError = null
+        try { workerLive = worker?.identity ? await adapter.inspect(worker.identity.pid) : null } catch (error) { workerError = error }
         const childLive = child?.identity ? await adapter.inspect(child.identity.pid) : null
-        if (workerLive && !sameIdentity(worker.identity, workerLive) ||
+        // Inspection failure permits only independently verified child control, never exit recovery.
+        if (workerError && !sameIdentity(child?.identity, childLive)) throw workerError
+        // A reused supervisor PID does not invalidate an independently verified child.
+        if (workerLive && !sameIdentity(worker.identity, workerLive) && !sameIdentity(child?.identity, childLive) ||
             childLive && !sameIdentity(child.identity, childLive)) {
           observed.reason = "process_identity_mismatch"
         } else if (sameIdentity(worker?.identity, workerLive)) {
@@ -398,7 +404,11 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
       }
       const jobDir = directory(id)
       await save(path.join(jobDir, "cancel.json"), { at: timestamp(), reason: "requested" })
-      const worker = job.workerIdentity && await adapter.inspect(job.workerIdentity.pid)
+      let worker = null
+      try { worker = job.workerIdentity && await adapter.inspect(job.workerIdentity.pid) } catch (error) {
+        // This permits only the child identity recheck below, not supervisor cleanup.
+        if (!job.processIdentity) throw error
+      }
       if (!sameIdentity(job.workerIdentity, worker) && job.processIdentity) {
         const live = await adapter.inspect(job.processIdentity.pid)
         if (!sameIdentity(job.processIdentity, live)) fail("render_process_identity", "Process identity changed before cancellation")

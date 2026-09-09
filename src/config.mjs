@@ -41,10 +41,12 @@ function artifactPath(value) {
   return path;
 }
 
-function pluginKey(entry) {
+async function pluginKey(entry) {
   const value = Array.isArray(entry) ? entry[0] : entry;
   try {
-    return pathToFileURL(artifactPath(value)).href;
+    const path = artifactPath(value);
+    // Keep unresolved entries; canonicalize only for duplicate detection.
+    return pathToFileURL(await realpath(path).catch(() => path)).href;
   } catch {
     return value;
   }
@@ -67,7 +69,7 @@ export async function mergeBundledPlugins(config, artifacts) {
   }
 
   const plugin = [...(config.plugin ?? [])];
-  const existing = new Set(plugin.map(pluginKey));
+  const existing = new Set(await Promise.all(plugin.map(pluginKey)));
   const ids = new Set();
   const defaults = {};
   const diagnostics = [];

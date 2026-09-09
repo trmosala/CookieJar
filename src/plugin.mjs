@@ -304,8 +304,9 @@ export function createTools(runtime) {
   tool("ae_connections", "List connections without disclosing other sessions' bindings.", {}, async (_, c) => {
     const list = await r.bridge.connections()
     c.check()
-    return list.map(({ id, connectionId, aeVersion, project, capabilities, connected, busy, binding }) => ({
-      id, connectionId, aeVersion, project, capabilities, connected, busy,
+    return list.map(({ id, connectionId, aeVersion, project, capabilities, activeCompId, connected, busy, binding, lock }) => ({
+      id, connectionId, aeVersion, project, capabilities, activeCompId, connected, busy,
+      mutationEligible: !!(connected && project.saved && project.path && capabilities.fileNetwork && !busy && !lock),
       owned: !!binding && binding.sessionID !== c.sessionID,
       binding: binding?.sessionID === c.sessionID ? binding : null,
     }))
@@ -315,7 +316,7 @@ export function createTools(runtime) {
     if (!before?.connected) fail("disconnected", "Connection is unavailable")
     const proof = hash(before)
     const expectedProject = Object.freeze(clone(before.project)), expectedOwner = before.binding?.id ?? null
-    await ask(`Bind this session to ${before.project.path || "unsaved project"} on ${a.connectionId}${a.takeover ? "; take over its existing session" : ""}.`, { ...a, project: before.project })
+    await ask(`Bind this session to ${before.project.path || "unsaved project"} on ${a.connectionId}${a.takeover ? "; take over its existing session" : ""}.${before.project.saved ? "" : " Inspection only; save manually and explicitly rebind before mutation."}`, { ...a, project: before.project })
     const after = (await r.bridge.connections()).find(b => b.connectionId === a.connectionId)
     c.check()
     if (!after || hash(after) !== proof) fail("stale_binding", "Target changed during binding review")
@@ -323,10 +324,10 @@ export function createTools(runtime) {
       takeover: a.takeover, expectedProject, expectedOwner, expectedConnection: before.epoch,
     })
   })
-  tool("ae_release", "Release only this session's binding and ephemeral authorizations.", {}, async (_, c, ask) => {
-    const b = current(r, c, null, { allowLocked: true })
-    await ask(`Release this session's AE binding to ${b.project.path}. Detached render jobs continue.`, { binding: b })
-    current(r, c, b, { allowLocked: true })
+  tool("ae_release", "Release only this session's active or suspended binding and ephemeral authorizations.", {}, async (_, c, ask) => {
+    const b = current(r, c, null, { allowLocked: true, allowSuspended: true })
+    await ask(`Release this session's AE binding to ${b.project.path || "unsaved project"}. Detached render jobs continue.`, { binding: b })
+    current(r, c, b, { allowLocked: true, allowSuspended: true })
     return r.release ? r.release(c.sessionID) : r.bridge.release(c.sessionID)
   })
   tool("ae_inspect", "Inspect the bound project with revision-safe persistent IDs.", {}, (_, c) => r.workflow.inspect(c.sessionID))
