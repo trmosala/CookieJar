@@ -1,0 +1,14 @@
+{
+  "name": "@cookiemonster/after-effects",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "exports": { ".": "./src/plugin.mjs" },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build": "node scripts/build.mjs",
+    "check": "node scripts/check.mjs"
+  },
+  "dependencies": { "zod": "4.1.8" }
+}

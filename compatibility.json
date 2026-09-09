@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "pluginVersion": "0.1.0",
+  "panelVersion": "0.1.0",
+  "protocolVersion": 1,
+  "minimumNodeVersion": "22",
+  "signed": false,
+  "certifiedEntries": [],
+  "candidates": [
+    { "aeMajor": 25, "status": "not-certified" },
+    { "aeMajor": 26, "status": "not-certified" }
+  ],
+  "cookieMonsterBuild": null,
+  "approvedArtifacts": [],
+  "updateLinks": {
+    "plugin": "https://github.com/trmosala/CookieJar/releases",
+    "panel": "https://github.com/trmosala/CookieJar/releases",
+    "cookieMonster": null
+  },
+  "releaseGate": "Blocked: desktop integration, signing, exact host qualification and pilot approval have no release evidence."
+}

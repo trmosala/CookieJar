@@ -1,0 +1,28 @@
+:root { color-scheme: dark; font: 13px/1.5 "Segoe UI", Arial, sans-serif; color: #e6e6e6; background: #242424; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 280px; }
+main { max-width: 700px; padding: 14px; margin: auto; }
+header { border-left: 3px solid #93b6ef; padding-left: 10px; }
+h1 { font-size: 18px; margin: 0; font-weight: 600; }
+h2 { font-size: 13px; margin: 0 0 8px; color: #e9e9e9; }
+p { margin: 8px 0; color: #c2c2c2; overflow-wrap: anywhere; }
+.qualification { color: #f2c777; font-size: 10px; letter-spacing: .09em; font-weight: 700; }
+section { border-top: 1px solid #454545; padding: 12px 0; }
+dl { margin: 6px 0; } dt { color: #aaa; font-size: 11px; } dd { margin: 0 0 7px; overflow-wrap: anywhere; }
+label { display: block; margin-bottom: 4px; }
+input { display: block; width: 100%; background: #161616; color: #eee; border: 1px solid #757575; padding: 8px; margin-bottom: 7px; }
+button { background: #3b3b3b; color: #eee; border: 1px solid #757575; border-radius: 3px; min-height: 34px; padding: 6px 10px; font: inherit; cursor: pointer; text-align: left; }
+button:hover { background: #505050; } button:disabled { opacity: .5; cursor: default; }
+button:focus-visible, input:focus-visible { outline: 2px solid #9cc6ff; outline-offset: 2px; }
+.buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.capture { background: #f2c777; color: #171717; padding: 10px; border: 2px solid #fff2ce; font-weight: 700; }
+#error { color: #ffb4aa; } #status { color: #b8d3ff; }
+select { width: 100%; min-height: 34px; padding: 6px; background: #161616; color: #eee; border: 1px solid #757575; font: inherit; }
+input[type="checkbox"] { display: inline-block; width: auto; margin: 10px 5px 0 0; }
+h3 { font-size: 12px; margin: 14px 0 6px; }
+a { color: #b8d3ff; display: inline-block; padding: 6px 0; overflow-wrap: anywhere; }
+a:focus, select:focus, button:focus { outline: 2px solid #9cc6ff; outline-offset: 2px; }
+#restore-review { padding: 10px; border: 1px solid #f2c777; margin-top: 8px; }
+#renders { padding-left: 18px; overflow-wrap: anywhere; }
+[hidden] { display: none !important; }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto; } }

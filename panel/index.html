@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>CookieMonster AE</title>
+<link rel="stylesheet" href="panel.css">
+</head>
+<body>
+<main>
+<header><h1>CookieMonster AE</h1><p class="qualification">DEVELOPMENT UNQUALIFIED</p></header>
+<p>Targets AE 25/26. No point versions certified. Use disposable projects until the qualification matrix is supplied.</p>
+<section aria-labelledby="status-heading">
+<h2 id="status-heading">Connection</h2>
+<p id="status" role="status" aria-live="polite">Starting panel...</p>
+<dl><dt>Versions</dt><dd id="versions">Panel 0.1.0</dd><dt>Project</dt><dd id="project">Unknown</dd><dt>Session</dt><dd id="binding">Unbound</dd><dt>Lock</dt><dd id="lock">Unknown</dd></dl>
+<p id="capture" class="capture" role="status" aria-live="assertive" hidden></p>
+<p id="error" role="alert"></p>
+</section>
+<section aria-labelledby="pair-heading">
+<h2 id="pair-heading">Pairing</h2>
+<form id="pair-form"><label for="code">Single-use code from CookieMonster chat</label><input id="code" type="password" autocomplete="off" spellcheck="false" maxlength="64"><button id="pair" type="submit">Pair</button></form>
+<div class="buttons"><button id="connect" type="button">Reconnect</button><button id="disconnect" type="button">Disconnect</button><button id="rotate" type="button">Rotate Credential</button><button id="unpair" type="button">Unpair</button></div>
+<p>Reconnection always requires explicit rebinding in chat. One panel per user data directory can own a pairing.</p>
+</section>
+<section aria-labelledby="capture-heading">
+<h2 id="capture-heading">Capture &amp; Recovery</h2>
+<p>Capture is unavailable in this deployment: preview/modal safety cannot be verified. A user idle assertion does not authorize capture. Inspection remains available.</p>
+<button id="idle" type="button" disabled>Capture Unavailable</button>
+<p>Timed-out scripts are never retried. Wait for AE to return, inspect the project and queue, then clear the local latch. Rebind and reconcile the durable lock in chat separately.</p>
+<button id="reconcile" type="button">I Inspected AE: Clear Local Latch</button>
+</section>
+<section aria-labelledby="preference-heading">
+<h2 id="preference-heading">File &amp; Network Permission</h2>
+<p id="preference">Unknown</p>
+<p>Windows: Edit &gt; Preferences &gt; Scripting &amp; Expressions. macOS: After Effects &gt; Settings (Preferences) &gt; Scripting &amp; Expressions. Enable &quot;Allow Scripts to Write Files and Access Network&quot; yourself. This panel never changes that preference.</p>
+</section>
+<section aria-labelledby="services-heading">
+<h2 id="services-heading">Bridge Services</h2>
+<button id="services-refresh" type="button">Refresh Checkpoints and Renders</button>
+<label><input id="services-auto" type="checkbox"> Refresh every 10 seconds while visible</label>
+<p id="services-status" role="status" aria-live="polite">Refresh to request metadata from the bridge.</p>
+<h3>Checkpoints</h3>
+<label for="checkpoint">Checkpoint in the bound project</label>
+<select id="checkpoint"><option value="">Refresh to load checkpoints</option></select>
+<p id="checkpoint-details"></p>
+<div class="buttons">
+<button id="checkpoint-pin" type="button" disabled>Pin</button>
+<button id="checkpoint-delete" type="button" disabled>Delete Checkpoint</button>
+<button id="restore-propose" type="button" disabled>Review Restore</button>
+</div>
+<div id="restore-review" role="region" aria-label="Restore confirmation" hidden>
+<p id="restore-details"></p>
+<p id="restore-operation"></p>
+<p>Review the exact operation above, including saving current edits and creating a verified current-state checkpoint before restore. If a recovery copy is opened, Save As to the intended path, explicitly rebind, and review reconciliation in chat; the original target remains locked. Approval is single-use and bound to this session/project.</p>
+<button id="restore-confirm" type="button">Confirm This Restore</button>
+<button id="restore-cancel" type="button">Cancel</button>
+</div>
+<h3>Render Jobs</h3>
+<ul id="renders"><li>Not requested</li></ul>
+<h3>Diagnostics</h3>
+<p>Export only the bridge's sanitized metadata. No local project, script, image, prompt, or credential collection.</p>
+<button id="diagnostics" type="button">Prepare Metadata Export</button>
+<a id="diagnostics-download" download="cookiemonster-ae-diagnostics.json" hidden>Save Metadata JSON</a>
+<p>Update source: github.com/trmosala/CookieJar/releases. Obtain the matching internal build from your administrator.</p>
+</section>
+</main>
+<script src="ui.js"></script>
+</body>
+</html>
