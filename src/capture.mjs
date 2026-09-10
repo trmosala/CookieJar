@@ -5,10 +5,11 @@ export const captureArgs = {
   compId: z.number().int().positive(),
   time: z.number().finite().nonnegative(),
   alpha: z.boolean().default(true),
+  maxWidth: z.number().int().min(1).max(2000).default(2000),
 }
 const MAX = 5 * 1024 * 1024
 // Only errors known to precede temporary queue mutation can release a failed call.
-export const safeRefusals = new Set(["unsafe_state", "preference_disabled", "capability_missing",
+export const safeRefusals = new Set(["busy", "unsafe_state", "preference_disabled", "capability_missing",
   "unsaved_project", "invalid_payload", "invalid_method", "unsupported_method", "missing_item", "wrong_item_type"])
 
 export function imageAttachment(result, alpha = true) {
@@ -82,7 +83,13 @@ export async function capture({ bridge, workflow }, sessionID, input, ask, check
         active.project.id !== b.project.id || active.project.path !== b.project.path)
       fail("stale_binding", "Capture binding changed")
   }
-  const initial = await workflow.inspect(sessionID)
+  const inspect = () => workflow.inspectQuery(sessionID, { compId: params.compId, depth: 0 })
+  const initial = await inspect()
+  const unchanged = async () => {
+    const latest = await inspect()
+    if (latest.expectedRevision !== initial.expectedRevision)
+      fail("stale_fingerprint", "Composition changed since capture inspection")
+  }
   current()
   const comp = initial.items.find(item => item.id === params.compId && item.kind === "comp")
   if (!comp || !Number.isFinite(comp.duration) || !Number.isFinite(comp.frameRate) || comp.frameRate <= 0 ||
@@ -93,25 +100,35 @@ export async function capture({ bridge, workflow }, sessionID, input, ask, check
   if (await ask(`Capture composition ${comp.name} (ID ${comp.id}) at ${params.time}s; alpha ${params.alpha}. Temporarily renders one frame.`, { ...params, binding: b }) === false)
     fail("permission_denied", "Capture denied")
   current()
-  if ((await workflow.inspect(sessionID)).fingerprint !== initial.fingerprint) fail("stale_fingerprint", "Composition changed during capture approval")
+  await unchanged()
   current()
   await bridge.lock(sessionID, { kind: "capture" })
-  let dispatched = false
+  let dispatched = false, returned = false
   try {
     current()
-    if ((await workflow.inspect(sessionID)).fingerprint !== initial.fingerprint) fail("stale_fingerprint", "Composition changed before capture")
+    await unchanged()
     current()
     dispatched = true
-    const result = await bridge.call(sessionID, "capture", params, { allowLocked: true })
+    const result = await bridge.call(sessionID, "capture", {
+      ...params, expectedRevision: initial.revision, expectedEpoch: initial.projectEpoch,
+      expectedProject: { id: b.project.id, path: b.project.path },
+    }, { allowLocked: true })
+    returned = true
     current()
     const attachment = imageAttachment(result, params.alpha)
+    if (result.width > params.maxWidth) fail("invalid_capture", "Image exceeds requested maximum width")
+    await unchanged()
+    current()
     await bridge.unlock(sessionID)
     return { output: JSON.stringify({ compId: params.compId, time: params.time, width: result.width, height: result.height }),
       attachments: [attachment] }
   } catch (error) {
-    if (!dispatched && error.code === "stale_fingerprint" || dispatched && safeRefusals.has(error.code)) {
+    if (!dispatched && error.code === "stale_fingerprint" ||
+        dispatched && !returned && (safeRefusals.has(error.code) || error.code === "unsupported_capability")) {
       current()
       await bridge.unlock(sessionID)
+    } else {
+      await bridge.markUncertain(sessionID, "Capture outcome was not confirmed; inspect before continuing").catch(() => {})
     }
     throw error
   }

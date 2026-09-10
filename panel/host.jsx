@@ -1,6 +1,8 @@
-/* CookieMonster AE: ES3, documented AE APIs only. DEVELOPMENT UNQUALIFIED. */
+/* CookieMonster AE: ES3. DEVELOPMENT UNQUALIFIED; native capture uses undocumented saveFrameToPng. */
 var CookieMonsterAE = (function () {
     var LIMIT = 4 * 1024 * 1024, lastProject = null, unsaved = "", plan = null, busy = false, uncertain = false, transaction = null, recovery = null;
+    var inspectionCursors = [], inspectionSerial = 0;
+    var projectEpoch = "", projectSerial = 0;
     function fail(code, message) { var e = new Error(message); e.code = code; throw e; }
     function own(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
     function array(v) { return Object.prototype.toString.call(v) === "[object Array]"; }
@@ -64,7 +66,7 @@ var CookieMonsterAE = (function () {
                     if (n !== ",") break;
                 }
             } else {
-                at--; m = /^(?:true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/.exec(s.substr(at));
+                at--; m = /^(true|false|null|-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?)/.exec(s.substr(at));
                 if (m) {
                     at += m[0].length;
                     if (m[0] === "true") return true;
@@ -98,7 +100,12 @@ var CookieMonsterAE = (function () {
     }
     function project() {
         var p = app.project, path = null;
-        if (p !== lastProject) { lastProject = p; unsaved = "unsaved:" + new Date().getTime() + ":" + Math.random(); plan = null; }
+        // AE throws even on equality comparison with a project handle invalidated by open/close.
+        if (!isValid(lastProject) || p !== lastProject) {
+            lastProject = p; unsaved = "unsaved:" + new Date().getTime() + ":" + Math.random(); plan = null;
+            projectEpoch = "project:" + new Date().getTime() + ":" + (++projectSerial) + ":" + Math.random();
+            inspectionCursors = [];
+        }
         if (p && p.file) {
             var file = p.file;
             if (file.alias) { file = file.resolve(); if (!file) fail("unsafe_state", "Cannot resolve project alias"); }
@@ -150,7 +157,7 @@ var CookieMonsterAE = (function () {
         var a = [], i, e;
         if (!app.effects) fail("unsupported_capability", "Installed effect catalog unavailable");
         for (i = 0; i < app.effects.length; i++) { e = app.effects[i]; a.push({matchName: String(e.matchName), displayName: String(e.displayName), category: String(e.category), version: String(e.version)}); }
-        a.sort(function (a, b) { return a.matchName < b.matchName ? -1 : a.matchName > b.matchName ? 1 : 0; }); return a;
+        a.sort(function (a, b) { return a.matchName < b.matchName ? -1 : (a.matchName > b.matchName ? 1 : 0); }); return a;
     }
     function installed(match) { var i; for (i = 0; i < app.effects.length; i++) if (app.effects[i].matchName === match) return app.effects[i]; return null; }
     function children(p, isLayer) {
@@ -210,19 +217,20 @@ var CookieMonsterAE = (function () {
             o.separated = p.isSeparationLeader ? p.dimensionsSeparated : false;
             o.min = p.hasMin ? p.minValue : null; o.max = p.hasMax ? p.maxValue : null;
             o.keys = [];
-            o.selectedKeys = p.selectedKeys ? p.selectedKeys.slice(0) : [];
+            o.selectedKeys = p.selectedKeys ? p.selectedKeys.slice(0, state.shallow ? 100 : p.selectedKeys.length) : [];
+            if(state.shallow)o.keyCount=p.numKeys;
             if (p.propertyValueType === PropertyValueType.NO_VALUE) o.value = null;
             else if (p.propertyValueType === PropertyValueType.CUSTOM_VALUE) { o.value = {opaque:true}; state.opaque = true; }
             else {
                 o.value = plainValue(p.value, p.propertyValueType);
                 o.baseValue = plainValue(p.valueAtTime(state.time, true), p.propertyValueType);
             }
-            for (i = 1; i <= p.numKeys; i++) {
+            for (i = 1; !state.shallow && i <= p.numKeys; i++) {
                 if (++state.count > 25000) fail("response_too_large", "Keyframe snapshot limit");
                 o.keys.push(keyData(p, i));
             }
         } else {
-            o.properties = []; list = children(p, false);
+            o.properties = []; if(state.shallow)return o; list = children(p, false);
             for (i = 0; i < list.length; i++) {
                 next = {itemId:locator.itemId, layerId:locator.layerId, path:locator.path.concat([{index:list[i].index, matchName:list[i].p.matchName, name:list[i].p.name}])};
                 o.properties.push(propertyTree(list[i].p, next, state, depth + 1));
@@ -237,7 +245,7 @@ var CookieMonsterAE = (function () {
         if (app.project.activeItem instanceof CompItem) o.activeCompId = app.project.activeItem.id;
         for (i = 1; i <= app.project.numItems; i++) {
             if (++state.count > 25000) fail("response_too_large", "Item snapshot limit");
-            p = app.project.item(i); it = {id:p.id, name:p.name, parentId:p.parentFolder ? p.parentFolder.id : null, selected:!!p.selected, kind:p instanceof CompItem ? "comp" : p instanceof FolderItem ? "folder" : "footage"};
+            p = app.project.item(i); it = {id:p.id, name:p.name, parentId:p.parentFolder ? p.parentFolder.id : null, selected:!!p.selected, kind:p instanceof CompItem ? "comp" : (p instanceof FolderItem ? "folder" : "footage")};
             if (p.selected) o.selection.push({itemId:p.id});
             if (p instanceof CompItem) {
                 it.width=p.width; it.height=p.height; it.pixelAspect=p.pixelAspect; it.duration=p.duration; it.frameRate=p.frameRate; it.time=p.time; it.bgColor=p.bgColor; it.layers=[];
@@ -263,6 +271,118 @@ var CookieMonsterAE = (function () {
         s = stringify(o);
         if (s.length > LIMIT - 512) fail("response_too_large", "Complete snapshot exceeds 4 MiB; no metadata omitted");
         o.fingerprint = hash(s); return o;
+    }
+    function inspectQuery(q) {
+        object(q,"compId layerId propertyPath depth cursor","");
+        var depth=own(q,"depth") ? num(q.depth,0,8,true) : 1, query={}, k, i, c, l, p, step, actualPath=[], start=0, stack=[], saved=null;
+        if(own(q,"compId"))id(q.compId);
+        if(own(q,"layerId")){id(q.layerId);if(!own(q,"compId"))fail("invalid_payload","layerId requires compId");}
+        if(own(q,"propertyPath")){
+            if(!own(q,"layerId") || !array(q.propertyPath) || q.propertyPath.length>32)fail("invalid_payload","propertyPath requires a layer and at most 32 steps");
+            for(i=0;i<q.propertyPath.length;i++){
+                step=q.propertyPath[i];object(step,"index matchName name","index matchName");
+                num(step.index,0,100000,true);str(step.matchName,"matchName");
+                if(own(step,"name"))str(step.name,"name",true);
+            }
+        }
+        for(k in q)if(own(q,k) && k!=="cursor")query[k]=q[k];
+        query.depth=depth;
+        var identity=project(), nativeProject=app.project, revision=num(app.project.revision,1,9007199254740991,true), signature=stringify(query);
+        if(own(q,"cursor")){
+            str(q.cursor,"cursor");
+            for(i=0;i<inspectionCursors.length;i++)if(inspectionCursors[i].token===q.cursor)saved=inspectionCursors[i];
+            if(!saved || saved.project!==nativeProject || saved.identity!==stringify(identity) || saved.revision!==revision || saved.query!==signature)
+                fail("stale_cursor","Inspection cursor expired or project, revision or query changed");
+            start=saved.start;
+            for(i=0;i<saved.stack.length;i++){
+                var copy={}, field;
+                for(field in saved.stack[i])if(own(saved.stack[i],field))copy[field]=saved.stack[i][field];
+                copy.seen=copy.seen ? parse(stringify(copy.seen)) : {};
+                stack.push(copy);
+            }
+        }
+        var o={project:identity,projectEpoch:projectEpoch,aeVersion:String(app.version),revision:revision,items:[],selection:[],installedEffects:[],capabilities:capability(),busy:busy,
+            activeCompId:app.project.activeItem instanceof CompItem ? app.project.activeItem.id : null,qualification:"DEVELOPMENT UNQUALIFIED",nextCursor:null};
+        function summary(v,isLayer,index) {
+            var r={id:v.id,name:v.name,selected:!!v.selected};
+            if(isLayer){
+                r.index=index;r.matchName=v.matchName;r.enabled=v.enabled;r.locked=v.locked;r.sourceId=v.source ? v.source.id : null;
+                r.parentId=v.parent ? v.parent.id : null;
+                if(v.selected)o.selection.push({itemId:c.id,layerId:v.id});
+            }else{
+                r.kind=v instanceof CompItem ? "comp" : (v instanceof FolderItem ? "folder" : "footage");
+                r.parentId=v.parentFolder ? v.parentFolder.id : null;
+                if(v instanceof CompItem){r.width=v.width;r.height=v.height;r.pixelAspect=v.pixelAspect;r.duration=v.duration;r.frameRate=v.frameRate;r.time=v.time;r.layerCount=v.numLayers;}
+                if(v.selected)o.selection.push({itemId:v.id});
+            }
+            return r;
+        }
+        function frame(v,path,level,isLayer){return {p:v,path:path,level:level,isLayer:isLayer,next:1,named:0,seen:{}};}
+        var more=false, it, ly, row, state={count:0,opaque:false,time:0,shallow:true}, count=0;
+        if(!own(q,"compId")){
+            for(i=start+1;i<=app.project.numItems && i<=start+100;i++)o.items.push(summary(app.project.item(i),false,i));
+            start=i-1;more=start<app.project.numItems;
+        }else{
+            c=item(q.compId,"comp");it=summary(c,false,0);o.items.push(it);it.layers=[];state.time=c.time;
+            if(!own(q,"layerId")){
+                for(i=start+1;i<=c.numLayers && i<=start+100;i++)it.layers.push(summary(c.layer(i),true,i));
+                start=i-1;more=start<c.numLayers;
+            }else{
+                l=layer(c,q.layerId);p=l;
+                for(i=0;i<(q.propertyPath || []).length;i++){
+                    step=q.propertyPath[i];
+                    var found=step.index ? p.property(step.index) : (i===0 ? p.property(step.matchName) : null);
+                    if(!found || found.matchName!==step.matchName || (own(step,"name") && found.name!==step.name))
+                        fail("stale_locator","Property index, matchName or name changed");
+                    actualPath.push({index:step.index,matchName:found.matchName,name:found.name});p=found;
+                }
+                var layerIndex=1;while(layerIndex<=c.numLayers && c.layer(layerIndex)!==l)layerIndex++;
+                ly=summary(l,true,layerIndex);ly.properties=[];it.layers.push(ly);
+                // ponytail: flat preorder records keep page boundaries independent of tree shape; locators retain ancestry.
+                o.propertyLayout="preorder";
+                if(p!==l && p.propertyType===PropertyType.PROPERTY){
+                    row=propertyTree(p,{itemId:c.id,layerId:l.id,path:actualPath},state,0);
+                    for(i=start+1;i<=p.numKeys && i<=start+100;i++)row.keys.push(keyData(p,i));
+                    row.keyOffset=start;start=i-1;more=start<p.numKeys;row.keysTruncated=more || row.keyOffset>0;ly.properties.push(row);
+                }else{
+                    if(!saved){
+                        if(p!==l)stack.push({node:p,path:actualPath,level:0,seen:{}});
+                        else if(depth>0)stack.push(frame(l,[],1,true));
+                    }
+                    var named=["ADBE Transform Group","ADBE Marker","ADBE Time Remapping","ADBE Text Properties","ADBE Root Vectors Group","ADBE Camera Options Group","ADBE Light Options Group","ADBE Material Options Group","ADBE Audio Group","ADBE Layer Styles","ADBE Layer Overrides"];
+                    while(stack.length && count<100){
+                        var top=stack[stack.length-1], child=null, index=0;
+                        if(top.node){stack.pop();child=top.node;actualPath=top.path;}
+                        else{
+                            if(top.next<=top.p.numProperties){index=top.next++;child=top.p.property(index);if(child)top.seen[child.matchName]=true;}
+                            else if(top.isLayer && top.named<named.length){
+                                var match=named[top.named++];if(!own(top.seen,match))child=top.p.property(match);
+                            }else{stack.pop();continue;}
+                            if(!child)continue;
+                            actualPath=top.path.concat([{index:index,matchName:child.matchName,name:child.name}]);
+                        }
+                        row=propertyTree(child,{itemId:c.id,layerId:l.id,path:actualPath},state,0);
+                        if(child.propertyType===PropertyType.PROPERTY)row.keysTruncated=child.numKeys>0;
+                        else{
+                            row.childCount=child.numProperties;row.childrenTruncated=child.numProperties>0;
+                            if(top.level<depth)stack.push(frame(child,actualPath,top.level+1,false));
+                        }
+                        ly.properties.push(row);count++;
+                    }
+                    more=stack.length>0;
+                }
+            }
+        }
+        if(app.project!==nativeProject || app.project.revision!==revision || stringify(project())!==stringify(identity))fail("stale_cursor","Project changed during inspection");
+        if(more){
+            var token="inspect:"+new Date().getTime()+":"+(++inspectionSerial)+":"+Math.random();
+            inspectionCursors.push({token:token,project:nativeProject,identity:stringify(identity),revision:revision,query:signature,start:start,stack:stack});
+            // ponytail: retain 64 recent continuations; older cursors explicitly expire rather than growing host memory.
+            if(inspectionCursors.length>64)inspectionCursors.shift();
+            o.nextCursor=token;
+        }
+        var encoded=stringify(o);if(encoded.length>LIMIT-512)fail("response_too_large","Inspection page exceeds 4 MiB; narrow the query");
+        o.fingerprint=hash(encoded);return o;
     }
     function resolve(loc, pin, enableEffect) {
         object(loc, "itemId layerId path revision", "itemId layerId path revision");
@@ -359,7 +479,7 @@ var CookieMonsterAE = (function () {
         if (p.propertyValueType === PropertyValueType.SHAPE) { var s=new Shape(); s.vertices=v.vertices; s.inTangents=v.inTangents; s.outTangents=v.outTangents; s.closed=v.closed; return s; }
         return v;
     }
-    function interp(s) { if (s !== "linear" && s !== "bezier" && s !== "hold") fail("invalid_payload", "Interpolation must be linear, bezier or hold"); return s === "linear" ? KeyframeInterpolationType.LINEAR : s === "bezier" ? KeyframeInterpolationType.BEZIER : KeyframeInterpolationType.HOLD; }
+    function interp(s) { if (s !== "linear" && s !== "bezier" && s !== "hold") fail("invalid_payload", "Interpolation must be linear, bezier or hold"); return s === "linear" ? KeyframeInterpolationType.LINEAR : (s === "bezier" ? KeyframeInterpolationType.BEZIER : KeyframeInterpolationType.HOLD); }
     function validateEase(a, n) {
         var i; if (!array(a) || a.length !== n) fail("invalid_payload", "Ease dimensions do not match property");
         for (i=0;i<a.length;i++) { object(a[i],"speed influence","speed influence"); num(a[i].speed,-1e12,1e12); num(a[i].influence,0.1,100); }
@@ -402,7 +522,7 @@ var CookieMonsterAE = (function () {
         }
     }
     function refName(a, refs, value) { if(own(a,"ref")) { str(a.ref,"ref"); if(!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(a.ref) || own(refs,a.ref)) fail("invalid_reference","Reference must be unique"); refs[a.ref]=value; } }
-    function pathFile(path) { str(path,"path"); if(!/^(?:[A-Za-z]:[\\/]|\/)/.test(path) || /^(?:\\\\|\/\/)/.test(path)) fail("invalid_path","Use an absolute local path, not a network path"); var f=new File(path); if(!f.exists) fail("file_missing","File does not exist"); return f; }
+    function pathFile(path) { str(path,"path"); var local=path.charAt(0)==="/" || (/^[A-Za-z]:/.test(path) && (path.charAt(2)==="/" || path.charAt(2)==="\\")), network=path.substr(0,2)==="//" || path.substr(0,2)==="\\\\"; if(!local || network) fail("invalid_path","Use an absolute local path, not a network path"); var f=new File(path); if(!f.exists) fail("file_missing","File does not exist"); return f; }
     function resolvedFile(file) {
         if(file.alias){file=file.resolve();if(!file)fail("unsafe_state","Unresolved footage alias");}
         return file;
@@ -461,7 +581,7 @@ var CookieMonsterAE = (function () {
                 refName(a,refs,{virtual:true,kind:"folder",parentFolder:own(a,"folderId") ? item(a.folderId,"folder",refs) : null}); affected.push(a.ref || "new folder");
             } else if(a.type==="asset.import") {
                 schema("ref path","path"); requireFiles(); source=resolvedFile(pathFile(a.path));a.path=source.fsName;
-                if(!/\.(?:png|jpe?g|tiff?|exr|psd|ai|wav|aif|aiff|mp3|mp4|mov)$/i.test(a.path)) fail("unsupported_asset","Asset extension not qualified for noninteractive footage import");
+                if(!/\.(png|jpe?g|tiff?|exr|psd|ai|wav|aif|aiff|mp3|mp4|mov)$/i.test(a.path)) fail("unsupported_asset","Asset extension not qualified for noninteractive footage import");
                 var io=new ImportOptions(source); if(!io.canImportAs(ImportAsType.FOOTAGE)) fail("unsupported_asset","Cannot import as footage");
                 var reused=existingFootage(source);
                 refName(a,refs,reused ? {kind:"footage",object:reused.object} : {virtual:true,kind:"footage"});
@@ -568,7 +688,7 @@ var CookieMonsterAE = (function () {
                             schema("locator time inType outType inEase outEase inTangent outTangent roving temporalContinuous temporalAutoBezier spatialContinuous spatialAutoBezier","locator time inType outType");
                             if(!p.isInterpolationTypeValid(interp(a.inType)) || !p.isInterpolationTypeValid(interp(a.outType))) fail("unsupported_interpolation","Interpolation not supported");
                             if(own(a,"inEase")!==own(a,"outEase") || own(a,"inTangent")!==own(a,"outTangent")) fail("invalid_payload","Supply both in/out values");
-                            var dims=p.propertyValueType===PropertyValueType.TwoD ? 2 : p.propertyValueType===PropertyValueType.ThreeD ? 3 : 1;
+                            var dims=p.propertyValueType===PropertyValueType.TwoD ? 2 : (p.propertyValueType===PropertyValueType.ThreeD ? 3 : 1);
                             if(own(a,"inEase")) { validateEase(a.inEase,dims);validateEase(a.outEase,dims); }
                             if(own(a,"inTangent")) {
                                 if(!p.isSpatial) fail("unsupported_interpolation","Not a spatial property");
@@ -687,14 +807,14 @@ var CookieMonsterAE = (function () {
                     else if(a.type==="keyframe.interpolation")applyInterpolation(p,keyAt(p,a.time,false),a);
                     else if(a.type==="keyframe.move") {
                         k=keyAt(p,a.time,false);d=keyData(p,k);v=p.keyValue(k);p.removeKey(k);p.setValueAtTime(a.toTime,v);k=keyAt(p,a.toTime,false);
-                        var interpolationName=function(s) { return s===String(KeyframeInterpolationType.LINEAR) ? "linear" : s===String(KeyframeInterpolationType.HOLD) ? "hold" : "bezier"; };
+                        var interpolationName=function(s) { return s===String(KeyframeInterpolationType.LINEAR) ? "linear" : (s===String(KeyframeInterpolationType.HOLD) ? "hold" : "bezier"); };
                         d.inType=interpolationName(d.inType);d.outType=interpolationName(d.outType);applyInterpolation(p,k,d);p.setLabelAtKey(k,d.label);
                     } else if(a.type==="expression.set") { p.expression=a.source;if(p.expressionError)fail("expression_error","Expression evaluation failed: "+p.expressionError);p.expressionEnabled=a.enabled; }
                     else if(a.type==="effect.remove")p.remove();
                     else if(a.type==="effect.enable")p.enabled=a.enabled;
                     else if(a.type==="effect.reorder")p.moveTo(a.index);
                 }
-                if(r && own(a,"ref")) refs[a.ref]={kind:a.type==="layer.create" ? "layer" : a.type==="comp.create" ? "comp" : a.type==="folder.create" ? "folder" : "footage",object:r,comp:c};
+                if(r && own(a,"ref")) refs[a.ref]={kind:a.type==="layer.create" ? "layer" : (a.type==="comp.create" ? "comp" : (a.type==="folder.create" ? "folder" : "footage")),object:r,comp:c};
                 results.push(r ? {id:r.id,ref:own(a,"ref") ? a.ref : null} : {ok:true});
                 expectedRevision=app.project.revision;
             }
@@ -761,7 +881,7 @@ var CookieMonsterAE = (function () {
             if(rec.phase!=="stopped")fail("unsafe_state","Recovery prepare is single-use");
             str(p.path,"emergency path");
             var slash=String.fromCharCode(92),local=p.path.split(slash).join("/");
-            if((local.charAt(0)!=="/" && !/^[A-Za-z]:[/]/.test(local)) || local.substr(0,2)==="//" || !/[.]aepx?$/i.test(local))fail("invalid_path","Absolute local recovery project required");
+            if((local.charAt(0)!=="/" && (!/^[A-Za-z]:/.test(local) || local.charAt(2)!=="/")) || local.substr(0,2)==="//" || !/[.]aepx?$/i.test(local))fail("invalid_path","Absolute local recovery project required");
             var file=new File(p.path);
             if(file.exists)fail("unsafe_state","Emergency destination already exists");
             rec.phase="saving";
@@ -813,11 +933,70 @@ var CookieMonsterAE = (function () {
         try { r=q.items.add(c);return {renderSettings:r.templates.slice(0),outputModules:r.outputModule(1).templates.slice(0)}; }
         finally { if(r)r.remove(); }
     }
+    function expectedState(p) {
+        if(own(p,"expectedEpoch")){
+            str(p.expectedEpoch,"expectedEpoch");project();
+            if(p.expectedEpoch!==projectEpoch)fail("stale_project","Native project instance changed before execution");
+        }
+        if(own(p,"expectedRevision")){
+            num(p.expectedRevision,1,9007199254740991,true);
+            if(p.expectedRevision!==app.project.revision)fail("stale_revision","Native project revision changed before execution");
+        }
+        if(own(p,"expectedProject")){
+            object(p.expectedProject,"id path","id path");str(p.expectedProject.id,"project id");
+            if(p.expectedProject.path !== null)str(p.expectedProject.path,"project path");
+            var current=project();
+            if(current.id!==p.expectedProject.id || current.path!==p.expectedProject.path)fail("stale_project","Project changed before execution");
+        }
+    }
+    function rawScript(p) {
+        object(p,"source expectedRevision expectedProject expectedEpoch label","source");ready(true);str(p.source,"source",true);
+        if(own(p,"label"))str(p.label,"label");
+        expectedState(p);
+        var modern=own(p,"expectedRevision"), run=modern ? new Function(p.source) : null, started=false, group=false, value, result;
+        function jsonValue(v,ancestors) {
+            var i,k,r;
+            if(v === null || typeof v==="string" || typeof v==="boolean" || (typeof v==="number" && isFinite(v)))return v;
+            if(!v || typeof v!=="object" || (!array(v) && (Object.prototype.toString.call(v)!=="[object Object]" || v.constructor!==Object)))
+                fail("unsupported_value","Script returned a non-JSON value");
+            if(ancestors.length>=64)fail("unsupported_value","Script result nesting limit");
+            for(i=0;i<ancestors.length;i++)if(ancestors[i]===v)fail("unsupported_value","Script returned a circular value");
+            ancestors.push(v);r=array(v) ? [] : {};
+            if(array(v)){for(i=0;i<v.length;i++)r.push(jsonValue(v[i],ancestors));}
+            else{for(k in v)if(own(v,k)){if(k==="__proto__" || k==="constructor" || k==="prototype")fail("unsupported_value","Unsafe script result key");r[k]=jsonValue(v[k],ancestors);}}
+            ancestors.pop();return r;
+        }
+        try{
+            app.beginUndoGroup(own(p,"label") ? p.label : "CookieMonster AE raw");group=true;
+            expectedState(p);plan=null;started=true;
+            // Arbitrary unsandboxed script BODY in the new contract; legacy eval retains its completion value.
+            value=modern ? run() : eval(p.source);
+            result={value:typeof value==="undefined" ? null : jsonValue(value,[])};
+            if(modern){result.revision=app.project.revision;result.project=project();}
+            if(stringify(result).length>LIMIT-512)fail("response_too_large","Script result exceeds transport budget");
+        }catch(e){
+            if(!started)throw e;
+            uncertain=true;
+            var line=e && (e.line || e.lineNumber), message=String(e && e.message || e).substr(0,1200);
+            fail("uncertain_outcome","Script error at line "+(line || "unavailable")+": "+message+"; partial changes and external side effects may remain. Checkpoint recovery required; do not retry.");
+        }finally{
+            if(group)try{app.endUndoGroup();}catch(undoError){uncertain=true;fail("uncertain_outcome","Script undo group could not close; partial changes may remain; do not retry");}
+        }
+        return result;
+    }
     function capture(params) {
-        requireFiles();
-        var c=item(params.compId,"comp");
-        time(params.time,c);bool(params.alpha);
-        fail("unsafe_state","Safe capture unavailable: this deployment has no qualified preview/modal signal. A user idle assertion is not detection.");
+        ready(true);requireFiles();
+        var c=item(params.compId,"comp"), alpha=own(params,"alpha") ? bool(params.alpha) : true, maxWidth=own(params,"maxWidth") ? num(params.maxWidth,1,2000,true) : 2000;
+        time(params.time,c);expectedState(params);
+        if(typeof c.saveFrameToPng!=="function")fail("unsupported_capability","Native frame capture is unavailable in this AE version");
+        if(app.project.renderQueue.rendering!==false || app.onError)fail("unsafe_state","Capture requires an idle queue without application error callbacks");
+        var dir=new Folder(Folder.temp.fsName+"/cookiemonster-ae-"+new Date().getTime()+"-"+Math.floor(Math.random()*1000000000));
+        if(dir.exists || !dir.create())fail("capture_failed","Cannot create private frame directory");
+        var file=new File(dir.fsName+"/frame_00000.png");
+        // This undocumented API can finish after evalScript returns. CEP waits for a complete PNG.
+        // Never remove its destination after dispatch: even an exception may leave a native writer active.
+        c.saveFrameToPng(params.time,file);
+        return {path:file.fsName,tempDir:dir.fsName,pending:true,alpha:alpha,maxWidth:maxWidth};
     }
     function dispatch(jsonString) {
         try {
@@ -832,8 +1011,17 @@ var CookieMonsterAE = (function () {
             if(recovery && request.method!=="status" && request.method!=="inspect" && request.method!=="reconcile" &&
                 !(request.method==="execute" && (p.phase==="recovery_prepare" || p.phase==="recovery_finish" || p.phase==="restore_prepare" || p.phase==="restore_finish")))
                 fail("unsafe_state","Stopped execution permits only inspected recovery");
-            if(request.method==="status"){object(p,"");result={project:project(),activeCompId:app.project.activeItem instanceof CompItem ? app.project.activeItem.id : null,aeVersion:String(app.version),capabilities:capability(),busy:busy,uncertain:uncertain};}
-            else if(request.method==="inspect"){object(p,"");result=inspect();}
+            if(request.method==="status"){
+                object(p,"");
+                var compositions=[], ci, currentComp=app.project.activeItem instanceof CompItem ? app.project.activeItem : null;
+                for(ci=1;ci<=app.project.numItems && compositions.length<2000;ci++){
+                    var composition=app.project.item(ci);
+                    if(composition instanceof CompItem)compositions.push({id:composition.id,name:composition.name});
+                }
+                result={project:project(),activeCompId:currentComp ? currentComp.id : null,compositions:compositions,
+                    aeVersion:String(app.version),capabilities:capability(),busy:busy,uncertain:uncertain};
+            }
+            else if(request.method==="inspect"){object(p,"query");result=own(p,"query") ? inspectQuery(p.query) : inspect();}
             else if(request.method==="preflight"){
                 object(p,"actions","actions");ready(true);var snapshot=inspect();result=validate(p.actions);plan={actions:stringify(result.actions),snapshot:stringify(snapshot),imports:importPins(result.actions)};
             } else if(request.method==="execute"){
@@ -849,12 +1037,9 @@ var CookieMonsterAE = (function () {
                 var file=pathFile(p.path);if(!/\.aepx?$/i.test(p.path))fail("invalid_path","Expected an AE project");
                 if(!app.open(file))fail("open_cancelled","Project open cancelled");plan=null;result={project:project()};
             } else if(request.method==="raw"){
-                object(p,"source","source");ready(true);str(p.source,"source",true);plan=null;
-                try{mutationStarted=true;app.beginUndoGroup("CookieMonster AE raw");var rawValue=eval(p.source);result={value:typeof rawValue==="undefined" ? null : rawValue};}
-                catch(rawError){uncertain=true;fail("execution_failed","Raw script failed; checkpoint recovery required");}
-                finally{app.endUndoGroup();}
+                result=rawScript(p);
             } else if(request.method==="capture"){
-                object(p,"compId time alpha","compId time alpha");busy=true;try{result=capture(p);}finally{busy=false;}
+                object(p,"compId time alpha maxWidth expectedRevision expectedProject expectedEpoch","compId time");busy=true;try{result=capture(p);}finally{busy=false;}
             } else if(request.method==="templates"){object(p,"compId","compId");result=templates(p.compId);}
             else if(request.method==="confirmIdle"){object(p,"");fail("unsafe_state","An idle assertion cannot authorize safe capture without qualified preview/modal detection");}
             else if(request.method==="reconcile"){object(p,"");uncertain=false;plan=null;transaction=null;recovery=null;result={project:project()};}

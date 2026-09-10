@@ -38,7 +38,8 @@ export function request(port, endpoint, body, { credential, headers = {}, raw } 
     const text = raw ?? (body === undefined ? "" : JSON.stringify(body))
     const req = http.request({
       hostname: "127.0.0.1", port, path: endpoint, method: endpoint === "/poll" ? "GET" : "POST",
-      agent: false,
+      // Reuse test polling sockets instead of exhausting Windows ephemeral ports.
+      agent: http.globalAgent,
       headers: { "Content-Type": "application/json", ...(credential ? { Authorization: `Bearer ${credential}` } : {}),
         ...(text ? { "Content-Length": Buffer.byteLength(text) } : {}), ...headers },
     }, res => {
@@ -63,15 +64,15 @@ export async function panelFixture(t, options = {}) {
   let pump
   t.after(async () => {
     stop = true
-    await pump
-    await bridge?.close()
-    await rm(root, { recursive: true, force: true })
+    try { await pump } finally {
+      try { await bridge?.close() } finally { await rm(root, { recursive: true, force: true }) }
+    }
   })
   bridge = await createBridge({ dataDir, timeoutMs: 2000, heartbeatMs: 60000, ...options })
   let descriptor = JSON.parse(await readFile(path.join(dataDir, "descriptor.json"), "utf8"))
   const panelId = "test-panel"
   const paired = await request(descriptor.port, "/pair", {
-    code: bridge.pairingCode("session").code, protocol: 1, version: "0.1.0", panelId,
+    code: bridge.pairingCode("session").code, protocol: 1, version: "0.2.2", panelId,
   })
   if (paired.status !== 200) throw new Error(JSON.stringify(paired))
   let credential = paired.body.credential
@@ -88,7 +89,7 @@ export async function panelFixture(t, options = {}) {
     get port() { return descriptor.port },
     send(endpoint, body, extra = {}) { return request(descriptor.port, endpoint, body, { credential, ...extra }) },
     async connect() {
-      const result = await api.send("/connect", { protocol: 1, version: "0.1.0", panelId,
+      const result = await api.send("/connect", { protocol: 1, version: "0.2.2", panelId,
         project: state.project, aeVersion: "26.0-test", capabilities: state.capabilities })
       if (result.status !== 200) throw new Error(JSON.stringify(result))
     },

@@ -16,7 +16,7 @@ test("diagnostics allowlist discards injected text, objects, versions, hashes an
   }
   const result = d.export(input), serialized = JSON.stringify(result)
   for (const word of ["SECRET", "artist", "password", "pairing-code", "prompt", "image", "aep"]) assert.ok(!serialized.includes(word), word)
-  assert.deepEqual(result.versions, { plugin: "0.1.0", protocol: 1, zod: "4.1.8" })
+  assert.deepEqual(result.versions, { plugin: "0.2.2", protocol: 1, zod: "4.1.8" })
   assert.equal(result.connections[0].capabilities.fileNetwork, false)
   assert.equal(result.connections[0].connected, false)
   assert.equal(result.connections[0].bindingState, "unknown")
@@ -86,14 +86,14 @@ test("retirement diagnostics retain only fixed errors, never inventory paths or 
 
 test("compatibility diagnostics strip URLs, build labels and injected metadata but retain numeric negotiation evidence", () => {
   const d = createDiagnostics(), secret = "SECRET"
-  const metadata = { status: "incompatible", panelVersion: "0.2.0-SECRET+artist", panelProtocol: 2,
+  const metadata = { status: "incompatible", panelVersion: "0.2.2-SECRET+artist", panelProtocol: 2,
     cookieMonsterVersion: "2.4.1+SECRET", cookieMonsterVersionStatus: "configured",
     releaseSourceUrl: "https://SECRET.test", updates: { panel: { url: "https://SECRET.test/token" } },
     credential: secret, project: secret }
   d.record("session", "bind", "failed", { errorCode: "incompatible_version", details: metadata })
   const result = d.export({ sessionID: "session", compatibility: { ...metadata, pendingPanels: [metadata] },
     connections: [{ compatibility: metadata }] })
-  const expected = { status: "incompatible", panelVersion: "0.2.0", panelProtocol: 2,
+  const expected = { status: "incompatible", panelVersion: "0.2.2", panelProtocol: 2,
     cookieMonsterVersion: "2.4.1", cookieMonsterVersionStatus: "configured" }
   assert.deepEqual(result.connections[0].compatibility, expected)
   assert.deepEqual(result.compatibility, { ...expected, pendingPanels: [expected] })

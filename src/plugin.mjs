@@ -8,6 +8,7 @@ import { createCheckpoints, createGrants } from "./storage.mjs"
 import { createWorkflow } from "./workflow.mjs"
 import { createRenderer } from "./render.mjs"
 import { createDiagnostics } from "./diagnostics.mjs"
+import { createChat } from "./chat.mjs"
 import { capture, captureArgs, safeRefusals } from "./capture.mjs"
 import { AE_PERMISSIONS } from "./config.mjs"
 import { fail, hash, PROPOSAL_TTL, releaseMetadata } from "./protocol.mjs"
@@ -15,8 +16,8 @@ import { fail, hash, PROPOSAL_TTL, releaseMetadata } from "./protocol.mjs"
 const text = z.string().min(1).max(256)
 const filePath = z.string().min(1).max(32767).refine(p => path.isAbsolute(p) && !/[\0\r\n]/.test(p) && !p.split(/[\\/]/).includes(".."), "Use an absolute local path without traversal")
 const id = z.number().int().positive()
-const privileged = ["ae_bind", "ae_release", "ae_execute", "ae_grant", "ae_capture", "ae_raw_enable",
-  "ae_raw_propose", "ae_raw_execute", "ae_checkpoints", "ae_restore", "ae_render_submit", "ae_render_cancel",
+const privileged = ["ae_bind", "ae_release", "ae_execute", "ae_grant", "ae_capture",
+  "ae_checkpoints", "ae_restore", "ae_render_submit", "ae_render_cancel",
   "ae_reconcile", "ae_templates", "ae_render_recover", "ae_render_retire"]
 const same = (a, b) => a?.id === b?.id && a?.connectionId === b?.connectionId &&
   a?.project?.id === b?.project?.id && a?.project?.path === b?.project?.path
@@ -291,6 +292,10 @@ export function createTools(runtime) {
         const c = { ...context, check, lifetime }, started = performance.now()
         check()
         try {
+          if (["ae_inspect", "ae_capture"].includes(name)) {
+            await r.bridge.ensureBound(c.sessionID)
+            check()
+          }
           const result = await execute(parsed, c, askFor(r, c, name))
           if (name !== "ae_release" && name !== "ae_bind") check()
           if (name !== "ae_release" && !lifetime?.aborted) r.diagnostics?.record(c.sessionID, name.slice(3), "ok", { durationMs: performance.now() - started })
@@ -303,7 +308,7 @@ export function createTools(runtime) {
       return r.run ? r.run(context, run) : run()
     } }
   }
-  tool("ae_pair", "Create a short-lived plain visible pairing code. Enter it only in the AE panel.", {}, async (_, c) => r.bridge.pairingCode(c.sessionID))
+  tool("ae_pair", "Recovery only: create a short-lived pairing code for the AE panel's advanced connection settings. Normal connection is automatic; start with ae_inspect instead.", {}, async (_, c) => r.bridge.pairingCode(c.sessionID))
   tool("ae_connections", "List connections and reported panel compatibility without other sessions' bindings. includeCompatibility adds runtime versions, trusted update guidance and this session's pending pairing mismatches, even with no connections.", {
     includeCompatibility: z.boolean().default(false),
   }, async (a, c) => {
@@ -317,7 +322,7 @@ export function createTools(runtime) {
     }))
     return a.includeCompatibility ? { compatibility: r.bridge.compatibility(c.sessionID), connections } : connections
   })
-  tool("ae_bind", "Explicitly bind this session to an AE connection; takeover requires review.", { connectionId: text, takeover: z.boolean().default(false) }, async (a, c, ask) => {
+  tool("ae_bind", "Select an AE instance when several are connected, reselect after a project change, or explicitly take control from another conversation. A single available instance binds automatically on ae_inspect. Takeover requires review.", { connectionId: text, takeover: z.boolean().default(false) }, async (a, c, ask) => {
     const before = clone((await r.bridge.connections()).find(b => b.connectionId === a.connectionId))
     if (!before?.connected) fail("disconnected", "Connection is unavailable")
     const proof = hash(before)
@@ -336,11 +341,18 @@ export function createTools(runtime) {
     current(r, c, b, { allowLocked: true, allowSuspended: true })
     return r.release ? r.release(c.sessionID) : r.bridge.release(c.sessionID)
   })
-  tool("ae_inspect", "Inspect the bound project with revision-safe persistent IDs.", {}, (_, c) => r.workflow.inspect(c.sessionID))
-  tool("ae_propose", "Validate structured AE actions and return a single-use immutable proposal; does not execute.", {
-    actions: z.array(z.record(z.string(), z.unknown())).min(1),
-  }, (a, c) => r.workflow.propose(c.sessionID, a.actions))
-  tool("ae_execute", "Review and execute an immutable structured proposal with checkpoint recovery.", { token: text }, (a, c, ask) => r.workflow.execute(c.sessionID, a.token, ask))
+  tool("ae_inspect", "Automatically connect this conversation to the single available AE instance and inspect its project or query any composition, layer or property. Multiple instances or another conversation's ownership require ae_connections and explicit ae_bind. Returns expectedRevision for ae_execute; use nextCursor to continue a bounded query.", {
+    compId: id.optional(), layerId: id.optional(),
+    propertyPath: z.array(z.object({
+      index: z.number().int().min(0).max(100000), matchName: z.string().min(1).max(4096),
+      name: z.string().max(4096).optional(),
+    }).strict()).max(32).optional(),
+    depth: z.number().int().min(0).max(8).optional(), cursor: z.string().min(1).max(8192).optional(),
+  }, (a, c) => r.workflow.inspectQuery(c.sessionID, a))
+  tool("ae_execute", "Review exact ExtendScript source and execute against expectedRevision from ae_inspect after a verified checkpoint. Unsandboxed: external effects cannot be rolled back; partial changes may remain. No automatic rollback or retry.", {
+    source: z.string().min(1).max(262144).regex(/^[^\u0000]*$/),
+    expectedRevision: z.string().regex(/^[a-f0-9]{64}$/), label: z.string().min(1).max(128).regex(/^[^\u0000-\u001f]*$/),
+  }, (a, c, ask) => r.workflow.executeScript(c.sessionID, a, ask))
   tool("ae_grant", "Approve an explicit canonical filesystem scope for this session and binding.", {
     path: filePath, recursive: z.boolean().default(false), write: z.boolean().default(false),
   }, async (a, c, ask) => {
@@ -361,20 +373,8 @@ export function createTools(runtime) {
     current(r, c, b)
     return granted
   })
-  tool("ae_capture", "Capture one explicit composition/time as a bounded PNG (alpha default) or JPEG attachment.", captureArgs,
+  tool("ae_capture", "Capture one explicit composition/time as a bounded PNG (alpha default) or JPEG image attachment for visual inspection. Keep AE idle and the panel visible.", captureArgs,
     (a, c, ask) => capture(r, c.sessionID, a, ask, c.check))
-  tool("ae_raw_enable", "Review non-transactional raw scripting risks; enable only this binding for five minutes.", {},
-    (_, c, ask) => r.workflow.enableRaw(c.sessionID, ask))
-  tool("ae_raw_propose", "Propose complete raw ExtendScript source, purpose, and risks; no execution.", {
-    source: z.string().min(1).max(512 * 1024), purpose: z.string().min(1).max(8192), risks: z.array(z.string().min(1).max(8192)).min(1).max(100),
-  }, async (a, c, ask) => {
-    const b = current(r, c), before = await snapshot(r, c, b)
-    await ask("Review a raw proposal (not execution):\n" + a.source, { ...a, nonTransactional: true, binding: b })
-    await snapshot(r, c, b, before.fingerprint)
-    return r.workflow.proposeRaw(c.sessionID, a)
-  })
-  tool("ae_raw_execute", "Review full raw source and execute its single-use hash; external side effects cannot be rolled back.", { hash: text },
-    (a, c, ask) => r.workflow.executeRaw(c.sessionID, a.hash, ask))
   tool("ae_checkpoints", "List, pin, unpin, or delete checkpoints only for the current project.", {
     action: z.enum(["list", "pin", "delete"]).default("list"), id: text.optional(), pinned: z.boolean().optional(),
   }, async (a, c, ask) => {
@@ -660,6 +660,10 @@ export async function server(_input, options = {}) {
   entry.refs++
   let runtime
   try { runtime = await entry.promise } catch (error) { entry.refs--; throw error }
+  if (!entry.chat) entry.chat = createChat(runtime)
+  const chat = await entry.chat
+  const unregisterChat = chat.register(_input)
+  runtime.bridge.setChatHandler(chat.handle)
   const owned = new Set(), owner = Symbol("plugin-instance")
   let disposed = false, disposePromise, config
   const tools = createTools({ ...runtime, permissionPolicy: name => checkPermissionConfig(config, name) })
@@ -668,6 +672,7 @@ export async function server(_input, options = {}) {
     definition.execute = (args, context) => {
       if (disposed) fail("runtime_closed", "Plugin instance is disposed")
       text.parse(context?.sessionID)
+      chat.checkSession(context.sessionID)
       const previous = entry.owners.get(context.sessionID)
       if (previous && previous !== owner) fail("session_scope", "Session belongs to another plugin instance")
       entry.owners.set(context.sessionID, owner); owned.add(context.sessionID)
@@ -689,6 +694,7 @@ export async function server(_input, options = {}) {
       config = value
     },
     async event({ event }) {
+      await chat.event(event)
       if (event?.type === "session.deleted") {
         const sessionID = event.properties?.info?.id
         if (typeof sessionID === "string") await release(sessionID)
@@ -699,6 +705,7 @@ export async function server(_input, options = {}) {
       disposed = true
       disposePromise = (async () => {
         const results = await Promise.allSettled([...owned].map(release))
+        unregisterChat()
         entry.refs--
         if (entry.refs === 0) {
           entry.closing = runtime.close()

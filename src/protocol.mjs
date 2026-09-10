@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 
-export const VERSION = "0.1.0"
+export const VERSION = "0.2.2"
 export const PROTOCOL = 1
 export const UPDATE_URL = "https://github.com/trmosala/CookieJar/releases"
 export const PROPOSAL_TTL = 5 * 60 * 1000

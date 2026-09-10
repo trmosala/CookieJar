@@ -8,6 +8,13 @@ const clone = value => JSON.parse(canonical(value))
 const uncertain = error => ["outcome_uncertain", "uncertain_outcome", "timeout", "disconnected", "binding_suspended", "stale_binding", "not_bound", "storage_failed", "invalid_host_result"].includes(error.code)
 const sameProject = (a, b) => a.id === b.id && a.path === b.path
 const MAX_BYTES = 3 * 1024 * 1024
+const SCRIPT_PROOF = "script-overview-v1"
+
+function overviewProof(inspected) {
+  const { fingerprint, nextCursor, ...data } = inspected.data
+  // Cursor handles change on every page read; their presence, not their value, is scene metadata.
+  return hash({ kind: SCRIPT_PROOF, connectionId: inspected.binding.connectionId, data, hasMore: nextCursor !== null })
+}
 
 function bounded(value) {
   const text = canonical(value)
@@ -26,13 +33,50 @@ function actionList(value) {
   return actions
 }
 
+export function inspectArgs(value = {}) {
+  const query = bounded(value)
+  assertObject(query, "query")
+  if (Object.keys(query).some(key => !["compId", "layerId", "propertyPath", "depth", "cursor"].includes(key)))
+    fail("invalid_payload", "Unknown inspection query field")
+  for (const key of ["compId", "layerId"])
+    if (Object.hasOwn(query, key) && (!Number.isSafeInteger(query[key]) || query[key] < 1 || query[key] > 2147483647))
+      fail("invalid_payload", `${key} must be a positive persistent ID`)
+  if (Object.hasOwn(query, "layerId") && !Object.hasOwn(query, "compId") ||
+      Object.hasOwn(query, "propertyPath") && !Object.hasOwn(query, "layerId"))
+    fail("invalid_payload", "Layers require compId; propertyPath requires compId and layerId")
+  if (Object.hasOwn(query, "depth") && (!Number.isInteger(query.depth) || query.depth < 0 || query.depth > 8))
+    fail("invalid_payload", "Inspection depth must be an integer from 0 to 8")
+  if (Object.hasOwn(query, "cursor")) {
+    assertString(query.cursor, "cursor", 8192)
+    if (query.cursor.includes("\u0000")) fail("invalid_payload", "Invalid cursor")
+  }
+  if (Object.hasOwn(query, "propertyPath")) {
+    if (!Array.isArray(query.propertyPath) || query.propertyPath.length > 32)
+      fail("invalid_payload", "propertyPath must be a bounded array")
+    for (const part of query.propertyPath) {
+      assertObject(part, "propertyPath segment")
+      if (Object.keys(part).some(key => !["index", "matchName", "name"].includes(key)) ||
+          !Number.isSafeInteger(part.index) || part.index < 0 || part.index > 100000)
+        fail("invalid_payload", "Invalid propertyPath segment")
+      assertString(part.matchName, "matchName", 4096)
+      if (part.matchName.includes("\u0000")) fail("invalid_payload", "Invalid matchName")
+      if (Object.hasOwn(part, "name") && (typeof part.name !== "string" || part.name.length > 4096 || part.name.includes("\u0000")))
+        fail("invalid_payload", "Invalid property name")
+    }
+  }
+  return query
+}
+
 export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, longPlanMs = 30000 }) {
   const proposals = new Map()
   const rawGates = new Map()
+  const queryRevisions = new Map()
+  const revisionSalt = randomBytes(32).toString("hex")
   const running = new Set()
   bridge.onRelease(async (sessionID, bindingID) => {
     proposals.delete(sessionID)
     rawGates.delete(sessionID)
+    queryRevisions.delete(sessionID)
     await grants.release(sessionID, bindingID)
   })
 
@@ -43,9 +87,20 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
       fail("stale_binding", "Session binding or project changed; propose again")
     return b
   }
-  async function snapshot(sessionID, expected, allowLocked = false) {
+  function queryRevision(sessionID, b, data) {
+    const scope = hash({ sessionID, bindingID: b.id, connectionId: b.connectionId,
+      project: { id: data.project.id, path: data.project.path }, projectEpoch: data.projectEpoch })
+    const prior = queryRevisions.get(sessionID)
+    // Native counters can reset after reopening. Never resurrect an observed older token.
+    // Native projectEpoch also detects same-path, same-counter replacements.
+    const epoch = !prior ? 0 : prior.epoch + (prior.scope !== scope || data.revision < prior.revision ? 1 : 0)
+    const token = hash({ salt: revisionSalt, scope, epoch, revision: data.revision })
+    queryRevisions.set(sessionID, { scope, epoch, revision: data.revision, token })
+    return token
+  }
+  async function snapshot(sessionID, expected, allowLocked = false, query) {
     const b = current(sessionID, expected, { allowLocked })
-    const data = bounded(await bridge.call(sessionID, "inspect", {}, { allowLocked }))
+    const data = bounded(await bridge.call(sessionID, "inspect", query === undefined ? {} : { query }, { allowLocked }))
     current(sessionID, b, { allowLocked })
     assertObject(data)
     if (!data.project || !sameProject(data.project, b.project)) fail("stale_project", "Host project identity no longer matches binding")
@@ -55,11 +110,26 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
         typeof data.capabilities?.fileNetwork !== "boolean" || typeof data.busy !== "boolean")
       fail("invalid_host_result", "Inspection must include complete project, items, selection, effects, capabilities, and busy state")
     if (data.busy) fail("host_busy", "AE reports an active operation")
-    return { data, fingerprint: hash(data), binding: b }
+    if (query !== undefined) {
+      if (!Number.isSafeInteger(data.revision) || data.revision < 1 ||
+          typeof data.projectEpoch !== "string" || !data.projectEpoch.length || data.projectEpoch.length > 256 ||
+          typeof data.project.id !== "string" || !data.project.id.length || data.project.id.length > 256 ||
+          !(data.project.path === null || typeof data.project.path === "string" && data.project.path.length > 0 && data.project.path.length <= 32768) ||
+          data.project.saved !== (data.project.path !== null) ||
+          typeof data.aeVersion !== "string" || !data.aeVersion.length || data.aeVersion.length > 256 ||
+          typeof data.fingerprint !== "string" || !data.fingerprint.length || data.fingerprint.length > 256 ||
+          !(data.nextCursor === null || typeof data.nextCursor === "string" && data.nextCursor.length > 0 && data.nextCursor.length <= 8192) ||
+          data.activeCompId !== null && data.activeCompId < 1)
+        fail("invalid_host_result", "Query inspection must include native revision, project identity, version, fingerprint and cursor")
+    }
+    const token = query === undefined ? null : queryRevision(sessionID, b, data)
+    return { data, fingerprint: query === undefined ? hash(data) : token, binding: b,
+      ...(query === undefined ? {} : { query }) }
   }
   async function revision(sessionID, plan, allowLocked = false) {
-    const inspected = await snapshot(sessionID, plan.binding, allowLocked)
-    if (inspected.fingerprint !== plan.fingerprint) fail("stale_fingerprint", "Project changed since this proposal was inspected")
+    const inspected = await snapshot(sessionID, plan.binding, allowLocked, plan.query)
+    if (inspected.fingerprint !== plan.fingerprint)
+      fail(plan.query === undefined ? "stale_fingerprint" : "stale_revision", "Project changed since inspection")
     return inspected
   }
   function alive(plan) {
@@ -101,21 +171,25 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
   }
   async function saveCheckpoint(sessionID, inspected, planHash) {
     const b = inspected.binding
-    await revision(sessionID, { binding: b, fingerprint: inspected.fingerprint }, true)
+    await revision(sessionID, inspected, true)
     const saved = await bridge.call(sessionID, "save", {}, { allowLocked: true })
     if (!saved?.project?.saved || !sameProject(saved.project, b.project))
       fail("stale_project", "Save changed project identity or did not save the project")
     // Current host omits dirty/save timestamps. Do not normalize revision or content:
     // revision also guards opaque/mixed-style state that cannot be compared directly.
-    await revision(sessionID, { binding: b, fingerprint: inspected.fingerprint }, true)
+    await revision(sessionID, inspected, true)
     const checkpoint = await checkpoints.create({
       projectPath: b.project.path, projectId: b.project.id, planHash, pinned: true,
     })
-    const verified = await checkpoints.verify(checkpoint.id)
-    if (!await checkpointMatches(verified, b) || verified.planHash !== planHash)
-      fail("checkpoint_invalid", "Checkpoint verification or plan identity failed")
-    await revision(sessionID, { binding: b, fingerprint: inspected.fingerprint }, true)
-    return verified
+    try {
+      const verified = await checkpoints.verify(checkpoint.id)
+      if (verified?.id !== checkpoint.id || !await checkpointMatches(verified, b) || verified.planHash !== planHash)
+        fail("checkpoint_invalid", "Checkpoint verification or plan identity failed")
+      await revision(sessionID, inspected, true)
+      return verified
+    } catch (error) {
+      throw new AEError(error.code || "checkpoint_invalid", error.message, { ...error.details, checkpointId: checkpoint.id })
+    }
   }
 
   function checkpointIdentity(checkpoint) {
@@ -195,6 +269,83 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
   }
 
   const workflow = {
+    async inspectQuery(sessionID, query = {}) {
+      query = inspectArgs(query)
+      return exclusive(sessionID, async () => {
+        const inspected = await snapshot(sessionID, null, true, query)
+        return { ...inspected.data, binding: inspected.binding, expectedRevision: inspected.fingerprint }
+      })
+    },
+    async executeScript(sessionID, input, ask) {
+      const payload = bounded(input)
+      assertObject(payload)
+      if (Object.keys(payload).some(key => !["source", "expectedRevision", "label"].includes(key)))
+        fail("invalid_payload", "Script execution accepts only source, expectedRevision and label")
+      assertString(payload.source, "source", 262144)
+      assertString(payload.label, "label", 128)
+      if (/\u0000/.test(payload.source) || /[\u0000-\u001f]/.test(payload.label) ||
+          typeof payload.expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(payload.expectedRevision))
+        fail("invalid_payload", "Invalid script source, label or expectedRevision token")
+      return exclusive(sessionID, async () => {
+        const b = current(sessionID, null, { write: true })
+        if (queryRevisions.get(sessionID)?.token !== payload.expectedRevision)
+          fail("stale_revision", "Use expectedRevision from a current inspectQuery result")
+        const initial = await snapshot(sessionID, b, false, {})
+        if (initial.fingerprint !== payload.expectedRevision) fail("stale_revision", "Project changed since inspection")
+        if (!initial.data.project.saved || !initial.data.project.path)
+          fail("unsaved_project", "Save the project before executing scripts")
+        const expiresAt = now() + PROPOSAL_TTL
+        const planHash = hash({ payload, bindingID: b.id })
+        await permit(ask, `Run UNSANDBOXED ExtendScript body: ${payload.label}\nProject: ${b.project.path}\nFile, network, process, preference and other external effects cannot be rolled back. Partial project changes may remain on failure. A verified checkpoint will be retained; no automatic rollback or retry.\nExact source:\n${payload.source}`, {
+          kind: "script", ...payload, hash: planHash, binding: b, nonTransactional: true,
+        })
+        alive({ expiresAt })
+        current(sessionID, b, { write: true })
+        await revision(sessionID, initial)
+        await bridge.lock(sessionID, { kind: "script", proof: SCRIPT_PROOF, planHash, nonTransactional: true })
+        let checkpoint = null, dispatched = false
+        try {
+          checkpoint = await saveCheckpoint(sessionID, initial, planHash)
+          await bridge.recordOutcome(sessionID, { outcome: "prepared", planHash, checkpointId: checkpoint.id })
+          alive({ expiresAt })
+          await revision(sessionID, initial, true)
+          current(sessionID, b, { write: true, allowLocked: true })
+          await bridge.recordOutcome(sessionID, { outcome: "dispatched", planHash, checkpointId: checkpoint.id })
+          dispatched = true
+          const result = bounded(await bridge.call(sessionID, "raw", {
+            source: payload.source, label: payload.label, expectedRevision: initial.data.revision,
+            expectedEpoch: initial.data.projectEpoch,
+            expectedProject: { id: b.project.id, path: b.project.path },
+          }, { allowLocked: true }))
+          if (!result || typeof result !== "object" || Array.isArray(result) || !Object.hasOwn(result, "value") ||
+              !Number.isSafeInteger(result.revision) || result.revision < initial.data.revision ||
+              !result.project || !sameProject(result.project, b.project))
+            fail("invalid_host_result", "Script must return a JSON value, native revision and matching project")
+          const after = await snapshot(sessionID, b, true, {})
+          if (after.data.revision !== result.revision || after.data.projectEpoch !== initial.data.projectEpoch)
+            fail("stale_revision", "Project changed after script execution")
+          await bridge.recordOutcome(sessionID, { outcome: "confirmed", planHash,
+            checkpointId: checkpoint.id, expectedFingerprint: overviewProof(after) })
+          const overview = { ...after.data, binding: { ...current(sessionID, b, { allowLocked: true }), lock: null },
+            expectedRevision: after.fingerprint }
+          await bridge.unlock(sessionID)
+          return { result: result.value, checkpointId: checkpoint.id, expectedRevision: after.fingerprint, overview }
+        } catch (error) {
+          if (dispatched || uncertain(error)) {
+            await bridge.markUncertain(sessionID, "Script outcome was not confirmed; retain checkpoint and partial changes").catch(() => {})
+            throw new AEError("outcome_uncertain", "Partial project changes and external effects may remain. No retry or automatic rollback; reconcile the locked target.", {
+              cause: error.code || "execution_failed", checkpointId: checkpoint?.id || error.details?.checkpointId || null, rolledBack: false,
+              hostMessage: error.message,
+              warning: "Partial changes may remain; the checkpoint does not undo external effects.",
+            })
+          }
+          await bridge.unlock(sessionID)
+          throw new AEError(error.code || "execution_failed", error.message, {
+            ...error.details, checkpointId: checkpoint?.id || error.details?.checkpointId || null, rolledBack: false,
+          })
+        }
+      })
+    },
     async inspect(sessionID) {
       const inspected = await snapshot(sessionID, null, true)
       return { ...inspected.data, fingerprint: inspected.fingerprint, binding: inspected.binding }
@@ -436,19 +587,31 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
     async reconcile(sessionID, ask) {
       return exclusive(sessionID, async () => {
         const b = current(sessionID, null, { allowLocked: true })
-        const inspected = await snapshot(sessionID, b, true)
+        const script = b.lock?.reason?.kind === "script" && b.lock.reason.proof === SCRIPT_PROOF
+        if (script && (b.lock.connectionId !== b.connectionId || !sameProject(b.lock.project, b.project) ||
+            b.lock.restore || b.lock.recoveryOriginal))
+          fail("recovery_target_mismatch", "Script recovery requires its original connection and project")
+        const inspected = await snapshot(sessionID, b, true, script ? {} : undefined)
+        const fingerprint = script ? overviewProof(inspected) : inspected.fingerprint
         const evidence = b.lock?.evidence
-        const proven = evidence?.outcome === "confirmed" && evidence.expectedFingerprint === inspected.fingerprint
+        // A bounded overview is not a complete scene/external-effects proof, even after confirmation.
+        const proven = !script && evidence?.outcome === "confirmed" && evidence.expectedFingerprint === fingerprint
         if (b.lock && !proven) {
-          await permit(ask, `Review reconciliation for ${b.project.path}.\nSnapshot SHA-256: ${inspected.fingerprint}\n${JSON.stringify(inspected.data, null, 2)}\nConfirm this is the intended recovered state, including external/raw effects. No command will be retried.`, {
-            kind: "reconcile", binding: b, fingerprint: inspected.fingerprint, snapshot: inspected.data, evidence: evidence || null,
+          const scope = script
+            ? "Bounded overview only: properties and later pages are omitted. Review the actual AE project and external effects before confirming."
+            : "Full inspected snapshot."
+          await permit(ask, `Review reconciliation for ${b.project.path}.\n${scope}\nSnapshot SHA-256: ${fingerprint}\n${JSON.stringify(inspected.data, null, 2)}\nConfirm this is the intended recovered state, including external/raw effects. No command will be retried.`, {
+            kind: "reconcile", binding: b, fingerprint, snapshot: inspected.data, evidence: evidence || null,
           })
         }
-        await revision(sessionID, { binding: b, fingerprint: inspected.fingerprint }, true)
+        if (script) {
+          if (overviewProof(await snapshot(sessionID, b, true, {})) !== fingerprint)
+            fail("stale_revision", "Project or reviewed overview changed during reconciliation")
+        } else await revision(sessionID, inspected, true)
         const latest = current(sessionID, b, { allowLocked: true })
         if (hash(latest.lock) !== hash(b.lock)) fail("stale_binding", "Recovery lock changed during review")
         await bridge.unlock(sessionID)
-        return { ...inspected.data, fingerprint: inspected.fingerprint, reconciled: true,
+        return { ...inspected.data, fingerprint, reconciled: true,
           proof: proven ? "confirmed_outcome" : "explicit_review", previousLock: b.lock,
           warning: "No command was retried. Inspection does not undo external or raw-script side effects." }
       })

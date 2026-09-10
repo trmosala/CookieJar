@@ -1,4 +1,21 @@
+# Current roadmap — 10 September 2026
+
+The previous open issues (#7, #15, #16, #17) were closed as superseded at the user's request, not as evidence that all release qualification work is complete.
+
+Implementation order:
+
+1. [#18 Attach references in AE chat](https://github.com/trmosala/CookieJar/issues/18)
+2. [#19 Select model and reasoning inside AE](https://github.com/trmosala/CookieJar/issues/19)
+3. [#20 Restore project state from chat checkpoints](https://github.com/trmosala/CookieJar/issues/20)
+4. [#21 Reuse brand and animation skills in AE](https://github.com/trmosala/CookieJar/issues/21)
+
+Image generation/import is excluded because its current limitation belongs in CookieMonster. Current live-test evidence is in [FIRST_TEST.md](FIRST_TEST.md).
+
+## Historical issue ledger (statuses below are from the earlier milestone)
+
 # Issue Acceptance Status
+
+**Historical ledger:** the September 9 closures and acceptance statements below describe 0.1.0. The 0.2.0 development refactor replaces public structured proposals/raw gates with approved script execution and adds experimental native capture. It has not requalified these issue acceptances. See [current setup and evidence](FIRST_TEST.md); no new GitHub status is claimed here.
 
 Snapshot: 2026-09-09. GitHub closures are confirmed for #1, #3, #5, #9, #11, #12 and #14, in addition to the six prior closures (#2, #4, #6, #8, #10, #13). **13 issues are closed; only #7, #15, #16 and #17 remain open**, with the gaps below.
 

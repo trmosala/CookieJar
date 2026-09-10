@@ -143,6 +143,7 @@ export function hostDouble(projectPath) {
     CloseOptions: { DO_NOT_SAVE_CHANGES: 1 },
     PropertyType: PT, PropertyValueType: VT, KeyframeInterpolationType: { LINEAR: 1, BEZIER: 2, HOLD: 3 },
     KeyframeEase: function(speed, influence) { this.speed = speed; this.influence = influence } })
+  context.isValid = value => value != null
   vm.runInContext(readFileSync(new URL("../panel/host.jsx", import.meta.url), "utf8"), context)
   const call = (method, params = {}) => JSON.parse(context.CookieMonsterAE.dispatch(JSON.stringify({ method, params })))
   project.save(project.file)

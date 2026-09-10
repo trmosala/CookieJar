@@ -2,14 +2,17 @@
 
 These are pre-production operating instructions and qualification expectations. There is no approved signed release or certified host yet. Verify the exact environment and limitations in QUALIFICATION.md before any real-work use.
 
+For **0.2.2 local development testing**, start with [FIRST_TEST.md](FIRST_TEST.md). The signed-install procedure below applies to future distribution. Current editing uses `ae_inspect` and exact-source `ae_execute`; the old proposal/raw-tool split is retired.
+
 ## Install And Activate
 
 1. Obtain the approved matched CookieMonster installer and signed ZXP from the internal release owner. Verify their hashes, trusted publisher and compatibility mapping. No such approved pair is recorded yet.
 2. Close AE and use the organization-qualified extension manager/version to install the signed ZXP. The manager and per-user/system installation scope must be recorded in the matrix; no manager is certified by these docs.
 3. Explicitly install the trusted plugin package (keep `plugin.mjs` and `render-worker.mjs` together) and select the reviewed config using the consumer's documented loader. Fully quit and restart CookieMonster/OpenCode after installation so startup reloads the plugin/config; account for active jobs and resolve uncertain operations before quitting. Then open AE and the CookieMonster panel under Window > Extensions. This is a manual installation step, not an instruction for the agent to restart the current session.
-4. Select an explicit panel profile and reuse its exact name after reopening/restarting AE; simultaneous AE instances need distinct profiles. Select `legacy` only to reuse the previous shared pairing in place, not copy or migrate it.
-5. Request `ae_pair` in chat and enter the short-lived code only in the local panel. Never attach pairing codes or credential files to support tickets.
-6. List connections and explicitly bind a saved project. Inspect unsaved projects only; save deliberately before mutation. Review proposals and normal generic permission prompts before execution.
+4. The panel selects and retains a local identity automatically and authenticates using owner-only local connection metadata. No pairing code is required in normal operation.
+5. Type into the AE chat panel to start or resume the project conversation. The first inspect/capture automatically binds the single connected target. With multiple AE instances, select the target with `ae_connections` and `ae_bind`; another conversation's ownership requires explicit takeover.
+6. Save deliberately before mutation and review the exact script source in the normal permission prompt. Idle reconnection to the same project can resume on inspection; project changes and uncertainty require explicit recovery/selection.
+
 
 For an invalid credential, install matching panel/plugin versions, obtain a fresh chat code and explicitly confirm credential recovery for the same profile. Identity, local uncertain latches and durable locks remain; recovery does not reconnect or rebind. Inspect AE before clearing a local latch, then reconnect, explicitly rebind and reconcile durable locks separately. Never delete profile/bridge state to bypass recovery.
 
@@ -22,7 +25,7 @@ The integration must detect and leave this preference unchanged. If file/network
 - Windows: Edit > Preferences > Scripting & Expressions > Allow Scripts to Write Files and Access Network.
 - macOS: After Effects > Settings (or Preferences on the qualified version) > Scripting & Expressions > Allow Scripts to Write Files and Access Network.
 
-Reopen/reconnect the panel and recheck capability status. Exact menu wording is a manual qualification item per AE point version. Disable only affected capabilities; a disabled preference is not permission to silently modify user settings. Raw scripting remains disabled until explicitly enabled for the current bound Session, and default config policy denies raw tools.
+Reopen/reconnect the panel and recheck capability status. Exact menu wording is a manual qualification item per AE point version. Disable only affected capabilities; a disabled preference is not permission to silently modify user settings. In 0.2.2, `ae_execute` requires approval of each script and a current inspection revision. There is no separate Session raw-enable tool. Scripts are unsandboxed; managed filesystem grants do not restrict their external effects.
 
 ## Updates And Removal
 
@@ -46,7 +49,7 @@ Additional asset/output paths require exact or recursive Session/binding-scoped 
 
 On timeout, modal blocking, disconnect during mutation or failed rollback, do not retry the action. Raw-script errors also leave the outcome uncertain and locked. Keep automation suspended, inspect the reported outcome and checkpoint verification, and use `ae_reconcile` to review actual evidence.
 
-Automatic rollback is separate from manual restore: acknowledged structured-operation errors may restore the entire pre-plan state only after the host is confirmed stopped and relevant state remains unchanged, using a verified emergency checkpoint and snapshot/hash guards. This is the approved #5/#12 acceptance. External edits, stale-state mismatches after mutation and timeouts preserve backups and recovery locks; do not assume every error restores the project.
+`ae_execute` in 0.2.2 never automatically rolls back or retries a script. It retains a verified pre-script checkpoint and locks on uncertain outcomes; inspect partial changes and reconcile deliberately. The older structured-operation rollback implementation remains internal for regression/recovery compatibility, but is not the current chat editing path. Historical #5/#12 structured-plan acceptance does not qualify script execution.
 
 Approved manual restore first saves dirty work to a private emergency project and verifies a protected current-state checkpoint. It then attempts guarded canonical publication and snapshot-checked close/reopen, retaining the displaced original. Confirmed canonical restore does not require Save As/rebind. If publication fails and freshness guards still hold, a private verified recovery copy is opened without overwriting original bytes, retained at the canonical path or `originalPath`; automation stays locked. Review it, deliberately Save As, explicitly rebind and reconcile before resuming. A failed freshness guard does not authorize opening fallback over newer edits.
 
@@ -73,11 +76,11 @@ The per-job socket gate isolates busy jobs; contention may delay a call up to 30
 
 ## Host Limitations
 
-**Capture is unavailable:** `ae_capture` always returns `unsafe_state` on the current host path because reliable preview/modal detection is unavailable. Normalization and attachment tests do not establish capture; do not bypass this safety refusal.
+**Capture:** request an explicit composition/time through `ae_capture` with the panel visible and AE idle. PNG preserves alpha; JPEG composites on black. The native host dispatches once, then CEP waits up to 10 seconds for a complete PNG and up to 10 seconds for image decoding. A pending PNG timeout preserves its temporary directory and retains local/durable uncertainty; do not retry until AE is idle and the outcome is reconciled. Successful output is bounded and the temporary directory is removed. AE 26.3 was tested live; the undocumented API and preview/modal behavior remain qualification limits.
 
-Template discovery temporarily adds/removes a render-queue item and requires approval and a lock; existing terminal queue entries are allowed. An exactly identified, installed but disabled effect may be enabled while protecting its stored data. Property execution uses 64-action chunks without a total action-count cap. Approved #11 scope excludes/refuses `comp.reorder`; supported layer reordering remains implemented.
+Template discovery temporarily adds/removes a render-queue item and requires approval and a lock; existing terminal queue entries are allowed. The old structured action engine still has 64-action chunks and excludes `comp.reorder`. These action-schema rules do not constrain arbitrary scripts exposed by 0.2.2.
 
-Verified AE source is committed as `b3a1fb3` (base `49ef591`), unchanged since verification: 264/264 tests, zero failures/skips/cancellations in 613.0605642 seconds; 32 script checks; 11 hashed artifacts; manifest inventory/SHA256 reproducibility passed. Sibling desktop source is committed as `a1e9efeff` (base `fa0b443cd`); both commits are local and unpushed. Restore/credential, render-retirement and desktop permission-override findings were fixed and re-reviewed with no remaining concrete scoped findings. Final refreshed Windows packaged smoke passed, including four matching artifact hashes, actual loader checks and detached-worker completion with a render double; see [integration evidence](INTEGRATION.md#final-smoke-evidence). This was not a real AE render or a live desktop user session. Desktop and CLI are unsigned; live AE/CEP, saved-project reopen, macOS/network qualification, approved signed releases and pilot sign-off remain absent. See [issue status](ISSUE_STATUS.md): 13 confirmed closed issues; only #7, #15, #16 and #17 remain open.
+Historical 0.1.0 evidence: AE `b3a1fb3` passed 264 tests, 32 syntax checks and reproducible artifact verification; sibling desktop `a1e9efeff` passed packaged smoke with a render double. Those results do not describe the current refactor. See [current development evidence](FIRST_TEST.md#verification-record) and [historical integration evidence](INTEGRATION.md#final-smoke-evidence). Desktop and CLI are unsigned; full live AE/CEP, macOS/network qualification, approved signed releases and pilot sign-off remain absent.
 
 ## Support And Privacy
 

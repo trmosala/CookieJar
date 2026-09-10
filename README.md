@@ -1,14 +1,24 @@
 # CookieMonster After Effects
 
-Standalone, pre-production AE sidecar plugin and CEP panel. **Unsigned and not certified.** AE 25/26 are candidates, not supported-environment claims. See [issue status](docs/ISSUE_STATUS.md), [qualification](docs/QUALIFICATION.md) and [pilot gates](docs/PILOT.md).
+**0.2.2 — local development build for first testing on disposable projects.** A Node sidecar and CEP panel connect CookieMonster/OpenCode to After Effects. Unsigned; no environments are certified.
 
-**Capture unavailable:** `ae_capture` always returns `unsafe_state` on the current host path because there is no reliable preview/modal detection signal. Image normalization and attachment tests do not establish working capture.
+The panel now provides [chat inside After Effects](docs/PRODUCT_GOAL.md), backed by CookieMonster's existing conversation runtime. Open it, type a message, and review replies, captured frames and approvals in AE. It follows the active composition; choose a comp to pin it or insert an explicit @mention. Conversations stay with the project, and project changes stop previous work. Normal connection is automatic. Multiple targets or another conversation's ownership require an explicit choice.
 
-`comp.reorder` is explicitly unsupported; layer reordering is supported. Manual checkpoint restore saves and verifies dirty work before guarded canonical restoration, retaining the displaced `originalPath`. Publication is not crash-atomic; fallback opens a private verified recovery copy with automation locked. See [recovery procedures](docs/OPERATIONS.md).
+The current editing flow is **inspect → review exact ExtendScript → execute → inspect the result**. `ae_inspect` supports bounded project/composition/layer/property queries and returns an `expectedRevision` token. `ae_execute` accepts that token, a label and a script body. It saves and verifies a checkpoint before running approved source. Scripts are unsandboxed; partial edits and external effects can remain after failure. There is no automatic rollback or retry for scripts.
+
+`ae_propose` and the three `ae_raw_*` tools are no longer exposed. Structured transaction internals remain for existing recovery paths and regression tests. Pairing, exclusive bindings, checkpoints, manual restore, render management and diagnostics remain available.
+
+`ae_capture` returns composition images for visual inspection: PNG with alpha, or JPEG, bounded to 2000 pixels. Keep AE idle and the panel visible. The panel waits for a complete native PNG before decoding and cleanup; timeout preserves the destination and requires reconciliation. Native capture uses undocumented `CompItem.saveFrameToPng`; Windows AE 26.3 has been live-tested, while other versions and preview/modal behavior remain unqualified.
+
+## First test
+
+Follow [FIRST_TEST.md](docs/FIRST_TEST.md) for local setup, the exact chat prompt, expected results and recovery instructions. It distinguishes automated evidence from the remaining live CEP/chat test.
+
+The git-ignored local `opencode.json` points to this repository's `dist/cm-ae/plugin.mjs`. Keep the whole `dist/cm-ae` directory together. Restart CookieMonster/OpenCode with this repository selected so it loads the project configuration. Building alone does not reload an already-running consumer.
 
 ## Development
 
-Node 22+; root dependency Zod 4.1.8; Bun 1.3.14 for bundling. From this directory:
+Node 22+, Zod 4.1.8 and Bun 1.3.14:
 
 ```sh
 npm ci --ignore-scripts
@@ -18,32 +28,26 @@ npm run build
 node scripts/verify-build.mjs --rebuild
 ```
 
-Package metadata and the lockfile are valid, with Zod pinned to 4.1.8. Run dependency commands in this directory, not a parent/sibling project. Tests include a Bun packaging regression, so Bun is required for the full suite as well as builds. Direct equivalents are `node --test test/*.test.mjs`, `node scripts/check.mjs`, and `node scripts/build.mjs`.
+Build output is a self-contained Node ESM plugin and render worker, default permissions, Zod license, complete CEP panel, compatibility metadata and deterministic SHA256 manifest. Builds do not install, sign or publish. Tests use AE doubles unless explicitly described as live; V8 parsing of JSX is not proof that ExtendScript accepts it.
 
-Build output: self-contained Node ESM package `dist/cm-ae/` with `plugin.mjs`, companion `render-worker.mjs`, default `permissions.json` and Zod license; complete `dist/panel`, compatibility mapping, and a deterministic SHA256 manifest. Keep the plugin and worker together. No install, signing, or publishing occurs. V8 parsing of host JSX is not an AE/ExtendScript test.
+On an already configured Windows CEP development machine, install the verified panel with:
 
-Final AE source verification passed **264/264 tests, zero failures, skips or cancellations, in 613.0605642 seconds**; `npm run check` checked **32 scripts**; `npm run build` produced **11 hashed artifacts**; and `node scripts/verify-build.mjs --rebuild` passed manifest inventory, SHA256 and reproducibility verification. The verified source is committed as `b3a1fb3` (base `49ef591`), unchanged since verification. Sibling desktop source is committed as `a1e9efeff` (base `fa0b443cd`). Both commits are local and unpushed.
-
-Restore/credential, render-retirement P1/P2 and desktop permission-override findings were fixed and re-reviewed with no remaining concrete findings in those scoped reviews. [Issue status](docs/ISSUE_STATUS.md) records **13 confirmed closed issues; only #7, #15, #16 and #17 remain open**. Final refreshed Windows packaged smoke passed, including four matching artifact hashes, actual loader checks and detached-worker completion with a render double; see [integration evidence](docs/INTEGRATION.md#final-smoke-evidence). Live AE/CEP, macOS and network qualification, signing and approved internal distribution remain absent.
-
-## Configuration
-
-Generate a **new explicit local output** from your existing JSON configuration:
-
-```sh
-node scripts/merge-config.mjs ./existing-config.json ./dist/cm-ae/plugin.mjs ./merged-config.json
+```powershell
+powershell -NoProfile -File scripts/install-dev-panel.ps1
 ```
 
-The CLI never searches for or edits global configuration, never overwrites an existing file, and refuses required-artifact failures. Existing plugin strings/tuples and user permission policy remain intact. Read tools, including scoped render listing, default to allow; state-changing tools and explicit render recovery ask; raw tools deny. Template discovery also asks because it temporarily changes the render queue. The adapter rejects unsafe auto-allow policies for privileged operations rather than silently rewriting user rules. Raw scripting additionally requires runtime Session enablement.
+This preserves the previous panel outside the CEP extensions folder, verifies installed hashes and leaves profile data/preferences unchanged. Restart AE afterward. This is a local developer setup, not signed pilot distribution.
 
-After explicitly installing the whole plugin package and selecting the reviewed config in the consumer, fully quit and restart CookieMonster/OpenCode to reload them. Resolve uncertain operations and account for active renders first. Generating the config file alone does not install or activate anything; no restart is performed by these commands.
+For another consumer configuration, generate a new explicit output while preserving existing plugins and permission policy:
 
-Desktop staging/startup/packaging is implemented in the sibling's `packages/desktop`, using `CM_AE_ARTIFACT_DIR` and the application version in server `releaseMetadata`, without replacing browser policy. Refreshed Windows packaged smoke passed and #1 is closed; see [integration](docs/INTEGRATION.md).
+```sh
+node scripts/merge-config.mjs existing-config.json dist/cm-ae/plugin.mjs merged-config.json
+```
 
-## Install And Use
+Read tools default to allow; execution, capture, filesystem grants, restore, template discovery and render control require approval. Auto-allow policies for privileged tools are rejected. Filesystem grants constrain managed operations; they do not sandbox arbitrary ExtendScript.
 
-There is no approved production installation yet. After release gates pass, install the signed ZXP with the qualified extension manager and open the panel under AE's **Window > Extensions** menu (wording varies by qualified host). Do not bypass signature verification for a pilot.
+## Release status
 
-Select an explicit panel profile and reuse its exact name after restart; `legacy` reuses the previous shared pairing in place. In chat, request a pairing code (`ae_pair`), enter it in the panel, list connections (`ae_connections`), then explicitly bind a saved project (`ae_bind`). Invalid-credential recovery requires a fresh code and explicit confirmation, preserves identity/latches/locks and never automatically reconnects or rebinds. Inspect, propose a structured plan, review it, and approve execution through the existing permission UI. Grant only required filesystem roots. Release the binding when finished.
+The 264-test baseline and September 9 packaged desktop smoke belong to the previous `0.1.0` source, not this refactor. Current development evidence is recorded in [FIRST_TEST.md](docs/FIRST_TEST.md). The [issue ledger](docs/ISSUE_STATUS.md) records the replacement product roadmap and preserves historical release gaps. Closing the earlier issues does not establish certification or pilot completion.
 
-See [operations](docs/OPERATIONS.md) for scripting preferences, updates, uninstallation, checkpoints and recovery; [release instructions](docs/RELEASE.md) for signing and evidence requirements. The docs describe the intended workflow and gates, not proof that every host scenario is implemented or qualified.
+See [operations](docs/OPERATIONS.md), [desktop integration](docs/INTEGRATION.md), [qualification](docs/QUALIFICATION.md), [release](docs/RELEASE.md) and [pilot](docs/PILOT.md). No production or pilot approval is implied by a passing development test.

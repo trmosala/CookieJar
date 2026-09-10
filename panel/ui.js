@@ -2,7 +2,7 @@
 (function () {
     "use strict";
     function el(id) { return document.getElementById(id); }
-    var client, host, store, api, working = false, checkpoints = [], serviceContext = "", diagnosticURL = null, serviceTimer, restoreOperation = null, restoreResult = "";
+    var client, host, store, api, chat, working = false, checkpoints = [], serviceContext = "", diagnosticURL = null, serviceTimer, restoreOperation = null, restoreResult = "";
     function serviceStatus(message) {
         // Operation evidence is not current-project metadata; refreshes must not erase backup locations.
         el("services-status").textContent=message+(restoreResult ? "\n\n"+restoreResult : "");
@@ -57,8 +57,16 @@
             else if(requested===client.context())serviceStatus("Checkpoint and render metadata refreshed.");
         });
     }
-    function problem(e) { el("error").textContent = (e.code || "panel_error") + ": " + (e.message || "Panel failed"); }
+    function problem(e) { el("error").textContent = (e.code || "panel_error") + ": " + (e.message || "Panel failed");el("connection-notice").hidden=false;el("connection-notice").textContent=e.message || "Connection needs attention. Open Settings & troubleshooting."; }
     function render(s) {
+        if(chat)chat.update(s);
+        var recovery=!!(s.uncertain || s.lock);
+        el("connection-status").textContent=recovery ? "Paused" : s.connection==="connected" ? "Connected" : "Connecting…";
+        el("recovery-notice").hidden=!recovery;
+        el("recovery-message").textContent=s.uncertain ? "An action was interrupted. Wait for AE to finish, then check your project and render queue before continuing. The action will not be repeated." : "The connection is back. Ask CookieMonster to review the interrupted action in chat before making more changes.";
+        el("reconcile").hidden=!s.uncertain;
+        el("connection-notice").hidden=s.connection==="connected" || recovery;
+        el("connection-notice").textContent=s.connection==="incompatible" ? "Update the AE panel and CookieMonster plugin to matching versions. See Settings & troubleshooting." : "Open CookieMonster with the AE plugin enabled. This panel connects automatically.";
         el("status").textContent = s.connection + (s.uncertain ? " / OUTCOME UNCERTAIN: DO NOT RETRY" : "");
         var compatibility=null;
         try { if(s.compatibility)compatibility=api.compatibilityMetadata(s.compatibility); } catch(ignore) {}
@@ -66,7 +74,7 @@
             " / CookieMonster Desktop "+(compatibility && compatibility.cookieMonsterVersionStatus==="configured" ? compatibility.cookieMonsterVersion : "not configured")+
             " / AE "+(s.aeVersion || "unknown");
         el("compatibility-status").textContent=s.connection==="incompatible" ? "Incompatible: automation stopped. Install matching versions, then reconnect." :
-            compatibility ? "Panel/bridge compatibility: "+compatibility.status : "Compatibility not checked. Pair with a valid code or reconnect.";
+            compatibility ? "Panel/bridge compatibility: "+compatibility.status : "Waiting for CookieMonster.";
         ["plugin","panel","cookieMonster"].forEach(function(key){
             var link=el("update-"+key),update=compatibility && compatibility.updates[key],configured=update && update.status==="configured";
             link.removeAttribute("href");link.hidden=!configured;
@@ -77,7 +85,8 @@
         source.removeAttribute("href");source.hidden=!compatibility;
         if(compatibility)source.href=compatibility.releaseSourceUrl;
         el("project").textContent = s.project ? (s.project.saved ? s.project.path : "Unsaved; writes disabled") : "Unknown";
-        el("binding").textContent = s.binding ? s.binding.sessionID + " (" + s.binding.state + ")" : "Unbound; bind in chat";
+        el("binding").textContent = s.binding ? s.binding.sessionID + " (" + s.binding.state + ")" : "Ready for a conversation; ask CookieMonster to inspect AE";
+        el("active-comp").textContent = s.activeCompId === null ? "No active composition" : "Composition ID " + s.activeCompId;
         el("lock").textContent = s.uncertain ? "Local uncertain latch; durable lock requires chat reconciliation" : s.lock ? s.lock.state : "No bridge lock reported";
         el("capture").hidden = !s.capture;
         el("capture").textContent = s.capture ? "CAPTURING COMPOSITION FRAME / Session " + s.capture : "";
@@ -101,12 +110,12 @@
         working = true; el("error").textContent = "";
         Promise.resolve().then(fn).catch(problem).then(function () { working = false; render(client.state); });
     }
-    function openProfile() {
+    function openProfile(automatic) {
         if (store) return;
         try {
-        store = new api.Store(undefined,el("profile").value);
+        store = automatic ? api.automaticStore() : new api.Store(undefined,el("profile").value);
         el("profile").disabled=true;el("profile-open").disabled=true;
-        el("profile-status").textContent="Profile: "+store.profile+". Reuse this exact name after reopening or restarting AE. Close this panel to select another profile.";
+        el("profile-status").textContent="Local identity: "+store.profile+". Saved automatically for reconnection.";
         host = new api.HostRPC(window.__adobe_cep__,25000,function (method,value) {
             if (method === "capture" && value.result) {
                 try { api.cleanupCapture(value.result); } catch (e) { problem(e); }
@@ -124,6 +133,7 @@
             });
         }});
         render(client.state);
+        if(window.CookieMonsterChat)chat=window.CookieMonsterChat(client,store,api);
         el("pair-form").addEventListener("submit",function(e){
             e.preventDefault();var code=el("code").value.trim();el("code").value="";
             action(function(){client.stop();return client.pair(code).then(function(){client.start();});});
@@ -212,10 +222,13 @@
             // Unload cannot await HTTP: a late disconnect could suspend a reopened profile.
             // The bridge suspends on heartbeat expiry; use Disconnect for an acknowledged close.
         });
-        if (store.state.credential && !store.state.uncertain) client.start();
-        // Unpaired panels need a valid code before negotiation or host startup.
+        if (!store.state.uncertain) client.start();
         } catch (e) {
             problem(e);el("status").textContent="Panel unavailable";
+            if(automatic && !store && e.code==="ENOENT") {
+                el("status").textContent="Waiting for CookieMonster. Open CookieMonster with the AE plugin enabled.";
+                setTimeout(function(){openProfile(true);},3000);
+            }
             // A failed initialization never selects a different profile or resets its latch.
             if (store) { el("profile-status").textContent="Initialization failed. Close and reopen this panel with the same profile."; }
         }
@@ -241,9 +254,9 @@
         api=nodeRequire(path.join(extension,"transport.cjs"));
         if (!el("profile-form") || !el("profile") || !el("profile-open") || !el("profile-status")) throw {code:"profile_ui_required",message:"Install the matching panel HTML with explicit profile selection"};
         ["pair","connect","disconnect","rotate","unpair","idle","reconcile","services-refresh","diagnostics"].forEach(function(id){el(id).disabled=true;});
-        el("status").textContent="Select a profile before connecting";
-        el("profile-status").textContent="AE "+environment.appVersion+". Each simultaneous AE instance needs a different profile. Select legacy only to use the previous shared pairing.";
+        el("status").textContent="Connecting to CookieMonster...";
         el("profile-form").addEventListener("submit",function(e){e.preventDefault();el("error").textContent="";openProfile();});
         window.addEventListener("unload",function(){if(store)store.close();});
+        openProfile(true);
     } catch (e) { problem(e); el("status").textContent = "Panel unavailable"; }
 }());

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "pluginVersion": "0.1.0",
-  "panelVersion": "0.1.0",
+  "pluginVersion": "0.2.2",
+  "panelVersion": "0.2.2",
   "protocolVersion": 1,
   "minimumNodeVersion": "22",
   "signed": false,

@@ -1,86 +1,215 @@
 <!doctype html>
+
 <html lang="en">
+
 <head>
+
 <meta charset="utf-8">
+
 <meta name="viewport" content="width=device-width,initial-scale=1">
+
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+
 <title>CookieMonster AE</title>
+
 <link rel="stylesheet" href="panel.css">
+
 </head>
+
 <body>
+
 <main>
-<header><h1>CookieMonster AE</h1><p class="qualification">DEVELOPMENT UNQUALIFIED</p></header>
-<p>Targets AE 25/26. No point versions certified. Use disposable projects until the qualification matrix is supplied.</p>
-<section aria-labelledby="status-heading">
-<h2 id="status-heading">Connection</h2>
-<p id="status" role="status" aria-live="polite">Starting panel...</p>
-<dl><dt>Versions</dt><dd id="versions">Panel 0.1.0</dd><dt>Project</dt><dd id="project">Unknown</dd><dt>Session</dt><dd id="binding">Unbound</dd><dt>Lock</dt><dd id="lock">Unknown</dd></dl>
+
+<header><div class="brand"><span class="brand-mark" aria-hidden="true">C</span><h1>CookieMonster</h1><span class="host-label">After Effects</span></div><span id="connection-status" role="status">Connecting…</span></header>
+
+<section class="chat" aria-label="Project chat">
+
+<div class="chat-heading"><h2 id="chat-project-name">Opening projectâ€¦</h2><button id="chat-new" type="button">New chat</button></div>
+
+<label class="sr-only" for="chat-comp">Composition</label>
+
+<select id="chat-comp"><option value="follow">Follow active composition</option></select>
+
+<p id="chat-target">Following active composition</p>
+
+<section id="recovery-notice" class="notice" aria-label="Recovery needed" hidden><h2>Check After Effects before continuing</h2><p id="recovery-message"></p><button id="reconcile" type="button">I checked AE — continue</button></section>
+
+<p id="connection-notice" class="notice" role="status" hidden></p>
+
 <p id="capture" class="capture" role="status" aria-live="assertive" hidden></p>
-<p id="error" role="alert"></p>
-</section>
-<section aria-labelledby="pair-heading">
-<h2 id="pair-heading">Pairing</h2>
-<form id="profile-form">
-<label for="profile">Panel Profile</label>
-<input id="profile" required maxlength="64" pattern="[a-z0-9][a-z0-9_-]{0,63}" autocomplete="off" spellcheck="false">
-<button id="profile-open" type="submit">Open Profile</button>
+
+<select id="chat-workspace" aria-label="CookieMonster workspace" hidden></select>
+
+<button id="chat-takeover" type="button" hidden>Take control for this chat</button>
+
+<div id="chat-messages" role="log" aria-label="Conversation"></div>
+
+<div id="chat-approvals" aria-live="polite"></div>
+
+<p id="chat-error" role="alert"></p>
+
+<form id="chat-form">
+
+<label class="sr-only" for="chat-input">Message CookieMonster</label>
+
+<textarea id="chat-input" rows="3" maxlength="16000" placeholder="What should we work on?"></textarea>
+
+<div class="chat-actions"><button id="chat-mention" type="button">@ Mention comp</button><span id="chat-progress" role="status">Connectingâ€¦</span><button id="chat-stop" type="button" disabled>Stop</button><button id="chat-send" type="submit" disabled>Send</button></div>
+
 </form>
+
+</section>
+
+<details id="advanced"><summary>Settings &amp; troubleshooting</summary><div class="advanced-content"><p class="qualification">Development build · Use disposable projects for testing.</p>
+
+<p>Targets AE 25/26. No point versions certified. Use disposable projects until the qualification matrix is supplied.</p>
+
+<section aria-labelledby="status-heading">
+
+<h2 id="status-heading">Connection</h2>
+
+<p id="status" role="status" aria-live="polite">Starting panel...</p>
+
+<dl><dt>Versions</dt><dd id="versions">Panel 0.2.2</dd><dt>Project</dt><dd id="project">Unknown</dd><dt>Following</dt><dd id="active-comp">No active composition</dd><dt>Session</dt><dd id="binding">Connecting automatically</dd><dt>Lock</dt><dd id="lock">Unknown</dd></dl>
+
+<p id="error" role="alert"></p>
+
+</section>
+
+<p>Connects automatically to CookieMonster on this computer. Ask CookieMonster to inspect AE to start working. If several AE instances are open, select the target in chat.</p>
+
+<details>
+
+<summary id="pair-heading">Connection recovery &amp; advanced settings</summary>
+
+<form id="profile-form">
+
+<label for="profile">Panel Profile</label>
+
+<input id="profile" required maxlength="64" pattern="[a-z0-9][a-z0-9_-]{0,63}" autocomplete="off" spellcheck="false">
+
+<button id="profile-open" type="submit">Open Profile</button>
+
+</form>
+
 <p id="profile-status" role="status" aria-live="polite"></p>
+
 <form id="pair-form"><label for="code">Single-use code from CookieMonster chat</label><input id="code" type="password" autocomplete="off" spellcheck="false" maxlength="64"><button id="pair" type="submit">Pair</button></form>
+
 <div class="buttons"><button id="connect" type="button">Reconnect</button><button id="disconnect" type="button">Disconnect</button><button id="rotate" type="button">Rotate Credential</button><button id="unpair" type="button">Unpair</button></div>
-<p>Use a different profile for each simultaneous AE instance. Reselect the same profile after reopening. Select legacy only for the previous shared pairing. Reconnection requires explicit rebinding in chat.</p>
+
+<p>Local identities and credentials are managed automatically. Manual pairing is retained for credential recovery. Another conversation's ownership requires an explicit takeover in chat.</p>
+
 <button id="recover-credential" type="button" disabled aria-describedby="credential-recovery-status">Recover Invalid Credential</button>
+
 <p id="credential-recovery-status" role="status" aria-live="polite">If authentication fails, install matching panel/plugin versions, enter a fresh single-use code above, then explicitly recover. This replaces the server credential for the same profile, retains identity, uncertain latch and durable locks, and does not reconnect. Never delete profile or bridge state to recover.</p>
-</section>
+
+</details>
+
 <section aria-labelledby="capture-heading">
+
 <h2 id="capture-heading">Capture &amp; Recovery</h2>
-<p>Capture is unavailable in this deployment: preview/modal safety cannot be verified. A user idle assertion does not authorize capture. Inspection remains available.</p>
-<button id="idle" type="button" disabled>Capture Unavailable</button>
+
+<p>Request a composition frame in chat for visual inspection. Keep this panel visible and stop previews first. Capture waits for a complete PNG; a timeout preserves its destination and requires reconciliation.</p>
+
+<button id="idle" type="button" disabled>Request Capture in Chat</button>
+
 <p>Timed-out scripts are never retried. Wait for AE to return, inspect the project and queue, then clear the local latch. Rebind and reconcile the durable lock in chat separately.</p>
-<button id="reconcile" type="button">I Inspected AE: Clear Local Latch</button>
+
+
+
 </section>
+
 <section aria-labelledby="preference-heading">
+
 <h2 id="preference-heading">File &amp; Network Permission</h2>
+
 <p id="preference">Unknown</p>
+
 <p>Windows: Edit &gt; Preferences &gt; Scripting &amp; Expressions. macOS: After Effects &gt; Settings (Preferences) &gt; Scripting &amp; Expressions. Enable &quot;Allow Scripts to Write Files and Access Network&quot; yourself. This panel never changes that preference.</p>
+
 </section>
+
 <section aria-labelledby="services-heading">
+
 <h2 id="services-heading">Bridge Services</h2>
+
 <button id="services-refresh" type="button">Refresh Checkpoints and Renders</button>
+
 <label><input id="services-auto" type="checkbox"> Refresh every 10 seconds while visible</label>
+
 <p id="services-status" role="status" aria-live="polite">Refresh to request metadata from the bridge.</p>
+
 <h3>Checkpoints</h3>
+
 <label for="checkpoint">Checkpoint in the bound project</label>
+
 <select id="checkpoint"><option value="">Refresh to load checkpoints</option></select>
+
 <p id="checkpoint-details"></p>
+
 <div class="buttons">
+
 <button id="checkpoint-pin" type="button" disabled>Pin</button>
+
 <button id="checkpoint-delete" type="button" disabled>Delete Checkpoint</button>
+
 <button id="restore-propose" type="button" disabled>Review Restore</button>
+
 </div>
+
 <div id="restore-review" role="region" aria-label="Restore confirmation" hidden>
+
 <p id="restore-details"></p>
+
 <p id="restore-operation"></p>
+
 <p>Review the exact operation above, including saving current edits and creating a verified current-state checkpoint before restore. If a recovery copy is opened, Save As to the intended path, explicitly rebind, and review reconciliation in chat; the original target remains locked. Approval is single-use and bound to this session/project.</p>
+
 <button id="restore-confirm" type="button">Confirm This Restore</button>
+
 <button id="restore-cancel" type="button">Cancel</button>
+
 </div>
+
 <h3>Render Jobs</h3>
+
 <ul id="renders"><li>Not requested</li></ul>
+
 <h3>Diagnostics</h3>
+
 <p>Export only the bridge's sanitized metadata. No local project, script, image, prompt, or credential collection.</p>
+
 <button id="diagnostics" type="button">Prepare Metadata Export</button>
+
 <a id="diagnostics-download" download="cookiemonster-ae-diagnostics.json" hidden>Save Metadata JSON</a>
+
 <h3>Compatibility &amp; Updates</h3>
+
 <p id="compatibility-status" role="status" aria-live="polite">Compatibility not checked.</p>
+
 <ul>
+
 <li>Bridge Plugin: <span id="update-plugin-status">not configured</span> <a id="update-plugin" target="_blank" rel="noopener noreferrer" hidden>Approved Plugin Update</a></li>
+
 <li>AE Panel: <span id="update-panel-status">not configured</span> <a id="update-panel" target="_blank" rel="noopener noreferrer" hidden>Approved Panel Update</a></li>
+
 <li>CookieMonster Desktop: <span id="update-cookieMonster-status">not configured</span> <a id="update-cookieMonster" target="_blank" rel="noopener noreferrer" hidden>Approved Desktop Update</a></li>
+
 </ul>
+
 <p><a id="release-source" target="_blank" rel="noopener noreferrer" hidden>Public Release Source</a> Release source is not an approved internal installer. Ask your administrator when updates are not configured.</p>
+
 </section>
+
+</div></details>
+
 </main>
+
+<script src="chat.js"></script>
+
 <script src="ui.js"></script>
+
 </body>
+
 </html>

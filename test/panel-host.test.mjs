@@ -9,6 +9,59 @@ import transport from "../panel/transport.cjs";
 import { hostDouble } from "./workflow-host.mjs";
 
 const source = readFileSync(new URL("../panel/host.jsx", import.meta.url), "utf8");
+test("host source avoids regex constructs rejected by the After Effects ExtendScript parser", () => {
+    assert.doesNotMatch(source, /\(\?:/);
+    assert.equal(source.includes("[\\\\/]"), false);
+    assert.equal(source.includes("[/]"), false);
+});
+test("six AE-sensitive alternate chains retain explicit grouping (source guard, not AE proof)", () => {
+    for (const expression of [
+        'a.matchName < b.matchName ? -1 : (a.matchName > b.matchName ? 1 : 0)',
+        'p instanceof CompItem ? "comp" : (p instanceof FolderItem ? "folder" : "footage")',
+        's === "linear" ? KeyframeInterpolationType.LINEAR : (s === "bezier" ? KeyframeInterpolationType.BEZIER : KeyframeInterpolationType.HOLD)',
+        'p.propertyValueType===PropertyValueType.TwoD ? 2 : (p.propertyValueType===PropertyValueType.ThreeD ? 3 : 1)',
+        's===String(KeyframeInterpolationType.LINEAR) ? "linear" : (s===String(KeyframeInterpolationType.HOLD) ? "hold" : "bezier")',
+        'a.type==="layer.create" ? "layer" : (a.type==="comp.create" ? "comp" : (a.type==="folder.create" ? "folder" : "footage"))'
+    ]) assert.ok(source.includes(expression), expression);
+});
+test("file-based conditional probe checks production expressions under V8, not AE", () => {
+    const probe = readFileSync(new URL("../scripts/ae-conditional-check.jsx", import.meta.url), "utf8");
+    const run = hostSource => {
+        let output = "", writes = 0;
+        const hostPath = "/repo/panel/host.jsx";
+        class File {
+            constructor(name) { this.fsName=name; this.exists=false; this.error=""; }
+            get parent() { return {parent:{fsName:"/repo"}}; }
+            open(mode) {
+                assert.ok((this.fsName===hostPath && mode==="r") ||
+                    (/^\/temp\/cm-ae-conditionals-\d+-\d+\.txt$/.test(this.fsName) && mode==="w"));
+                return true;
+            }
+            read() { assert.equal(this.fsName,hostPath); return hostSource; }
+            write(text) { writes++; output=text; return true; }
+            close() { return true; }
+        }
+        const app = new Proxy({version:"V8-double"}, {get(target,key) {
+            assert.equal(key,"version","probe must not access projects/preferences/recovery");
+            return target[key];
+        }});
+        let error;
+        try {
+            vm.runInNewContext(probe, {File,Folder:{temp:{fsName:"/temp"}},app,
+                $:{fileName:"/repo/scripts/ae-conditional-check.jsx",writeln() {}}}, {timeout:1000});
+        } catch (e) { error=e; }
+        assert.equal(writes,1);
+        return {output,error};
+    };
+    const good=run(source);
+    assert.ifError(good.error);
+    assert.equal((good.output.match(/^PASS /gm) || []).length,25);
+    assert.match(good.output,/PASS 24\/24\n$/);
+    const bad=run(source.replace('p instanceof CompItem ? "comp"', 'p instanceof CompItem ? "broken"'));
+    assert.match(String(bad.error),/kind.comp: expected comp, got broken/);
+    assert.match(bad.output,/FAIL after/);
+    assert.doesNotMatch(bad.output,/PASS 24\/24/);
+});
 function fixture() {
     const PT = { PROPERTY: 1, INDEXED_GROUP: 2, NAMED_GROUP: 3 };
     const VT = Object.fromEntries(["NO_VALUE","OneD","TwoD","ThreeD","TwoD_SPATIAL","ThreeD_SPATIAL","COLOR","CUSTOM_VALUE","MARKER","TEXT_DOCUMENT","SHAPE"].map((k,i)=>[k,i+1]));
@@ -78,7 +131,8 @@ function fixture() {
     const comp=new CompItem(), lyr=comp.layers.addNull();
     const rqItems=[], disk=new Map();
     class File {
-        constructor(p){this.fsName=p;this.exists=true;this.alias=false;this.length=100;}
+        constructor(p){this.fsName=p;this.alias=false;this.length=100;}
+        get exists(){return this.fsName.includes("/cookiemonster-ae-") ? disk.has(this.fsName) : true;}
         remove(){disk.delete(this.fsName);return true;}
     }
     class Folder {
@@ -105,6 +159,7 @@ function fixture() {
         items:{addComp(...args){const c=new CompItem(...args);project.list.push(c);return c;},addFolder(name){const f=new FolderItem(name);project.list.push(f);return f;}}};
     const app={project,version:"25.3",effects:[{matchName:"ADBE Slider Control",displayName:"Slider",category:"Controls",version:"1"}],preferences:{getPrefAsLong(){return 1;}},beginUndoGroup(){begins++;},endUndoGroup(){ends++;},open(file){project.file=file;return project;}};
     const context=vm.createContext({app,$:{os:"Windows"},FootageItem,FileSource,ImportOptions,ImportAsType:{FOOTAGE:1},CompItem,FolderItem,TextLayer,CameraLayer,LightLayer,PropertyType:PT,PropertyValueType:VT,KeyframeInterpolationType:{LINEAR:1,BEZIER:2,HOLD:3},KeyframeEase:function(speed,influence){this.speed=speed;this.influence=influence;},Shape:function(){},File,Folder,RQItemStatus:RQ,GetSettingsFormat:{STRING:1},PostRenderAction:{NONE:0},MarkerValue:function(comment){this.comment=comment;}});
+    context.isValid = value => value != null;
     vm.runInContext(source,context);
     const call=(method,params={})=>JSON.parse(context.CookieMonsterAE.dispatch(JSON.stringify({method,params})));
     const plan=actions=>{const p=call("preflight",{actions});assert.ok(p.result,JSON.stringify(p));return p.result.actions;};
@@ -158,6 +213,16 @@ test("duplicate imports within one plan create only one native FootageItem",()=>
     assert.ok(result.result,JSON.stringify(result));
     assert.equal(result.result.results[0].id,result.result.results[1].id);
     assert.equal(f.project.list.filter(item=>item instanceof f.FootageItem).length,1);
+});
+test("asset imports accept absolute local paths and reject network paths",()=>{
+    for(const local of ["C:/Project/asset.png","C:\\Project\\asset.png","/Project/asset.png"]){
+        const result=fixture().run([{type:"asset.import",path:local}]);
+        assert.ok(result.result,JSON.stringify(result));
+    }
+    for(const network of ["//server/share/asset.png","\\\\server\\share\\asset.png"]){
+        const result=fixture().call("preflight",{actions:[{type:"asset.import",path:network}]});
+        assert.equal(result.error.code,"invalid_path");
+    }
 });
 test("disabled ancestor protects stored properties and destructive layer operations",()=>{
     const f=fixture(),fx=f.lyr.effects.addProperty("ADBE Slider Control");
@@ -600,17 +665,146 @@ test("template discovery rejects rendering, paused, unknown and callback queue s
         assert.equal(added,0);assert.equal(f.rqItems.length,1);assert.equal(f.rqItems[0],r);
     }
 });
-test("capture refuses unqualified preview/modal safety even after explicit idle assertion without touching queue",()=>{
-    const f=fixture(),params={compId:f.comp.id,time:0,alpha:true};
-    assert.equal(f.call("capture",params).error.code,"unsafe_state");
-    const prior=f.queue.items.add(f.comp);f.call("confirmIdle");
-    assert.equal(f.call("confirmIdle").error.code,"unsafe_state");
-    const result=f.call("capture",params);assert.equal(result.error.code,"unsafe_state");assert.equal(prior.render,true);assert.equal(f.rqItems.length,1);
-    assert.equal(f.disk.size,0);
-    f.queue.render=()=>{throw new Error("Render failed");};f.disk.clear();f.call("confirmIdle");
-    assert.ok(f.call("capture",params).error);assert.equal(prior.render,true);assert.equal(f.rqItems.length,1);assert.equal(f.disk.size,0);
-    prior.status=f.RQ.DONE;f.call("confirmIdle");assert.equal(f.call("capture",params).error.code,"unsafe_state");
+test("native capture dispatches once and preserves deferred output and project state",()=>{
+    for(const mode of ["idle","deferred","throw","missing-api","rendering","unknown-rendering","preference","stale","project","bad-width"]){
+        const f=fixture(),prior=f.queue.items.add(f.comp),identity=f.call("status").result.project;
+        f.comp.time=2;f.comp.resolutionFactor=[2,2];f.lyr.selected=true;
+        const params={compId:f.comp.id,time:1,expectedRevision:1,expectedProject:{id:identity.id,path:identity.path},maxWidth:800};
+        let calls=0,output;
+        f.comp.saveFrameToPng=(time,file)=>{calls++;output=file;assert.equal(time,1);if(mode!=="deferred")f.disk.set(file.fsName,"png");if(mode==="throw")throw Error("Native error after dispatch");};
+        if(mode==="missing-api")delete f.comp.saveFrameToPng;
+        f.queue.render=()=>assert.fail("No queue rendering");f.queue.items.add=()=>assert.fail("No queue additions");
+        if(mode==="rendering")f.queue.rendering=true;
+        if(mode==="unknown-rendering")f.queue.rendering=undefined;
+        if(mode==="preference")f.app.preferences.getPrefAsLong=()=>0;
+        if(mode==="stale")params.expectedRevision=2;
+        if(mode==="project")params.expectedProject.id="other";
+        if(mode==="bad-width")params.maxWidth=2001;
+        const result=f.call("capture",params);
+        if(mode==="idle" || mode==="deferred"){
+            assert.ok(result.result,JSON.stringify(result));assert.equal(result.result.pending,true);assert.equal(result.result.maxWidth,800);
+            assert.equal(result.result.path,output.fsName);assert.match(result.result.tempDir,/cookiemonster-ae-/);
+        }else{assert.ok(result.error,mode);if(mode==="throw")assert.equal(f.disk.get(output.fsName),"png");else assert.equal(f.disk.size,0,mode);}
+        assert.equal(calls,["idle","deferred","throw"].includes(mode)?1:0);
+        assert.equal(f.comp.time,2);assert.deepEqual(f.comp.resolutionFactor,[2,2]);assert.equal(f.lyr.selected,true);
+        assert.equal(f.project.activeItem,f.comp);assert.equal(f.project.revision,1);assert.equal(f.rqItems.length,1);assert.equal(prior.render,true);
+        f.queue.rendering=false;assert.equal(f.call("status").result.busy,false);assert.equal(f.begins,0);
+    }
 });
+test("targeted overview and comp summaries paginate without touching properties; full inspect remains full",()=>{
+    const f=fixture(),full=f.call("inspect").result;
+    assert.ok(full.items[0].layers[0].properties.length);
+    for(let i=0;i<204;i++)f.project.items.addFolder("Folder "+i);
+    f.lyr.property=()=>assert.fail("Summary must not read properties");
+    let cursor,ids=[];
+    do{
+        const result=f.call("inspect",{query:cursor ? {cursor} : {}}).result;
+        assert.ok(result);assert.ok(result.items.length<=100);assert.deepEqual(result.installedEffects,[]);
+        ids.push(...result.items.map(i=>i.id));cursor=result.nextCursor;
+    }while(cursor);
+    assert.equal(ids.length,205);assert.equal(new Set(ids).size,205);
+    const q={compId:f.comp.id},comp=f.call("inspect",{query:q}).result;
+    assert.equal(comp.items[0].layers[0].id,f.lyr.id);assert.equal(comp.items[0].layers[0].properties,undefined);
+    const first=f.call("inspect",{query:{}}).result;
+    assert.equal(f.call("inspect",{query:{compId:f.comp.id,cursor:first.nextCursor}}).error.code,"stale_cursor");
+    f.project.revision++;
+    assert.equal(f.call("inspect",{query:{cursor:first.nextCursor}}).error.code,"stale_cursor");
+    const fresh=f.call("inspect",{query:{}}).result;f.project.file.fsName="C:/Project/other.aep";
+    assert.equal(f.call("inspect",{query:{cursor:fresh.nextCursor}}).error.code,"stale_cursor");
+    for(const query of [{depth:9},{depth:1.5},{layerId:f.lyr.id},{propertyPath:[]},{cursor:"invented"}])assert.ok(f.call("inspect",{query}).error);
+});
+test("targeted locked/disabled duplicate effect paths retain expressions and paginate leaf keys read-only",()=>{
+    const f=fixture(),first=f.lyr.effects.addProperty("ADBE Slider Control"),second=f.lyr.effects.addProperty("ADBE Slider Control");
+    first.property(1).value=10;second.property(1).value=20;second.enabled=false;f.lyr.locked=true;
+    const p=second.property(1);p.expression="broken(";p.expressionError="Syntax error";p.expressionEnabled=true;
+    for(let i=0;i<205;i++)p.setValueAtTime(i/100,i);
+    const propertyPath=[{index:1,matchName:"ADBE Effect Parade"},{index:2,matchName:"ADBE Slider Control"},{index:1,matchName:p.matchName}];
+    const query={compId:f.comp.id,layerId:f.lyr.id,propertyPath};
+    let cursor,keys=[];
+    do{
+        const result=f.call("inspect",{query:{...query,...(cursor ? {cursor} : {})}});
+        assert.ok(result.result,JSON.stringify(result));
+        const row=result.result.items[0].layers[0].properties[0];
+        assert.equal(row.value,20);assert.equal(row.expressionError,"Syntax error");assert.equal(row.keyCount,205);
+        assert.equal(row.locator.path[1].index,2);assert.equal(row.locator.path[1].name,second.name);
+        keys.push(...row.keys);cursor=result.result.nextCursor;
+    }while(cursor);
+    assert.equal(keys.length,205);assert.equal(new Set(keys.map(k=>k.time)).size,205);
+    assert.equal(f.call("inspect",{query:{...query,propertyPath:propertyPath.map((s,i)=>i===1 ? {...s,name:"wrong"} : s)}}).error.code,"stale_locator");
+    assert.equal(second.enabled,false);assert.equal(f.lyr.locked,true);assert.equal(f.project.revision,1);assert.equal(f.begins,0);
+});
+test("targeted property preorder pages resume exactly and depth limits avoid unrelated value reads",()=>{
+    const f=fixture(),props=Array.from({length:205},(_,i)=>new f.Property("P"+i,i));
+    f.lyr.transform.children=props;
+    const query={compId:f.comp.id,layerId:f.lyr.id,propertyPath:[{index:0,matchName:"ADBE Transform Group"}],depth:1};
+    let cursor,rows=[];
+    do{
+        const response=f.call("inspect",{query:{...query,...(cursor ? {cursor} : {})}});
+        assert.ok(response.result,JSON.stringify(response));
+        rows.push(...response.result.items[0].layers[0].properties);cursor=response.result.nextCursor;
+    }while(cursor);
+    assert.equal(rows.length,206);assert.equal(new Set(rows.map(r=>JSON.stringify(r.locator.path))).size,206);
+    Object.defineProperty(props[0],"value",{get(){assert.fail("Depth zero must not inspect descendants");}});
+    assert.equal(f.call("inspect",{query:{...query,depth:0}}).result.items[0].layers[0].properties.length,1);
+    assert.equal(f.call("inspect",{query:{compId:f.comp.id,layerId:f.lyr.id}}).result.items[0].layers[0].properties.length,2);
+});
+test("raw body contract checks native revision/project, returns JSON and retains partial failures",()=>{
+    const f=fixture(),project=f.call("status").result.project,expectedProject={id:project.id,path:project.path};
+    const params={source:"app.project.revision++; return {ok:true, values:[1,null]};",expectedRevision:1,expectedProject,label:"Test script"};
+    assert.equal(f.call("raw",{...params,expectedRevision:2}).error.code,"stale_revision");
+    assert.equal(f.call("raw",{...params,expectedProject:{...expectedProject,id:"other"}}).error.code,"stale_project");
+    assert.equal(f.begins,0);
+    assert.deepEqual(f.call("raw",params).result,{value:{ok:true,values:[1,null]},revision:2,project});
+    assert.equal(f.begins,1);assert.equal(f.ends,1);
+    assert.deepEqual(f.call("raw",{source:"1+2"}).result,{value:3});
+    for(const source of [
+        'app.project.revision++; var e=new Error("broken script"); e.line=7; throw e;',
+        'app.project.revision++; return function(){};',
+        'app.project.revision++; return {value:undefined};',
+        'app.project.revision++; var v={};v.self=v;return v;',
+        'app.project.revision++; return new Date();',
+        'app.project.revision++; return NaN;'
+    ]){
+        const g=fixture(),result=g.call("raw",{source,expectedRevision:1});
+        assert.equal(result.error.code,"uncertain_outcome",JSON.stringify(result));assert.match(result.error.message,/partial changes/);
+        if(source.includes("e.line"))assert.match(result.error.message,/line 7: broken script/);
+        assert.equal(g.project.revision,2);assert.equal(g.ends,1);assert.equal(g.call("status").result.uncertain,true);
+        assert.equal(g.call("raw",{source:"return 1;",expectedRevision:2}).error.code,"uncertain_outcome");
+    }
+    const changed=fixture();
+    changed.app.beginUndoGroup=()=>{changed.project.revision++;};
+    assert.equal(changed.call("raw",{source:"app.project.revision=999;return 1;",expectedRevision:1}).error.code,"stale_revision");
+    assert.equal(changed.project.revision,2);assert.equal(changed.ends,1);
+});
+test("native replacement changes query epoch without changing persisted project identity and guards raw twice",()=>{
+    for(const boundary of ["before","undo"]){
+        const f=fixture(),before=f.call("inspect",{query:{}}).result;
+        assert.equal(f.call("inspect",{query:{compId:f.comp.id}}).result.projectEpoch,before.projectEpoch);
+        const replace=()=>{f.app.project={...f.project};};
+        if(boundary==="before")replace();
+        else f.app.beginUndoGroup=replace;
+        const result=f.call("raw",{source:"app.project.revision=999;return 1;",expectedRevision:before.revision,
+            expectedProject:{id:before.project.id,path:before.project.path},expectedEpoch:before.projectEpoch});
+        assert.equal(result.error.code,"stale_project",boundary);
+        assert.equal(f.app.project.revision,before.revision);
+        const after=f.call("inspect",{query:{}}).result;
+        assert.deepEqual(after.project,before.project);
+        assert.equal(after.revision,before.revision);
+        assert.notEqual(after.projectEpoch,before.projectEpoch);
+        assert.equal(f.call("status").result.uncertain,false);
+        assert.equal(f.ends,boundary==="undo" ? 1 : 0);
+    }
+});
+test("invalidated native project handle starts a new inspection epoch",()=>{
+    const f=fixture(),before=f.call("inspect",{query:{}}).result;
+    let checked=false;
+    f.context.isValid=value=>{checked=true;assert.equal(value,f.project);return false;};
+    const after=f.call("inspect",{query:{}}).result;
+    assert.equal(checked,true);
+    assert.deepEqual(after.project,before.project);
+    assert.notEqual(after.projectEpoch,before.projectEpoch);
+});
+
 test("preference is read-only and disabled files leave inspection available; oversized snapshot refuses",()=>{
     const f=fixture();f.app.preferences.getPrefAsLong=()=>0;
     assert.equal(f.call("inspect").result.capabilities.fileNetwork,false);assert.equal(f.call("save").error.code,"preference_disabled");

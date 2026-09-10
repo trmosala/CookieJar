@@ -17,7 +17,7 @@ test("compatibility runtime metadata validates release targets and credential-fr
   assert.equal(defaults.cookieMonsterVersionStatus, "not_configured")
   assert.equal(defaults.releaseSourceUrl, "https://github.com/trmosala/CookieJar/releases")
   assert.ok(Object.values(defaults.updates).every(update => update.status === "not_configured" && update.url === null))
-  const update = { version: "0.1.0", protocol: 1, url: "https://releases.example.test/ae/0.1.0" }
+  const update = { version: "0.2.2", protocol: 1, url: "https://releases.example.test/ae/0.2.2" }
   assert.equal(releaseMetadata({ cookieMonsterVersion: "2.4.1", updates: { panel: update } }).updates.panel.status, "configured")
   for (const url of ["javascript:alert(1)", "http://example.test/a", "file:///C:/secret", "//example.test/a",
     "https://user:secret@example.test/a", "https://example.test/a?token=secret", "https://example.test/a#secret",
@@ -37,12 +37,12 @@ test("compatibility runtime metadata validates release targets and credential-fr
 
 test("compatibility probes retain only authenticated versions, never authorize tools, and preserve pending recovery locks", async t => {
   const configured = { cookieMonsterVersion: "2.4.1",
-    updates: { panel: { version: "0.1.0", protocol: 1, url: "https://releases.example.test/ae/0.1.0" } } }
+    updates: { panel: { version: "0.2.2", protocol: 1, url: "https://releases.example.test/ae/0.2.2" } } }
   const p = await panelFixture(t, { releaseMetadata: configured })
   configured.cookieMonsterVersion = "9.9.9"
-  const peer = { panelId: "test-panel", protocol: 2, version: "0.2.0" }
+  const peer = { panelId: "test-panel", protocol: 2, version: "0.2.2" }
   const initial = (await p.bridge.connections())[0].compatibility
-  assert.equal(initial.panelVersion, "0.1.0")
+  assert.equal(initial.panelVersion, "0.2.2")
   assert.equal(initial.status, "compatible")
   assert.equal(initial.cookieMonsterVersion, "2.4.1")
   assert.equal((await request(p.port, "/compatibility", peer)).status, 401)
@@ -64,8 +64,8 @@ test("compatibility probes retain only authenticated versions, never authorize t
   assert.equal(probe.status, 200)
   assert.equal(probe.body.compatibility.status, "incompatible")
   assert.equal(probe.body.compatibility.panelProtocol, 2)
-  assert.equal(probe.body.compatibility.panelVersion, "0.2.0")
-  assert.equal(probe.body.compatibility.updates.panel.url, "https://releases.example.test/ae/0.1.0")
+  assert.equal(probe.body.compatibility.panelVersion, "0.2.2")
+  assert.equal(probe.body.compatibility.updates.panel.url, "https://releases.example.test/ae/0.2.2")
   const connection = (await p.bridge.connections())[0]
   assert.equal(connection.connected, false)
   assert.equal(connection.lock.state, "uncertain")
@@ -79,9 +79,9 @@ test("compatibility probes retain only authenticated versions, never authorize t
   assert.equal(mismatch.body.error.code, "incompatible_version")
   assert.deepEqual(mismatch.body.error.details.compatibility, probe.body.compatibility)
   const persisted = await readFile(path.join(p.dataDir, "bridge-state.json"), "utf8")
-  for (const excluded of ["panelVersion", "cookieMonsterVersion", "0.2.0", "releases.example.test"])
+  for (const excluded of ["panelVersion", "cookieMonsterVersion", "0.2.2", "releases.example.test"])
     assert.ok(!persisted.includes(excluded), excluded)
-  await p.send("/compatibility", { ...peer, version: "0.1.0", protocol: 1 })
+  await p.send("/compatibility", { ...peer, version: "0.2.2", protocol: 1 })
   assert.equal((await p.bridge.connections())[0].connected, false)
   await p.connect()
   await p.bridge.bind("session", p.connectionId)
@@ -92,7 +92,7 @@ test("compatibility probes retain only authenticated versions, never authorize t
   const fresh = (await p.bridge.connections())[0]
   assert.equal(fresh.project, null)
   assert.equal(fresh.capabilities, null)
-  assert.equal(fresh.compatibility.panelVersion, "0.2.0")
+  assert.equal(fresh.compatibility.panelVersion, "0.2.2")
   assert.equal(fresh.connected, false)
   await p.send("/unpair", {})
   assert.equal((await p.bridge.connections())[0].compatibility.panelVersion, null)
@@ -102,7 +102,7 @@ test("compatibility probes retain only authenticated versions, never authorize t
 test("compatibility pairing mismatch is code-authenticated, session-scoped, volatile and expires without credentials", async t => {
   let clock = Date.now()
   const p = await panelFixture(t, { now: () => clock, pairingTtlMs: 1000 })
-  const peer = { code: "invalid", panelId: "untrusted-panel", protocol: 2, version: "0.2.0" }
+  const peer = { code: "invalid", panelId: "untrusted-panel", protocol: 2, version: "0.2.2" }
   const rejected = await request(p.port, "/pair", peer)
   assert.equal(rejected.body.error.code, "invalid_pairing_code")
   assert.deepEqual(rejected.body.error.details, {})
@@ -110,7 +110,7 @@ test("compatibility pairing mismatch is code-authenticated, session-scoped, vola
   const before = await readFile(path.join(p.dataDir, "bridge-state.json"), "utf8")
   peer.code = p.bridge.pairingCode("other").code
   assert.equal((await request(p.port, "/pair", peer)).body.error.code, "incompatible_version")
-  assert.equal(p.bridge.compatibility("other").pendingPanels[0].panelVersion, "0.2.0")
+  assert.equal(p.bridge.compatibility("other").pendingPanels[0].panelVersion, "0.2.2")
   assert.deepEqual(p.bridge.compatibility("session").pendingPanels, [])
   assert.equal((await p.bridge.connections()).length, 1)
   assert.equal(await readFile(path.join(p.dataDir, "bridge-state.json"), "utf8"), before)
@@ -122,7 +122,7 @@ test("compatibility pairing mismatch is code-authenticated, session-scoped, vola
   assert.deepEqual(p.bridge.compatibility("other").pendingPanels, [])
   peer.code = p.bridge.pairingCode("other").code
   await request(p.port, "/pair", peer)
-  const paired = await request(p.port, "/pair", { ...peer, protocol: 1, version: "0.1.0" })
+  const paired = await request(p.port, "/pair", { ...peer, protocol: 1, version: "0.2.2" })
   assert.equal(paired.status, 200)
   assert.equal(paired.body.compatibility.status, "compatible")
   assert.deepEqual(p.bridge.compatibility("other").pendingPanels, [])
@@ -152,9 +152,9 @@ test("panel services authenticate, derive own session, recheck binding, and awai
   assert.equal((await p.send("/panel", { action: "renders", sessionID: "other" })).body.error.code, "invalid_payload")
   assert.equal((await p.send("/panel", { action: "checkpoint.pin", id: "x", pinned: "yes" })).body.error.code, "invalid_payload")
   const other = await request(p.port, "/pair", { code: p.bridge.pairingCode("other").code,
-    panelId: "second", protocol: 1, version: "0.1.0" })
+    panelId: "second", protocol: 1, version: "0.2.2" })
   const sendOther = (endpoint, body) => request(p.port, endpoint, body, { credential: other.body.credential })
-  await sendOther("/connect", { panelId: "second", protocol: 1, version: "0.1.0",
+  await sendOther("/connect", { panelId: "second", protocol: 1, version: "0.2.2",
     project: p.state.project, capabilities: p.state.capabilities, aeVersion: "26.0" })
   assert.equal((await sendOther("/panel", { action: "renders" })).body.error.code, "not_bound")
   await p.bridge.bind("other", other.body.connectionId)
@@ -342,8 +342,8 @@ test("manual restore forged finish and foreign replies cannot confirm a path tra
     const finish = { phase: "restore_finish", transaction, recoveryId: prepare.recoveryId,
       expected: saved.snapshot, path: original.path, verifiedCheckpoint: { id: "backup", hash: hash("bytes"), size: 1 } }
     const foreign = await request(p.port, "/pair", { code: p.bridge.pairingCode("foreign").code,
-      panelId: "foreign-panel", protocol: 1, version: "0.1.0" })
-    await request(p.port, "/connect", { panelId: "foreign-panel", protocol: 1, version: "0.1.0",
+      panelId: "foreign-panel", protocol: 1, version: "0.2.2" })
+    await request(p.port, "/connect", { panelId: "foreign-panel", protocol: 1, version: "0.2.2",
       project: original, capabilities: p.state.capabilities, aeVersion: "26.0" }, { credential: foreign.body.credential })
     const pending = p.bridge.call("session", "execute", finish, { allowLocked: true })
     const rejected = assert.rejects(pending, { code: "outcome_uncertain" })
@@ -435,10 +435,10 @@ test("native loopback authentication, schemas, pairing replay/expiry, rotation a
   assert.equal((await p.send("/heartbeat", {}, { raw: "{" })).body.error.code, "invalid_payload")
   assert.equal((await p.send("/heartbeat", { project: p.state.project, capabilities: {}, busy: false })).status, 400)
   const code = p.bridge.pairingCode("other").code
-  const pair = { code, protocol: 1, version: "0.1.0", panelId: "other-panel" }
+  const pair = { code, protocol: 1, version: "0.2.2", panelId: "other-panel" }
   const mismatch = await request(p.port, "/pair", { ...pair, protocol: 2 })
   assert.equal(mismatch.body.error.code, "incompatible_version")
-  assert.equal(mismatch.body.error.details.version, "0.1.0")
+  assert.equal(mismatch.body.error.details.version, "0.2.2")
   assert.equal((await request(p.port, "/pair", pair)).status, 200)
   assert.equal((await request(p.port, "/pair", pair)).body.error.code, "invalid_pairing_code")
   pair.code = p.bridge.pairingCode("expiry").code
@@ -473,7 +473,7 @@ test("native loopback authentication, schemas, pairing replay/expiry, rotation a
 
 test("discovery accepts validated active composition metadata and clears it across project and connection changes", async t => {
   const p = await panelFixture(t)
-  const connect = activeCompId => p.send("/connect", { protocol: 1, version: "0.1.0", panelId: "test-panel",
+  const connect = activeCompId => p.send("/connect", { protocol: 1, version: "0.2.2", panelId: "test-panel",
     project: p.state.project, aeVersion: "26.0-test", capabilities: p.state.capabilities, activeCompId })
   const heartbeat = activeCompId => p.send("/heartbeat", {
     project: p.state.project, capabilities: p.state.capabilities, busy: false, activeCompId,

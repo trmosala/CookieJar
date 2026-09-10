@@ -38,7 +38,7 @@ function fixture(...args) {
         if(action==="checkpoints")return {result:[{id:"checkpoint-1",createdAt:1000,pinned:false,storageMode:"project",size:123}]};
         if(action==="renders")return {result:[{id:"job-1",state:"running",path:"DO NOT DISPLAY"}]};
         if(action==="checkpoint.restore.propose")return {result:{token:"SECRET-RESTORE-TOKEN",sourceTimestamp:1000,destinationTimestamp:2000,operation}};
-        if(action==="diagnostics")return {result:{version:"0.1.0",events:[{code:"ready"}]}};
+        if(action==="diagnostics")return {result:{version:"0.2.2",events:[{code:"ready"}]}};
         if(action==="checkpoint.restore.confirm"){
             const recoveryCopy=!!options.fallback;
             const result={checkpointId:"checkpoint-1",currentCheckpointId:"backup-1",canonicalPath:project.path,
@@ -59,11 +59,12 @@ function fixture(...args) {
         store.profile=profile;return store;
     },Client:function(options){
         client=new transport.Client({...options,request});
-        client.descriptor={instanceId:"instance",port:12345,protocol:1,version:"0.1.0"};
+        client.descriptor={instanceId:"instance",port:12345,protocol:1,version:"0.2.2"};
         Object.assign(client.state,{connection:"connected",project,capabilities:{fileNetwork:true},binding:{id:"binding",sessionID:"session",state:"active",project},lock:null});
         client.start=()=>{client.running=true;};client.stop=()=>{client.running=false;};
         return client;
     }};
+    api.automaticStore=()=>new api.Store(undefined,"automatic-1");
     const document={hidden:false,getElementById:id=>elements[id],createElement:tag=>new Element(tag)};
     const window={__adobe_cep__:{
         getHostEnvironment(){return JSON.stringify(options.environment || {appId:"AEFT",appVersion:"25.3"});},
@@ -81,23 +82,33 @@ function fixture(...args) {
     if(!options.manual && elements["profile-form"]?.events.submit)select("primary");
     return {get client(){return client;},store,opened,select,e:elements,calls,blobs,revoked,intervals,events,document,click,set confirm(v){confirm=v;}};
 }
-test("profile selection is explicit, fixed until unload, and never auto-adopts another panel",()=>{
-    const first=fixture(restoreOperation,{manual:true}),second=fixture(restoreOperation,{manual:true});
-    assert.equal(first.client,undefined);assert.equal(first.e.connect.disabled,true);assert.deepEqual(first.opened,[]);
-    first.select("artist-a");second.select("artist-b");
-    assert.deepEqual(first.opened,["artist-a"]);assert.deepEqual(second.opened,["artist-b"]);
-    assert.match(first.e["profile-status"].textContent,/artist-a/);assert.equal(first.e.profile.disabled,true);
-    first.select("artist-b");assert.deepEqual(first.opened,["artist-a"]);
+test("panel opens automatically, retains uncertainty and closes its saved identity on unload",()=>{
+    const first=fixture(restoreOperation,{manual:true});
+    assert.ok(first.client);assert.deepEqual(first.opened,["automatic-1"]);
+    assert.equal(first.client.running,true);
+    first.select("artist-b");assert.deepEqual(first.opened,["automatic-1"]);
     first.events.unload();assert.equal(first.store.closed,true);
-    const reopened=fixture(restoreOperation,{manual:true});
-    assert.deepEqual(reopened.opened,[]);reopened.select("artist-a");assert.deepEqual(reopened.opened,["artist-a"]);
     const uncertain=fixture(restoreOperation,{uncertain:true});
     assert.equal(uncertain.client.running,false);assert.equal(uncertain.e.pair.disabled,true);
     assert.match(uncertain.e.status.textContent,/OUTCOME UNCERTAIN/);
-    const refused=fixture(restoreOperation,{manual:true,storeError:"panel_in_use"});
-    refused.select("artist-a");assert.equal(refused.client,undefined);assert.equal(refused.e.profile.disabled,false);
-    assert.match(refused.e.error.textContent,/panel_in_use/);assert.deepEqual(refused.opened,["artist-a"]);
+    const refused=fixture(restoreOperation,{manual:true,storeError:"unsafe_storage"});
+    assert.equal(refused.client,undefined);assert.match(refused.e.error.textContent,/unsafe_storage/);
 });
+test("recovery appears only when needed and distinguishes local review from chat recovery",()=>{
+    const f=fixture();
+    assert.equal(f.e["recovery-notice"].hidden,true);
+    assert.equal(f.e["connection-notice"].hidden,true);
+    f.client.state.uncertain=true;f.client.emit();
+    assert.equal(f.e["recovery-notice"].hidden,false);
+    assert.equal(f.e.reconcile.hidden,false);
+    assert.match(f.e["recovery-message"].textContent,/will not be repeated/);
+    f.client.state.uncertain=false;f.client.state.lock={state:"uncertain"};f.client.emit();
+    assert.equal(f.e.reconcile.hidden,true);
+    assert.match(f.e["recovery-message"].textContent,/in chat/);
+    f.client.state.lock=null;f.client.emit();
+    assert.equal(f.e["recovery-notice"].hidden,true);
+});
+
 test("profile bootstrap fails closed for missing markup, wrong host, and remote extension paths",()=>{
     for(const options of [{missingProfile:true},{environment:{appId:"PHXS",appVersion:"25.0"}},{extension:"file://remote/share/panel"},{extension:"\\\\remote\\share\\panel"},{extension:"C:\\safe\\..\\other"},{extension:"/safe/../other"}]){
         const f=fixture(restoreOperation,{...options,manual:true});
@@ -131,7 +142,7 @@ test("actual UI diagnostics prepare only backend metadata, revoke downloads, and
     const f=fixture();
     await f.click("diagnostics");
     assert.equal(f.calls.length,1);assert.deepEqual(f.calls[0].body,{action:"diagnostics"});
-    assert.deepEqual(JSON.parse(await f.blobs[0].text()),{version:"0.1.0",events:[{code:"ready"}]});
+    assert.deepEqual(JSON.parse(await f.blobs[0].text()),{version:"0.2.2",events:[{code:"ready"}]});
     assert.equal(f.e["diagnostics-download"].hidden,false);assert.equal(f.e["diagnostics-download"].href,"blob:metadata-1");
     f.e["services-auto"].checked=true;f.document.hidden=true;f.intervals[0]();
     assert.equal(f.calls.length,1);
@@ -191,21 +202,21 @@ test("UI never announces success or discloses unvalidated stale, foreign or malf
 });
 test("compatibility UI separates versions, exposes only configured HTTPS links and cleans stale links",()=>{
     const f=fixture();
-    assert.match(f.e.versions.textContent,/Panel 0.1.0 \/ Bridge Plugin unknown \/ CookieMonster Desktop not configured/);
+    assert.match(f.e.versions.textContent,/Panel 0.2.2 \/ Bridge Plugin unknown \/ CookieMonster Desktop not configured/);
     for(const key of ["plugin","panel","cookieMonster"]){
         assert.equal(f.e["update-"+key].hidden,true);
         assert.equal(f.e["update-"+key].href,undefined);
         assert.equal(f.e["update-"+key+"-status"].textContent,"not configured");
     }
-    const empty={status:"compatible",pluginVersion:"0.1.0",protocol:1,panelVersion:"0.1.0",panelProtocol:1,
+    const empty={status:"compatible",pluginVersion:"0.2.2",protocol:1,panelVersion:"0.2.2",panelProtocol:1,
         cookieMonsterVersion:null,cookieMonsterVersionStatus:"not_configured",releaseSourceUrl:"https://github.com/trmosala/CookieJar/releases",
         updates:Object.fromEntries(["plugin","panel","cookieMonster"].map(k=>[k,{status:"not_configured",version:null,protocol:null,url:null}]))};
     const configured=structuredClone(empty);
     configured.cookieMonsterVersion="2.4.1";configured.cookieMonsterVersionStatus="configured";
     for(const key of ["plugin","panel","cookieMonster"])
-        configured.updates[key]={status:"configured",version:key==="cookieMonster" ? "2.4.1" : "0.1.0",protocol:1,url:"https://releases.example.test/"+key};
+        configured.updates[key]={status:"configured",version:key==="cookieMonster" ? "2.4.1" : "0.2.2",protocol:1,url:"https://releases.example.test/"+key};
     f.client.state.compatibility=configured;f.client.emit();
-    assert.match(f.e.versions.textContent,/Bridge Plugin 0.1.0 \/ CookieMonster Desktop 2.4.1/);
+    assert.match(f.e.versions.textContent,/Bridge Plugin 0.2.2 \/ CookieMonster Desktop 2.4.1/);
     for(const key of ["plugin","panel","cookieMonster"]){
         assert.equal(f.e["update-"+key].href,configured.updates[key].url);
         assert.equal(f.e["update-"+key].hidden,false);

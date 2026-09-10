@@ -1,6 +1,6 @@
 "use strict";
 var fs = require("fs"), path = require("path"), os = require("os"), http = require("http"), crypto = require("crypto"), child = require("child_process");
-var VERSION = "0.1.0", PROTOCOL = 1, MAX = 4 * 1024 * 1024;
+var VERSION = "0.2.2", PROTOCOL = 1, MAX = 4 * 1024 * 1024;
 function error(code, message) { var e = new Error(message); e.code = code; return e; }
 function record(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
 function text(v, max) { return typeof v === "string" && v.length > 0 && v.length <= max; }
@@ -180,6 +180,37 @@ Store.prototype.descriptor = function () {
     if (!record(d) || Object.keys(d).sort().join(",") !== "instanceId,port,protocol,updateUrl,version" || !Number.isInteger(d.port) || d.port < 1 || d.port > 65535 || !text(d.instanceId,256) || !text(d.version,128) || !text(d.updateUrl,2048)) throw error("invalid_descriptor", "Invalid loopback descriptor");
     return d;
 };
+Store.prototype.automaticCode = function (descriptor) {
+    var value=readJSON(path.join(this.root,"automatic-connection.json"),8192);
+    if(!record(value) || value.instanceId!==descriptor.instanceId || !/^[A-Za-z0-9_-]{43}$/.test(value.code))
+        throw error("invalid_descriptor","Waiting for matching CookieMonster connection metadata");
+    return value.code;
+};
+function automaticStore(dataDir) {
+    var root=path.resolve(dataDir || process.env.CM_AE_DATA_DIR || path.join(os.homedir(),".cookiemonster-ae"));
+    var base=path.join(root,"panel-private"),names=[];
+    if(fs.existsSync(base)) {
+        var stat=fs.lstatSync(base);
+        if(!stat.isDirectory() || stat.isSymbolicLink())throw error("unsafe_storage","Invalid panel storage");
+        names=fs.readdirSync(base).filter(function(n){return /^profile-/.test(n);}).map(function(n){return n.slice(8);}).sort();
+        if(fs.existsSync(path.join(base,"credential.json")))names.unshift("legacy");
+    }
+    // Recover an interrupted identity first, otherwise resume the most recently used one.
+    var latched={},recent={};
+    names.forEach(function(name){
+        var file=path.join(name==="legacy" ? base : path.join(base,"profile-"+name),"credential.json");
+        try { latched[name]=panelState(file).uncertain ? 1 : 0;recent[name]=fs.statSync(file).mtimeMs; }
+        catch(e) { if(e.code!=="ENOENT")throw e;latched[name]=0;recent[name]=0; }
+    });
+    names.sort(function(a,b){return latched[b]-latched[a] || recent[b]-recent[a] || (a<b ? -1 : a>b ? 1 : 0);});
+    // Keep existing identities and latches. A live owner is the only reason to try another slot.
+    for(var i=0;i<names.length;i++) {
+        try { var store=new Store(root,names[i]);try { store.save();return store; }catch(e){store.close();throw e;} }
+        catch(e) { if(e.code!=="panel_in_use")throw e; }
+    }
+    var slot=1;while(names.indexOf("automatic-"+slot)>=0)slot++;
+    return new Store(root,"automatic-"+slot);
+}
 Store.prototype.close = function () {
     if (this.legacyLock && this.legacyToken) {
         try {
@@ -202,7 +233,7 @@ function request(descriptor, credential, endpoint, body, timeout) {
         function done(err, result) { if (finished) return; finished = true; clearTimeout(timer); if (err) reject(err); else resolve(result); }
         var req = http.request({hostname:"127.0.0.1", port:descriptor.port, path:endpoint, method:endpoint === "/poll" ? "GET" : "POST", headers:headers, agent:false}, function (res) {
             var chunks = [], size = 0;
-            res.on("data", function (chunk) { size += chunk.length; if (size > MAX) { req.destroy(); done(error("invalid_response", "Oversized bridge response")); } else chunks.push(chunk); });
+            res.on("data", function (chunk) { size += chunk.length; if (size > (endpoint==="/chat" ? 8*1024*1024 : MAX)) { req.destroy(); done(error("invalid_response", "Oversized bridge response")); } else chunks.push(chunk); });
             res.on("error", function () { done(error("disconnected", "Bridge response interrupted")); });
             res.on("end", function () {
                 try {
@@ -258,15 +289,34 @@ HostRPC.prototype.call = function (method, params, expectedProject) {
         } catch (e) { clearTimeout(timer); self.pending = false; self.uncertain = true; reject(error("outcome_uncertain", "evalScript dispatch failed; outcome unknown")); }
     });
 };
-function captureFile(result) {
+function captureFile(result, allowMissing) {
     if (!record(result) || !text(result.tempDir,32768) || !text(result.path,32768)) throw error("invalid_capture", "Capture must identify its temporary directory");
     var dir = path.resolve(result.tempDir), file = path.resolve(result.path);
     if (!/^cookiemonster-ae-[0-9]+-[0-9]+$/.test(path.basename(dir)) || path.dirname(dir) !== path.resolve(os.tmpdir()) || path.dirname(file) !== dir || !/^frame_.*\.png$/i.test(path.basename(file))) throw error("invalid_capture", "Capture path is outside integration-owned temporary storage");
-    if (fs.lstatSync(dir).isSymbolicLink() || fs.lstatSync(file).isSymbolicLink() || !fs.statSync(file).isFile()) throw error("invalid_capture", "Capture path must not be a link");
+    if (fs.lstatSync(dir).isSymbolicLink() || !fs.statSync(dir).isDirectory()) throw error("invalid_capture", "Capture directory must not be a link");
+    try {
+        if (fs.lstatSync(file).isSymbolicLink() || !fs.statSync(file).isFile()) throw error("invalid_capture", "Capture path must not be a link");
+    } catch(e) { if (!allowMissing || e.code!=="ENOENT") throw e; }
     return {dir:dir,file:file};
 }
+function completePNG(bytes) {
+    if(bytes.length<33 || bytes.slice(0,8).toString("hex")!=="89504e470d0a1a0a" || bytes.readUInt32BE(8)!==13 || bytes.toString("ascii",12,16)!=="IHDR")return false;
+    var offset=8, data=false;
+    while(offset+12<=bytes.length){
+        var size=bytes.readUInt32BE(offset),type=bytes.toString("ascii",offset+4,offset+8);
+        if(size>bytes.length-offset-12)return false;
+        offset+=size+12;
+        if(type==="IDAT" && size)data=true;
+        if(type==="IEND")return data && size===0 && offset===bytes.length;
+    }
+    return false;
+}
 function cleanupCapture(result) {
-    var owned = captureFile(result), entries = fs.readdirSync(owned.dir);
+    var owned = captureFile(result, result.pending===true), entries = fs.readdirSync(owned.dir);
+    if(result.pending===true){
+        if(!fs.existsSync(owned.file) || fs.statSync(owned.file).size>64*1024*1024 || !completePNG(fs.readFileSync(owned.file)))
+            throw error("capture_pending","Native capture may still be writing; destination preserved");
+    }
     entries.forEach(function (name) {
         var f = path.join(owned.dir,name);
         if (!/^frame_.*\.png$/i.test(name) || !fs.lstatSync(f).isFile() || fs.lstatSync(f).isSymbolicLink()) throw error("capture_cleanup_failed","Unexpected file in capture directory; preserved for manual inspection");
@@ -276,17 +326,31 @@ function cleanupCapture(result) {
 }
 function normalizeCapture(result, document, ImageType) {
     return new Promise(function (resolve,reject) {
-        var owned, image, timer;
+        var owned, image, timer, poll, finished=false, ready=result && result.pending!==true;
         function finish(err,value) {
-            clearTimeout(timer);
+            if(finished)return;finished=true;clearTimeout(timer);clearTimeout(poll);
             if (image) { image.onload = null; image.onerror = null; }
-            try { if (owned) cleanupCapture(result); } catch (e) { err = error("capture_cleanup_failed","Temporary capture cleanup failed"); }
+            try { if (owned && ready) cleanupCapture(result); } catch (e) { err = error("capture_cleanup_failed","Temporary capture cleanup failed"); }
             if (err) reject(err); else resolve(value);
         }
         try {
-            owned = captureFile(result);
-            if (fs.statSync(owned.file).size > 64*1024*1024) throw error("capture_too_large","Source PNG exceeds decode budget");
-            var bytes = fs.readFileSync(owned.file);
+            owned = captureFile(result,result.pending===true);
+            var maxWidth=result.maxWidth===undefined ? 2000 : result.maxWidth;
+            if(!Number.isInteger(maxWidth) || maxWidth<1 || maxWidth>2000)throw error("invalid_capture","maxWidth must be an integer from 1 to 2000");
+            if(result.alpha===undefined)result.alpha=true;
+            if(typeof result.alpha!=="boolean")throw error("invalid_capture","alpha must be boolean");
+            function readComplete() {
+                if(finished)return;
+                try {
+                    captureFile(result,result.pending===true);
+                    if(!fs.existsSync(owned.file)){poll=setTimeout(readComplete,100);return;}
+                    if(fs.statSync(owned.file).size>64*1024*1024)throw error("capture_too_large","Source PNG exceeds decode budget");
+                    var bytes=fs.readFileSync(owned.file);
+                    if(result.pending===true && !completePNG(bytes)){poll=setTimeout(readComplete,100);return;}
+                    ready=true;clearTimeout(timer);decode(bytes);
+                }catch(e){finish(e);}
+            }
+            function decode(bytes) {
             if (bytes.length < 24 || bytes.slice(0,8).toString("hex") !== "89504e470d0a1a0a") throw error("invalid_capture","Expected PNG signature");
             var w = bytes.readUInt32BE(16), h = bytes.readUInt32BE(20);
             if (!w || !h || w > 30000 || h > 30000 || w*h > 64000000) throw error("capture_too_large","PNG exceeds pixel decode budget");
@@ -294,7 +358,7 @@ function normalizeCapture(result, document, ImageType) {
             image.onerror = function () { finish(error("invalid_capture","PNG decode failed")); };
             image.onload = function () {
                 try {
-                    var scale = Math.min(1,2000/w,2000/h), canvas = document.createElement("canvas"), mime = result.alpha ? "image/png" : "image/jpeg", data, count=0;
+                    var scale = Math.min(1,maxWidth/w,2000/h), canvas = document.createElement("canvas"), mime = result.alpha ? "image/png" : "image/jpeg", data, count=0;
                     canvas.width = Math.max(1,Math.floor(w*scale)); canvas.height = Math.max(1,Math.floor(h*scale));
                     do {
                         var ctx = canvas.getContext("2d");
@@ -314,6 +378,9 @@ function normalizeCapture(result, document, ImageType) {
             };
             timer=setTimeout(function(){finish(error("invalid_capture","Image decode timed out"));},10000);
             image.src="data:image/png;base64,"+bytes.toString("base64");
+            }
+            timer=setTimeout(function(){finish(error("capture_timeout","Native PNG did not complete within 10 seconds; destination preserved; do not retry automatically"));},10000);
+            readComplete();
         } catch(e) { finish(e); }
     });
 }
@@ -474,7 +541,7 @@ Client.prototype.negotiate=function(endpoint,body){
             }
             self.state.connection="incompatible";
         } else {self.state.compatibility=null;if(self.state.connection!=="incompatible")self.state.connection="disconnected";}
-        self.state.binding=null;self.stop();self.emit();throw e;
+        self.state.binding=null;if(e.code!=="disconnected")self.stop();self.emit();throw e;
     });
 };
 Client.prototype.send=function(endpoint,body){return this.request(this.descriptor,this.store.state.credential,endpoint,body);};
@@ -571,6 +638,9 @@ Client.prototype.status=function(){
         if(!record(s) || !record(s.project) || !record(s.capabilities) || typeof s.capabilities.fileNetwork!=="boolean" || !text(s.aeVersion,128) ||
             !(s.activeCompId === null || (Number.isSafeInteger(s.activeCompId) && s.activeCompId>0)))throw error("invalid_host_result","Host status incomplete");
         self.state.project=s.project;self.state.activeCompId=s.activeCompId;self.state.capabilities=s.capabilities;self.state.aeVersion=s.aeVersion;
+        if(s.compositions!==undefined && (!Array.isArray(s.compositions) || s.compositions.length>2000 || s.compositions.some(function(c){return !record(c) || !Number.isSafeInteger(c.id) || c.id<1 || typeof c.name!=="string" || c.name.length>32768;})))
+            throw error("invalid_host_result","Invalid composition list");
+        self.state.compositions=s.compositions || [];
         if(s.uncertain) { self.mark(true); throw error("outcome_uncertain","Host requires recovery"); }
         self.emit();return s;
     });
@@ -586,7 +656,12 @@ Client.prototype.connect=function(){
     var self=this;
     if(self.recovering)return Promise.reject(error("host_busy","Credential recovery is outstanding"));
     if(self.state.uncertain)return Promise.reject(error("outcome_uncertain","Reconcile before connecting"));
-    if(!self.store.state.credential)return Promise.reject(error("invalid_pairing_code","Pair with a valid code before connecting"));
+    if(!self.store.state.credential) {
+        self.discover();
+        return self.negotiate("/pair",{code:self.store.automaticCode(self.descriptor),protocol:PROTOCOL,version:VERSION,panelId:self.store.state.panelId}).then(function(r){
+            self.acceptCredential(r);return self.connect();
+        });
+    }
     self.connectionGeneration++;
     var d=self.discover(),mismatch=d.protocol!==PROTOCOL || d.version!==VERSION;
     return Promise.resolve().then(function(){
@@ -612,7 +687,7 @@ Client.prototype.command=function(cmd){
     var self=this, reply, beatTimer, beat=Promise.resolve(), beatError, finished=false, dispatched=false;
     if(self.state.connection==="incompatible")return Promise.reject(error("incompatible_version","Host automation is stopped until versions match"));
     if(!record(cmd) || Object.keys(cmd).sort().join(",")!=="id,method,params,sessionID" || !text(cmd.id,256) || !text(cmd.sessionID,256) || !record(cmd.params) || ["inspect","preflight","save","execute","open","raw","capture","templates"].indexOf(cmd.method)<0) return Promise.reject(error("invalid_command","Malformed or unsupported command"));
-    var b=self.state.binding, writes=["save","execute","open","raw"].indexOf(cmd.method)>=0;
+    var b=self.state.binding, writes=["save","execute","open","raw","capture"].indexOf(cmd.method)>=0;
     function bound(){
         var current=self.state.binding;
         return current && current.id===b.id && current.state==="active" && current.sessionID===cmd.sessionID && current.project && current.project.id===self.state.project.id && current.project.path===self.state.project.path;
@@ -640,7 +715,7 @@ Client.prototype.command=function(cmd){
         finished=true;clearTimeout(beatTimer);return beat;
     }).then(function(){
         var code=reply.error && reply.error.code;
-        self.state.uncertain=!!beatError || self.host.uncertain || ["outcome_uncertain","uncertain_outcome","execution_failed","invalid_host_result","capture_cleanup_failed"].indexOf(code)>=0 || (dispatched && writes && code==="host_error");
+        self.state.uncertain=!!beatError || self.host.uncertain || ["outcome_uncertain","uncertain_outcome","execution_failed","invalid_host_result","capture_cleanup_failed","capture_timeout"].indexOf(code)>=0 || (dispatched && writes && code==="host_error");
         self.state.busy=self.state.uncertain;
         if(beatError)throw error("outcome_uncertain","Connection changed during host call; no retry");
         // Server must observe idle before it resolves reply and attempts unlock.
@@ -658,15 +733,17 @@ Client.prototype.command=function(cmd){
 };
 Client.prototype.tick=function(){
     var self=this;
-    if(self.inFlight || self.state.uncertain || self.state.connection==="incompatible" || !self.store.state.credential)return Promise.resolve();
+    if(self.inFlight || self.state.uncertain || self.state.connection==="incompatible")return Promise.resolve();
     self.inFlight=true;
     return Promise.resolve().then(function(){
         var d=self.store.descriptor();
         if(d.protocol!==PROTOCOL || d.version!==VERSION || !self.descriptor || d.instanceId!==self.descriptor.instanceId || d.port!==self.descriptor.port || self.state.connection!=="connected")return self.connect();
         return self.status();
     }).then(function(){return self.heartbeat();}).then(function(){return self.send("/poll");}).then(function(r){
+        self.state.lastError="";
         if(!record(r) || !Object.prototype.hasOwnProperty.call(r,"command"))throw error("invalid_response","Malformed poll");
-        if(r.command !== null)return self.command(r.command);
+        // A chat may bind between our heartbeat and poll. Refresh ownership before dispatch.
+        if(r.command !== null)return self.heartbeat().then(function(){return self.command(r.command);});
     }).catch(function(e){
         self.state.lastError=e.code || "panel_error";self.state.connection=self.state.connection==="incompatible" || e.code==="incompatible_version" || e.code==="incompatible" ? "incompatible" : "disconnected";self.state.binding=null;
         if(self.store.state.uncertain || self.host.uncertain){self.state.uncertain=true;self.state.busy=true;try{self.mark(true);}catch(ignore){}}
@@ -675,7 +752,7 @@ Client.prototype.tick=function(){
     }).then(function(){self.inFlight=false;});
 };
 Client.prototype.start=function(){
-    var self=this;if(self.running || self.state.connection==="incompatible" || !self.store.state.credential)return;self.running=true;
+    var self=this;if(self.running || self.state.connection==="incompatible")return;self.running=true;
     function loop(){if(!self.running)return;self.tick().then(function(){if(self.running)self.timer=setTimeout(loop,1000);});}loop();
 };
 Client.prototype.stop=function(){this.running=false;clearTimeout(this.timer);};
@@ -687,4 +764,4 @@ Client.prototype.reconcile=function(){
     self.host.uncertain=false;
     return self.host.call("reconcile",{}).then(function(){self.mark(false);self.state.busy=false;self.state.capture=null;self.state.binding=null;self.state.connection="paired";self.emit();self.start();},function(e){self.host.uncertain=true;throw e;});
 };
-module.exports={Store:Store,Client:Client,HostRPC:HostRPC,request:request,compatibilityMetadata:compatibilityMetadata,normalizeCapture:normalizeCapture,cleanupCapture:cleanupCapture,secure:secure,VERSION:VERSION,PROTOCOL:PROTOCOL};
+module.exports={Store:Store,automaticStore:automaticStore,Client:Client,HostRPC:HostRPC,request:request,requestId:function(){return crypto.randomBytes(20).toString("hex");},compatibilityMetadata:compatibilityMetadata,normalizeCapture:normalizeCapture,cleanupCapture:cleanupCapture,secure:secure,VERSION:VERSION,PROTOCOL:PROTOCOL};

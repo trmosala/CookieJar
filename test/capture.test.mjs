@@ -25,7 +25,7 @@ test("capture attachment validates actual PNG/JPEG headers, canonical base64, di
   assert.throws(() => imageAttachment({ ...jpg, data: jpeg.toString("base64") }, false), { code: "invalid_capture" })
 })
 
-test("capture adapter propagates the actual host safety refusal without touching the queue", async t => {
+test("capture adapter refuses missing native capability without touching the queue or retaining a lock", async t => {
   const p = await panelFixture(t), host = hostDouble(p.state.project.path)
   Object.assign(p.state, host.call("inspect").result)
   await p.heartbeat()
@@ -38,9 +38,8 @@ test("capture adapter propagates the actual host safety refusal without touching
     if (response.error) throw Object.assign(new Error(response.error.message), { code: response.error.code })
     return response.result
   })
-  assert.equal(host.call("confirmIdle").error.code, "unsafe_state")
   await assert.rejects(capture({ bridge: p.bridge, workflow }, "session", { compId: 1, time: 0 }, async () => {}),
-    error => error.code === "unsafe_state" && error.message.includes("preview/modal"))
+    error => error.code === "unsupported_capability")
   assert.equal(queueTouches, 0)
   assert.equal(p.log.filter(command => command.method === "capture").length, 1)
   assert.equal(p.bridge.binding("session").lock, null)
@@ -49,29 +48,41 @@ test("capture adapter propagates the actual host safety refusal without touching
 test("real bridge capture locks before dispatch, refuses stale approval, and retains ambiguous outcomes", async t => {
   const p = await panelFixture(t, { timeoutMs: 300 })
   p.state.items = [{ id: 1, kind: "comp", name: "Frame", duration: 2, frameRate: 25 }]
+  Object.assign(p.state, { revision: 1, projectEpoch: "capture-project", aeVersion: "26.0", fingerprint: "capture", nextCursor: null })
   const workflow = createWorkflow({ bridge: p.bridge, checkpoints: createCheckpoints({ dataDir: p.dataDir }), grants: createGrants() })
   let mode = "ok", dispatched = 0
   await p.start(async command => {
-    if (command.method !== "capture") return simulatedHost(command, p)
+    if (command.method !== "capture") {
+      if (command.method === "inspect") assert.deepEqual(command.params, { query: { compId: 1, depth: 0 } })
+      return simulatedHost(command, p)
+    }
     dispatched++
     assert.equal(p.bridge.binding("session", { allowLocked: true }).lock.state, "executing")
     if (mode === "timeout") return undefined
     if (mode === "bad") return { ...result(), width: 2 }
-    if (mode !== "ok") throw Object.assign(new Error("Safe capture unavailable: no qualified preview/modal signal"), { code: mode })
-    assert.deepEqual(command.params, { compId: 1, time: 0, alpha: true })
+    if (mode === "drift") { p.state.revision++; return result() }
+    if (mode !== "ok") throw Object.assign(new Error("Capture unavailable"), { code: mode })
+    assert.deepEqual(command.params, { compId: 1, time: 0, alpha: true, maxWidth: 2000,
+      expectedRevision: p.state.revision, expectedEpoch: p.state.projectEpoch,
+      expectedProject: { id: p.state.project.id, path: p.state.project.path } })
     return result()
   })
   const run = ask => capture({ bridge: p.bridge, workflow }, "session", { compId: 1, time: 0 }, ask)
   await assert.rejects(run(), { code: "permission_required" })
   await assert.rejects(run(async () => false), { code: "permission_denied" })
-  await assert.rejects(run(async () => { p.state.selection.push({ itemId: 1 }) }), { code: "stale_fingerprint" })
+  for (const maxWidth of [0, 2001, 1.5])
+    await assert.rejects(capture({ bridge: p.bridge, workflow }, "session", { compId: 1, time: 0, maxWidth }, async () => {}), { name: "ZodError" })
+  await assert.rejects(run(async () => { p.state.revision++ }), { code: "stale_fingerprint" })
+  await assert.rejects(run(async () => { p.state.projectEpoch = "reopened" }), { code: "stale_fingerprint" })
   assert.equal(dispatched, 0)
   const output = await run(async () => {})
   assert.equal(output.attachments[0].type, "file")
   assert.equal(p.bridge.binding("session").lock, null)
-  mode = "unsafe_state"
-  await assert.rejects(run(async () => {}), { code: "unsafe_state" })
-  assert.equal(p.bridge.binding("session").lock, null)
+  for (const code of ["unsafe_state", "busy", "unsupported_capability"]) {
+    mode = code
+    await assert.rejects(run(async () => {}), { code })
+    assert.equal(p.bridge.binding("session").lock, null)
+  }
   p.state.capabilities.fileNetwork = false
   await p.heartbeat()
   await assert.rejects(run(async () => {}), { code: "capability_missing" })
@@ -80,6 +91,10 @@ test("real bridge capture locks before dispatch, refuses stale approval, and ret
   mode = "bad"
   await assert.rejects(run(async () => {}), { code: "invalid_capture" })
   assert.ok(p.bridge.binding("session", { allowLocked: true }).lock)
+  await p.bridge.unlock("session")
+  mode = "drift"
+  await assert.rejects(run(async () => {}), { code: "stale_fingerprint" })
+  assert.equal(p.bridge.binding("session", { allowLocked: true }).lock.state, "uncertain")
   await p.bridge.unlock("session")
   mode = "timeout"
   await assert.rejects(run(async () => {}), { code: "outcome_uncertain" })

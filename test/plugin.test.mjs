@@ -18,11 +18,40 @@ const exec = promisify(execFile)
 const context = (ask = async () => {}, sessionID = "session") => ({ sessionID, ask, abort: new AbortController().signal })
 const permissionConfig = { permission: "ask" }
 
+test("first inspection automatically binds the single AE target without an approval prompt", async t => {
+  const { p, tools } = await fixture(t)
+  await p.bridge.release("session")
+  const result = JSON.parse(await tools.ae_inspect.execute({}, context(() => assert.fail("connection must not ask"), "automatic-chat")))
+  assert.ok(result.expectedRevision)
+  assert.equal(p.bridge.binding("automatic-chat").connectionId, p.connectionId)
+  await assert.rejects(tools.ae_inspect.execute({}, context(undefined, "other-chat")), { code: "binding_owned" })
+})
+
+async function pluginHost(command, p) {
+  if (command.method === "inspect") return {
+    ...structuredClone(p.state),
+    ...(command.params.query === undefined ? {} : { fingerprint: hash(p.state), nextCursor: null }),
+  }
+  if (command.method === "raw") {
+    assert.equal(command.params.expectedRevision, p.state.revision)
+    assert.deepEqual(command.params.expectedProject, { id: p.state.project.id, path: p.state.project.path })
+    p.state.revision++
+    return { value: command.params.source, revision: p.state.revision, project: structuredClone(p.state.project) }
+  }
+  return simulatedHost(command, p)
+}
+
+async function scriptArgs(tools, c = context()) {
+  const { expectedRevision } = JSON.parse(await tools.ae_inspect.execute({}, c))
+  return { source: 'return "Reviewed";\n', expectedRevision, label: "Reviewed script" }
+}
+
 async function fixture(t, options = {}) {
   let p, r, cleanup
   t.after(async () => {
-    await p?.stop()
-    try { await r?.close() } finally { await cleanup?.() }
+    try { await p?.stop() } finally {
+      try { await r?.close() } finally { await cleanup?.() }
+    }
   })
   p = await panelFixture({ after: callback => { cleanup = callback } })
   let clock = Date.now()
@@ -31,6 +60,9 @@ async function fixture(t, options = {}) {
     permissionConfig: options.permissionConfig || permissionConfig, now: () => clock,
     processAdapter: options.processAdapter, aerenderPath: options.aerenderPath })
   p.state.items = [{ id: 1, kind: "comp", name: "Main", duration: 2, frameRate: 25 }]
+  p.state.revision = 1
+  p.state.projectEpoch = "test-project-instance"
+  p.state.aeVersion = "26.0-test"
   await writeFile(p.state.project.path, JSON.stringify(p.state))
   await p.start(async command => {
     if (options.handler) {
@@ -43,7 +75,7 @@ async function fixture(t, options = {}) {
       p.state.project.path = command.params.path
       return { project: structuredClone(p.state.project) }
     }
-    return simulatedHost(command, p)
+    return pluginHost(command, p)
   })
   return { p, r, tools: createTools(r), advance(ms) { clock += ms } }
 }
@@ -85,15 +117,15 @@ async function retirementFixture(t) {
   return { ...f, adapter, job, jobDir }
 }
 
-test("object module export is import-safe and exposes all strict raw-shape tools", async () => {
+test("object module export is import-safe and exposes only the simplified strict tool surface", async () => {
   assert.equal(plugin.id, "cm-ae")
   assert.equal(plugin.server, server)
   const result = await exec(process.execPath, ["--input-type=module", "-e",
     "import net from 'node:net'; net.Server.prototype.listen=()=>{throw Error('listener at import')}; const m=await import('./src/plugin.mjs'); if(m.default.server!==m.server)throw Error('export');"])
   assert.equal(result.stderr, "")
   const tools = createTools({})
-  const names = ["pair","connections","bind","release","inspect","propose","execute","grant","capture","raw_enable","raw_propose",
-    "raw_execute","checkpoints","restore","templates","render_submit","render_status","render_cancel","render_retire","render_result","render_recover","render_list","diagnostics","reconcile"]
+  const names = ["pair","connections","bind","release","inspect","execute","grant","capture",
+    "checkpoints","restore","templates","render_submit","render_status","render_cancel","render_retire","render_result","render_recover","render_list","diagnostics","reconcile"]
   assert.deepEqual(Object.keys(tools).sort(), names.map(name => "ae_" + name).sort())
   assert.deepEqual(Object.keys(AE_PERMISSIONS).sort(), Object.keys(tools).sort())
   for (const name of names) {
@@ -110,20 +142,20 @@ test("compatibility chat discovery preserves legacy arrays and exposes mismatche
   const readOnly = context(() => assert.fail("discovery must not ask"))
   const list = JSON.parse(await tools.ae_connections.execute({}, readOnly))
   assert.ok(Array.isArray(list))
-  assert.equal(list[0].compatibility.panelVersion, "0.1.0")
+  assert.equal(list[0].compatibility.panelVersion, "0.2.2")
   const overview = JSON.parse(await tools.ae_connections.execute({ includeCompatibility: true }, readOnly))
   assert.equal(overview.compatibility.cookieMonsterVersionStatus, "not_configured")
   assert.equal(overview.compatibility.updates.cookieMonster.url, null)
   await assert.rejects(tools.ae_connections.execute({ updateUrl: "https://evil.test" }, readOnly), { name: "ZodError" })
-  await p.send("/compatibility", { panelId: "test-panel", version: "0.2.0-SECRET", protocol: 2 })
+  await p.send("/compatibility", { panelId: "test-panel", version: "0.2.2-SECRET", protocol: 2 })
   const mismatch = JSON.parse(await tools.ae_connections.execute({ includeCompatibility: true }, readOnly))
-  assert.equal(mismatch.connections[0].compatibility.panelVersion, "0.2.0-SECRET")
+  assert.equal(mismatch.connections[0].compatibility.panelVersion, "0.2.2-SECRET")
   assert.equal(mismatch.connections[0].compatibility.status, "incompatible")
   assert.equal(mismatch.connections[0].mutationEligible, false)
   await assert.rejects(tools.ae_bind.execute({ connectionId: p.connectionId }, readOnly), { code: "disconnected" })
   await assert.rejects(tools.ae_inspect.execute({}, readOnly), { code: "binding_suspended" })
   const diagnostic = JSON.parse(await tools.ae_diagnostics.execute({}, readOnly))
-  assert.equal(diagnostic.connections[0].compatibility.panelVersion, "0.2.0")
+  assert.equal(diagnostic.connections[0].compatibility.panelVersion, "0.2.2")
   assert.equal(diagnostic.connections[0].compatibility.status, "incompatible")
   assert.ok(!/SECRET|https:/.test(JSON.stringify(diagnostic)))
   assert.ok(!JSON.stringify(diagnostic).includes(p.state.project.path))
@@ -153,19 +185,19 @@ test("compatibility chat overview works before connection and removes pending re
   const pairing = JSON.parse(await tools.ae_pair.execute({}, readOnly))
   assert.equal(pairing.compatibility.cookieMonsterVersion, "2.4.1")
   const response = await request(descriptor.port, "/pair", { code: pairing.code, panelId: "peer-SECRET",
-    protocol: 2, version: "0.2.0-SECRET" })
+    protocol: 2, version: "0.2.2-SECRET" })
   assert.equal(response.body.error.code, "incompatible_version")
   const pending = await discovery(readOnly)
   assert.deepEqual(pending.connections, [])
-  assert.equal(pending.compatibility.pendingPanels[0].panelVersion, "0.2.0-SECRET")
+  assert.equal(pending.compatibility.pendingPanels[0].panelVersion, "0.2.2-SECRET")
   assert.deepEqual((await discovery(context(undefined, "other"))).compatibility.pendingPanels, [])
   const diagnostic = JSON.parse(await tools.ae_diagnostics.execute({}, readOnly))
-  assert.equal(diagnostic.compatibility.pendingPanels[0].panelVersion, "0.2.0")
+  assert.equal(diagnostic.compatibility.pendingPanels[0].panelVersion, "0.2.2")
   assert.ok(!/SECRET|https:/.test(JSON.stringify(diagnostic)))
   await instance.event({ event: { type: "session.deleted", properties: { info: { id: "session" } } } })
   assert.deepEqual((await discovery(readOnly)).compatibility.pendingPanels, [])
   assert.equal((await request(descriptor.port, "/pair", { code: pairing.code, panelId: "peer",
-    protocol: 1, version: "0.1.0" })).body.error.code, "invalid_pairing_code")
+    protocol: 1, version: "0.2.2" })).body.error.code, "invalid_pairing_code")
 })
 
 test("permission policy fails closed on global, wildcard, pattern and agent auto-allow", () => {
@@ -177,33 +209,64 @@ test("permission policy fails closed on global, wildcard, pattern and agent auto
   ]) assert.throws(() => checkPermissionConfig(config, null, { configure: true }), { code: "unsafe_permission_config" })
   checkPermissionConfig({ permission: { read: "allow", ae_execute: "ask" } }, "ae_execute")
   assert.throws(() => checkPermissionConfig(undefined, "ae_execute"), { code: "permission_policy_required" })
-  assert.throws(() => checkPermissionConfig({}, "ae_raw_enable"), { code: "permission_denied" })
-  checkPermissionConfig({ permission: { ae_raw_enable: "ask" } }, "ae_raw_enable")
+  assert.throws(() => checkPermissionConfig({}, "ae_execute"), { code: "permission_denied" })
+  checkPermissionConfig({ permission: AE_PERMISSIONS }, "ae_execute")
+  checkPermissionConfig({ permission: { ...AE_PERMISSIONS, ae_propose: "allow",
+    ae_raw_enable: "allow", ae_raw_propose: "allow", ae_raw_execute: "allow" } }, null, { configure: true })
 })
 
-test("real workflow adapters enforce one-time asks, context session, abort and stale binding/grant checks", async t => {
+test("script adapter enforces exact-source approval, denial, abort, binding and checkpoint checks", async t => {
   const { p, r, tools } = await fixture(t)
-  const propose = () => tools.ae_propose.execute({ actions: [{ type: "layer.create", name: "Reviewed" }] }, context()).then(JSON.parse)
-  let plan = await propose()
-  await assert.rejects(tools.ae_execute.execute({ token: plan.token }, { sessionID: "session" }), { code: "permission_required" })
-  plan = await propose()
+  let args = await scriptArgs(tools)
+  await assert.rejects(tools.ae_execute.execute(args, { sessionID: "session" }), { code: "permission_required" })
+  await assert.rejects(tools.ae_execute.execute(args, context(request => {
+    assert.equal(request.metadata.source, args.source)
+    return false
+  })), { code: "permission_denied" })
+  const denied = createTools({ ...r, permissionPolicy: name => checkPermissionConfig({
+    permission: { ...AE_PERMISSIONS, ae_execute: "deny" },
+  }, name) })
+  await assert.rejects(denied.ae_execute.execute(args, context(() => assert.fail("denied policy asked"))),
+    { code: "permission_denied" })
   const controller = new AbortController()
-  await assert.rejects(tools.ae_execute.execute({ token: plan.token }, {
+  await assert.rejects(tools.ae_execute.execute(args, {
     ...context(async request => {
       assert.equal(request.permission, "ae_execute"); assert.deepEqual(request.always, [])
-      assert.match(request.patterns[0], /Reviewed/); controller.abort()
+      assert.ok(request.patterns[0].endsWith(args.source)); controller.abort()
     }), abort: controller.signal,
   }), { code: "aborted" })
-  assert.equal(p.log.some(command => command.method === "execute"), false)
-  plan = await propose()
-  await assert.rejects(tools.ae_execute.execute({ token: plan.token }, context(async () => {
+  assert.equal(p.log.some(command => ["save", "raw", "execute"].includes(command.method)), false)
+  assert.deepEqual(await r.checkpoints.list(p.state.project.id), [])
+  await assert.rejects(tools.ae_execute.execute(args, context(async () => {
     await p.bridge.bind("session", p.connectionId)
-  })), error => ["aborted", "stale_binding", "invalid_token"].includes(error.code))
-  plan = await propose()
-  const result = JSON.parse(await tools.ae_execute.execute({ token: plan.token }, context()))
-  assert.equal(result.results.length, 1)
-  assert.ok((await r.checkpoints.verify(result.checkpointId)).verified)
-  await assert.rejects(tools.ae_execute.execute({ token: plan.token }, context()), { code: "invalid_token" })
+  })), error => ["aborted", "stale_binding", "stale_revision"].includes(error.code))
+  await assert.rejects(tools.ae_execute.execute(args, context(() => assert.fail("stale binding token asked"))),
+    { code: "stale_revision" })
+  args = await scriptArgs(tools)
+  let reviews = 0
+  const result = JSON.parse(await tools.ae_execute.execute(args, context(request => {
+    reviews++
+    assert.equal(request.permission, "ae_execute")
+    assert.deepEqual(request.always, [])
+    assert.ok(request.patterns[0].endsWith(args.source))
+    assert.equal(request.metadata.source, args.source)
+    assert.equal(request.metadata.expectedRevision, args.expectedRevision)
+    assert.equal(request.metadata.label, args.label)
+    assert.equal(request.metadata.nonTransactional, true)
+    assert.equal(p.log.some(command => ["save", "raw", "execute"].includes(command.method)), false)
+    request.metadata.source = "unapproved callback mutation"
+  })))
+  assert.equal(reviews, 1)
+  assert.equal(result.result, args.source)
+  const checkpoint = await r.checkpoints.verify(result.checkpointId)
+  assert.equal(checkpoint.verified, true)
+  assert.equal(checkpoint.pinned, true)
+  assert.equal(JSON.parse(await readFile(checkpoint.path, "utf8")).revision, 1)
+  assert.equal(p.log.filter(command => command.method === "raw").length, 1)
+  assert.equal(p.log.find(command => command.method === "raw").params.source, args.source)
+  assert.notEqual(result.expectedRevision, args.expectedRevision)
+  await assert.rejects(tools.ae_execute.execute(args, context(() => assert.fail("stale revision asked"))),
+    { code: "stale_revision" })
   await assert.rejects(tools.ae_grant.execute({ path: p.dataDir, write: true, recursive: true }, context(async () => {
     p.state.selection.push({ itemId: 1 })
   })), { code: "stale_fingerprint" })
@@ -560,7 +623,7 @@ test("detached renders remain discoverable only in their project and require one
   assert.equal(r.jobs.has("detached"), false)
   await p.connect()
   await tools.ae_bind.execute({ connectionId: p.connectionId, takeover: true }, context(undefined, "next"))
-  await p.start(command => simulatedHost(command, p))
+  await p.start(command => pluginHost(command, p))
   await tools.ae_render_result.execute({ jobId: "detached" }, context(review, "next"))
   assert.equal(r.jobs.get("detached").sessionID, "next")
   await tools.ae_release.execute({}, context(undefined, "next"))
@@ -696,12 +759,14 @@ test("chat discovery retains active composition and reports unsaved mutation eli
   await tools.ae_bind.execute({ connectionId: p.connectionId }, context(request => {
     assert.match(request.patterns[0], /inspection.only/i)
   }))
-  await p.start(command => simulatedHost(command, p))
+  await p.start(command => pluginHost(command, p))
   const inspected = JSON.parse(await tools.ae_inspect.execute({}, context()))
   assert.equal(inspected.project.saved, false)
   assert.equal((await list("session"))[0].mutationEligible, false)
-  await assert.rejects(tools.ae_propose.execute({ actions: [{ type: "layer.create", name: "No write" }] }, context()), { code: "unsaved_project" })
-  assert.equal(p.log.some(command => ["save", "execute", "preflight"].includes(command.method)), false)
+  await assert.rejects(tools.ae_execute.execute({
+    source: "return 1;", expectedRevision: inspected.expectedRevision, label: "No write",
+  }, context()), { code: "unsaved_project" })
+  assert.equal(p.log.some(command => ["save", "raw", "execute", "preflight"].includes(command.method)), false)
 })
 
 test("chat release works while suspended, retains recovery locks, and refuses a replacement binding during approval", async t => {
@@ -745,14 +810,56 @@ test("bind passes the reviewed project and owner through the bridge await bounda
   assert.throws(() => r.bridge.binding("session"), { code: "not_bound" })
 })
 
-test("propose accepts more than 1000 actions but retains the workflow JSON byte bound", async t => {
+test("inspect and execute validate strict query/script schemas and forward only context session", async () => {
+  const calls = []
+  const tools = createTools({ bridge: { async ensureBound(sessionID) { assert.ok(["query-session", "session"].includes(sessionID)) } }, workflow: {
+    async inspectQuery(sessionID, args) { calls.push({ sessionID, args }); return { expectedRevision: hash("revision") } },
+    async executeScript(sessionID, args, ask) { calls.push({ sessionID, args }); assert.equal(typeof ask, "function"); return { result: true } },
+  } })
+  const query = { compId: 1, layerId: 2, propertyPath: [
+    { index: 0, matchName: "ADBE Transform Group", name: "" },
+    { index: 100000, matchName: "ADBE Position" },
+  ], depth: 8, cursor: "next-page" }
+  await tools.ae_inspect.execute(query, context(undefined, "query-session"))
+  assert.deepEqual(calls.pop(), { sessionID: "query-session", args: query })
+  const args = await scriptArgs(tools)
+  args.source = "x".repeat(262144)
+  args.label = "x".repeat(128)
+  await tools.ae_execute.execute(args, context(undefined, "script-session"))
+  assert.deepEqual(calls.pop(), { sessionID: "script-session", args })
+  const beforeInvalid = calls.length
+  for (const invalid of [
+    { compId: 0 }, { layerId: 1.5 }, { depth: -1 }, { depth: 9 }, { depth: 1.5 }, { cursor: "" },
+    ...[{ index: -1, matchName: "x" }, { index: 100001, matchName: "x" },
+      { index: 0.5, matchName: "x" }, { index: 0, matchName: "" },
+      { index: 0, matchName: "x", extra: true }].map(part => ({ ...query, propertyPath: [part] })),
+  ]) await assert.rejects(tools.ae_inspect.execute(invalid, context()), { name: "ZodError" })
+  for (const invalid of [
+    { token: "old-proposal" }, { ...args, source: "" }, { ...args, source: "x".repeat(262145) },
+    { ...args, source: "return 1;\u0000" },
+    { ...args, expectedRevision: "forged" }, { ...args, expectedRevision: 1 },
+    { ...args, label: "" }, { ...args, label: "x".repeat(129) }, { ...args, actions: [] },
+    ...Array.from({ length: 32 }, (_, code) => ({ ...args, label: "Label" + String.fromCharCode(code) })),
+  ]) await assert.rejects(tools.ae_execute.execute(invalid, context()), { name: "ZodError" })
+  assert.equal(calls.length, beforeInvalid, "invalid input must be rejected before workflow dispatch")
+})
+
+test("query inspection forwards scope and stale native revisions prevent saves and scripts", async t => {
   const { tools, p } = await fixture(t)
-  const actions = Array.from({ length: 1001 }, () => ({ type: "property.set", value: 1 }))
-  const proposed = JSON.parse(await tools.ae_propose.execute({ actions }, context()))
-  assert.ok(proposed.token)
-  assert.ok(p.log.some(command => command.method === "preflight"))
-  await assert.rejects(tools.ae_propose.execute({ actions: [{ type: "property.set", value: "x".repeat(4 * 1024 * 1024) }] }, context()),
-    { code: "payload_too_large" })
+  const query = { compId: 1, layerId: 2, propertyPath: [{ index: 1, matchName: "ADBE Position" }], depth: 0 }
+  const inspected = JSON.parse(await tools.ae_inspect.execute(query, context(() => assert.fail("inspect asked"))))
+  assert.deepEqual(p.log.at(-1).params, { query })
+  assert.equal(inspected.revision, 1)
+  assert.equal(inspected.nextCursor, null)
+  assert.match(inspected.expectedRevision, /^[a-f0-9]{64}$/)
+  const args = { source: "return 1;", expectedRevision: inspected.expectedRevision, label: "Stale native edit" }
+  p.state.revision++
+  await assert.rejects(tools.ae_execute.execute(args, context(() => assert.fail("stale revision asked"))),
+    { code: "stale_revision" })
+  const fresh = await scriptArgs(tools)
+  await assert.rejects(tools.ae_execute.execute(fresh, context(() => { p.state.revision++ })),
+    { code: "stale_revision" })
+  assert.equal(p.log.some(command => ["save", "raw", "execute"].includes(command.method)), false)
 })
 
 test("initialization failure closes the real listener and releases ownership", async t => {
@@ -785,15 +892,15 @@ test("directory instances share one listener; disposal waits owned work, aborts 
 
 test("release and close abort pending permission callbacks without waiting for UI resolution", async t => {
   const { p, r, tools } = await fixture(t)
-  const plan = JSON.parse(await tools.ae_propose.execute({ actions: [{ type: "layer.create", name: "No write" }] }, context()))
+  const args = await scriptArgs(tools)
   let entered
   const ready = new Promise(resolve => { entered = resolve })
-  const pending = tools.ae_execute.execute({ token: plan.token }, context(() => { entered(); return new Promise(() => {}) }))
+  const pending = tools.ae_execute.execute(args, context(() => { entered(); return new Promise(() => {}) }))
   const rejected = assert.rejects(pending, { code: "aborted" })
   await ready
   await r.drain("session")
   await rejected
-  assert.equal(p.log.some(command => command.method === "execute"), false)
+  assert.equal(p.log.some(command => ["save", "raw", "execute"].includes(command.method)), false)
   assert.equal(r.diagnostics.export({ sessionID: "session" }).events.length, 0)
 })
 
@@ -803,11 +910,11 @@ test("abort during post-approval inspection stops workflow before any save or ex
   const { p, tools } = await fixture(t, { handler(command) {
     if (approved && command.method === "inspect") controller.abort()
   } })
-  const plan = JSON.parse(await tools.ae_propose.execute({ actions: [{ type: "layer.create", name: "No write" }] }, context()))
-  await assert.rejects(tools.ae_execute.execute({ token: plan.token }, {
+  const args = await scriptArgs(tools)
+  await assert.rejects(tools.ae_execute.execute(args, {
     ...context(() => { approved = true }), abort: controller.signal,
   }), { code: "aborted" })
-  assert.equal(p.log.some(command => ["save", "execute"].includes(command.method)), false)
+  assert.equal(p.log.some(command => ["save", "raw", "execute"].includes(command.method)), false)
 })
 
 test("drain waits a late bind and releases it before returning", async t => {

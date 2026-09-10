@@ -21,7 +21,7 @@
 - Obtain participant consent, project approval and metadata retention/deletion policy before collecting anything.
 - Certify all assigned environments and supply approved signed **non-production** CookieMonster and ZXP builds; record versions, hashes, trusted publisher and install/update/rollback channel.
 - Resolve release-blocking dependencies and confirm training, support escalation, recovery drill and clean removal instructions.
-- Select explicit raw-script exercises with visible source and Session-limited enablement; do not weaken default production policy for convenience.
+- For 0.2.0, select explicit script exercises with exact-source approval and verified checkpoints. The previous Session raw-enable gate is retired. Requalify script behavior and partial-failure recovery before pilot use.
 
 ## Privacy And Defects
 

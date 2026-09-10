@@ -120,6 +120,8 @@ async function startBridge({
   const statePath = path.join(dataDir, "bridge-state.json")
   const descriptorPath = path.join(dataDir, "descriptor.json")
   const instanceId = randomUUID()
+  const automaticCode = randomBytes(32).toString("base64url")
+  const automaticCredentials = new Map()
   let state = { credentials: [], locks: [] }
   try {
     const stat = await lstat(statePath)
@@ -183,12 +185,14 @@ async function startBridge({
   await persist()
   const live = new Map()
   const bindings = new Map()
+  const projectChangedBindings = new Set()
   const pairing = new Map()
   const releaseListeners = new Set()
   let attempts = []
   let closed = false
   let bindingChange = false
   let panelHandler = null
+  let chatHandler = null
   let closing = null
 
   function healthy() {
@@ -289,6 +293,25 @@ async function startBridge({
         lock: clone(targetLock(c.id, c.project) || null),
       }))
     },
+    async ensureBound(sessionID) {
+      await expire()
+      const existing = bindings.get(sessionID)
+      if (existing) {
+        const c = live.get(existing.connectionId)
+        if (projectChangedBindings.has(existing.id)) fail("binding_suspended", "Project changed; explicitly select the project again with ae_bind")
+        // Resume only the same project, never redirect a conversation after a project switch.
+        if (c?.connected && sameProject(existing.project, c.project) && !c.busy && !c.pending &&
+            !targetLock(c.id, c.project)) existing.state = "active"
+        return binding(sessionID)
+      }
+      const available = (await bridge.connections()).filter(c => c.connected)
+      if (!available.length) fail("disconnected", "Open the CookieMonster panel in After Effects; it connects automatically")
+      if (available.length !== 1) fail("target_ambiguous", "Multiple AE instances are connected; select one with ae_connections and ae_bind")
+      const c = available[0]
+      if (c.binding) fail("binding_owned", "Another conversation owns this AE instance; explicitly take control with ae_bind")
+      if (c.lock || c.busy) fail("target_locked", "Inspect and reconcile the AE target before continuing")
+      return bridge.bind(sessionID, c.id, { expectedProject: c.project, expectedOwner: null, expectedConnection: c.epoch })
+    },
     async bind(sessionID, connectionId, { takeover = false, expectedProject, expectedOwner, expectedConnection } = {}) {
       healthy()
       assertString(sessionID, "sessionID", 256)
@@ -339,6 +362,7 @@ async function startBridge({
       else if (c && targetLock(c.id, b.project)?.state === "executing")
         await uncertain(c, "Session released during a transaction")
       bindings.delete(sessionID)
+      if (b) projectChangedBindings.delete(b.id)
       for (const lock of state.locks) if (lock.sessionID === sessionID) delete lock.sessionID
       await persist()
       await notify(b)
@@ -397,6 +421,7 @@ async function startBridge({
       if (panelHandler) fail("handler_registered", "Panel handler is already registered")
       panelHandler = callback
     },
+    setChatHandler(callback) { chatHandler = callback },
     onRelease(callback) {
       releaseListeners.add(callback)
       return () => releaseListeners.delete(callback)
@@ -569,7 +594,7 @@ async function startBridge({
       fail("invalid_payload", "Content-Type must be application/json")
     const endpoint = req.url
     if ((endpoint === "/poll" ? "GET" : "POST") !== req.method) fail("invalid_method", "Wrong HTTP method")
-    if (!["/pair", "/connect", "/compatibility", "/heartbeat", "/poll", "/reply", "/disconnect", "/unpair", "/rotate", "/panel"].includes(endpoint))
+    if (!["/pair", "/connect", "/compatibility", "/heartbeat", "/poll", "/reply", "/disconnect", "/unpair", "/rotate", "/panel", "/chat"].includes(endpoint))
       fail("not_found", "Unknown endpoint")
     let credential
     if (endpoint !== "/pair") {
@@ -602,7 +627,8 @@ async function startBridge({
       assertString(body.code, "code", 64)
       assertString(body.panelId, "panelId", 256)
       const codeHash = digest(body.code)
-      const code = pairing.get(codeHash)
+      const automatic = codeHash === digest(automaticCode)
+      const code = automatic ? { expiresAt: Infinity } : pairing.get(codeHash)
       if (!code || code.expiresAt <= now()) fail("invalid_pairing_code", "Pairing code is invalid, used, or expired")
       // Bounded by the existing one-code-per-session TTL; never persisted or linked to a credential.
       code.peer = peerVersion(body)
@@ -611,6 +637,11 @@ async function startBridge({
       pairing.delete(codeHash)
       let record = state.credentials.find(c => c.panelId === body.panelId)
       if (record) {
+        if (automatic) {
+          const secret = automaticCredentials.get(body.panelId)
+          if (secret && record.hash === digest(secret)) return { credential: secret, connectionId: record.connectionId, ...info }
+          fail("already_paired", "Existing identity requires its saved credential or explicit credential recovery")
+        }
         const c = live.get(record.connectionId)
         if (c) await suspend(c, "Panel paired again; explicitly rebind")
       } else {
@@ -621,6 +652,7 @@ async function startBridge({
       const secret = randomBytes(32).toString("base64url")
       record.hash = digest(secret)
       await persist()
+      if (automatic) automaticCredentials.set(body.panelId, secret)
       return { credential: secret, connectionId: record.connectionId, ...info }
     }
     let c = live.get(credential.connectionId)
@@ -668,6 +700,25 @@ async function startBridge({
     if (now() - c.seen > heartbeatMs) {
       await suspend(c, "Heartbeat expired")
       fail("disconnected", "Heartbeat expired; reconnect and explicitly rebind")
+    }
+    if (endpoint === "/chat") {
+      schema(body, ["action", "project"], ["text", "requestId", "compId", "directory", "permissionId", "response", "takeover"])
+      if (!["state", "send", "new", "stop", "permission"].includes(body.action)) fail("invalid_payload", "Unknown chat action")
+      const expected = project(body.project), credentialHash = credential.hash
+      const check = () => {
+        if (live.get(c.id) !== c || !c.connected || credential.hash !== credentialHash || !sameProject(c.project, expected))
+          fail("stale_project", "Project or connection changed; message was not redirected")
+      }
+      check()
+      if (!chatHandler) fail("chat_unavailable", "Reload CookieMonster with the matching chat-enabled plugin")
+      const handler = chatHandler
+      return async () => {
+        check()
+        const result = await handler({ connectionId: c.id, panelId: c.panelId, project: clone(expected), body: clone(body), check })
+        check()
+        if (Buffer.byteLength(JSON.stringify(result)) > 8 * 1024 * 1024) fail("payload_too_large", "Chat response exceeds its display budget")
+        return { result }
+      }
     }
     if (endpoint === "/panel") {
       assertObject(body)
@@ -717,6 +768,7 @@ async function startBridge({
       const caps = capabilities(body.capabilities), activeCompId = activeComp(body.activeCompId)
       if (typeof body.busy !== "boolean") fail("invalid_payload", "busy must be boolean")
       if (!sameProject(p, c.project)) {
+        for (const b of bindings.values()) if (b.connectionId === c.id) projectChangedBindings.add(b.id)
         await suspend(c, "Project identity, path or saved state changed; explicitly rebind")
         c.connected = true
       }
@@ -899,6 +951,8 @@ async function startBridge({
   }, Math.max(10, Math.min(1000, heartbeatMs / 2)))
   sweeper.unref()
   try {
+    // Protected by the owner-only data directory; never exposed through HTTP or diagnostics.
+    await atomic(path.join(dataDir, "automatic-connection.json"), { instanceId, code: automaticCode })
     await atomic(descriptorPath, { port: server.address().port, instanceId, protocol: PROTOCOL, version: VERSION, updateUrl: UPDATE_URL })
   } catch (error) {
     await bridge.close()

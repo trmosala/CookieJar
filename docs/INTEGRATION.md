@@ -1,5 +1,13 @@
 # Desktop Integration Boundary
 
+**0.2.2 development update:** the current public editing tools are targeted `ae_inspect` and script-body `ae_execute`. `ae_propose` and all `ae_raw_*` tools are retired. Use the matching 0.2.2 panel and rebuild/reload the consumer. Current evidence and the local project configuration are described in [FIRST_TEST.md](FIRST_TEST.md). The September 9 packaged evidence below remains historical.
+
+The bridge publishes `automatic-connection.json` in its protected data directory alongside the non-secret discovery descriptor. The panel uses that runtime-scoped secret for initial authentication and then retains its own credential. No unauthenticated command endpoint is added. Inspect/capture automatically select the sole connected instance without taking another session's ownership. See [PRODUCT_GOAL.md](PRODUCT_GOAL.md) for the embedded-chat direction.
+
+
+The chat adapter uses the plugin's provided `input.client` and `input.directory`. The authenticated `/chat` endpoint never accepts arbitrary session IDs: it resolves the panel/project's saved CM session. Chat operations run outside the bridge transport transition queue so inspections and permissions can progress. User messages are admitted through `session.promptAsync`; replies are read from `session.messages`, and permission events are forwarded to the panel with once/reject replies through the SDK. The adapter does not implement a second agent loop. `chat-projects.json` stores only project/session associations and submission receipts; CM retains message history.
+
+
 [#1](https://github.com/trmosala/CookieJar/issues/1) is closed with sibling desktop integration under `CookieMonster/packages/desktop` and passing final refreshed Windows packaged smoke. The standalone plugin exports `{ id: "cm-ae", server }` and ships with `render-worker.mjs`. Packaged smoke evidence is recorded below, separately from standalone build/rebuild verification and live-host qualification.
 
 ## Desktop Wiring
@@ -38,14 +46,14 @@ Existing permission rules keep their order; global string policy is preserved. N
 
 ## Adapter Policy
 
-`AE_PERMISSIONS` covers pairing/connections, binding/release, inspection/proposals/execution, grants/capture, raw scripting, checkpoints/restore, templates, rendering/retirement and diagnostics/reconciliation.
+`AE_PERMISSIONS` covers pairing/connections, binding/release, inspection/script execution, grants/capture, checkpoints/restore, templates, rendering/retirement and diagnostics/reconciliation.
 
 - `ae_render_list`: `allow` for scoped read-only discovery; listing does not grant control of a recovered job or another project's jobs.
 - `ae_render_recover`: `ask` for explicit recovery/reclaim after release or restart.
 - `ae_render_retire`: `ask` for previewed inventory of proven terminal/quiescent owned artifacts. Published outputs and shared source checkpoints stay untouched; same-volume private claims are required.
 - `ae_templates`: `ask`, not read-only. Host discovery temporarily adds/removes a render-queue item, validates the saved bound project and takes an execution lock.
 - `ae_render_status` and `ae_render_result`: `allow`; recovery/control still needs its explicit authorization path.
-- Mutation/control tools: `ask`; `ae_raw_enable`, `ae_raw_propose`, `ae_raw_execute`: `deny` by default. Runtime Session enablement is separately required.
+- Mutation/control tools: `ask`. `ae_execute` reviews exact source with a current revision and checkpoint; the removed raw tools have no active defaults or Session gate.
 
 Restore/credential, render-retirement and desktop permission-override fixes have been re-reviewed with no remaining concrete findings in those scoped reviews. Rollback remains conditional on stopped/unchanged state; interruption preserves locks/backups. Retirement interruptions require manual recovery, never automatic plan replay; see [operations](OPERATIONS.md).
 
@@ -71,4 +79,4 @@ Local evidence was recorded at `%TEMP%\opencode\cj1-worker-K29UpD\evidence.json`
 
 ## Remaining Evidence
 
-Live AE/CEP behavior, macOS/network qualification and real approval/attachment/Session lifecycle operation remain unqualified. Desktop and CLI are unsigned. #16 requires approved signed installers/ZXP, an agreed exact OS/AE/CEP/storage matrix and actual manual qualification; #17 then requires a real cohort, named support owner, consent, pilot execution and sign-off. Approved internal update records/URLs remain `not_configured` (#15); a public source page is not an approved installer. Capture remains `unsafe_state` without a reliable preview/modal safety signal (#7).
+Full live AE/CEP behavior, macOS/network qualification and real approval/attachment/Session lifecycle operation remain unqualified. Desktop and CLI are unsigned. #16 requires approved signed installers/ZXP and exact environment qualification; #17 then requires a real pilot and sign-off. Approved internal update records/URLs remain `not_configured` (#15). Capture now uses an experimental undocumented API; preview/modal safety and live attachment qualification remain open (#7).

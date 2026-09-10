@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<ExtensionManifest Version="7.0" ExtensionBundleId="com.cookiemonster.ae" ExtensionBundleVersion="0.1.0" ExtensionBundleName="CookieMonster AE">
-  <ExtensionList><Extension Id="com.cookiemonster.ae.panel" Version="0.1.0"/></ExtensionList>
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.cookiemonster.ae" ExtensionBundleVersion="0.2.2" ExtensionBundleName="CookieMonster AE">
+  <ExtensionList><Extension Id="com.cookiemonster.ae.panel" Version="0.2.2"/></ExtensionList>
   <ExecutionEnvironment>
     <HostList><Host Name="AEFT" Version="[25.0,26.99]"/></HostList>
     <LocaleList><Locale Code="All"/></LocaleList>
