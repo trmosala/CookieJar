@@ -72,3 +72,14 @@ a { color:#b5c6df; overflow-wrap:anywhere; }
 ::-webkit-scrollbar { width:6px; height:6px; } ::-webkit-scrollbar-thumb { background:#3c3c3c; border-radius:5px; }
 @media(max-width:380px) { main { padding:0 10px; } .host-label { display:none; } #chat-progress { flex-basis:35%; } }
 @media(max-height:450px) { header { padding:6px 0; } .chat { padding-top:6px; } #chat-input { min-height:40px; height:40px; } #chat-target { margin:3px 0; } }
+
+#chat-attachments { display:flex; gap:6px; flex-wrap:wrap; }
+.chat-reference { display:flex; align-items:center; gap:6px; padding:5px; border:1px solid #303030; border-radius:6px; max-width:100%; }
+.chat-reference span { overflow-wrap:anywhere; }
+.chat-reference img { width:40px; height:40px; object-fit:contain; }
+.attachment-help { font-size:11px; color:#999; margin:4px 0; }
+.chat-model-controls { display:flex; gap:8px; margin-bottom:4px; }
+.chat-model-controls label { display:flex; flex-direction:column; gap:3px; min-width:0; color:var(--text-muted, #999); font-size:11px; }
+.chat-model-controls label:first-child { flex:1; }
+.chat-model-controls select { max-width:100%; margin:0; }
+#chat-model-status { margin:4px 0; color:var(--text-muted, #999); font-size:11px; }

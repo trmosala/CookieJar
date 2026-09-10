@@ -8,8 +8,12 @@ async function fixture(t) {
   await p.bridge.release("session")
   const calls = [], statuses = {}, messages = [], inputs = []
   let counter = 0, admitted
+  const selections = {}, catalog = { all: [{ id: "test", name: "Test", models: { sol: { id: "sol", name: "Sol", variants: { high: {}, low: {} } }, fast: { id: "fast", name: "Fast" } } }], connected: ["test"] }
   const client = {
+    provider: { async list() { return { data: catalog } } },
+    _client: { async post(options) { calls.push(["model", options]); selections[options.path.sessionID] = options.body.model; return {} } },
     session: {
+      async get(options) { return { data: { model: selections[options.path.id] } } },
       async create(options) { calls.push(["create", options]); return { data: { id: "ses_chat" + (++counter) } } },
       async status() { return { data: statuses } },
       async messages() { return { data: messages } },
@@ -30,9 +34,47 @@ async function fixture(t) {
     if (response.status !== 200) throw Object.assign(new Error(response.body.error.message), response.body.error)
     return response.body.result
   }
-  return { p, chat, runtime, client, calls, inputs, messages, statuses, send, set admitted(fn) { admitted = fn } }
+  return { p, chat, runtime, client, catalog, selections, calls, inputs, messages, statuses, send, set admitted(fn) { admitted = fn } }
 }
 const message = (extra = {}) => ({ action: "send", text: "Make this title blue", compId: 1, requestId: "a".repeat(40), ...extra })
+
+test("model selection uses CM session configuration, survives reopening and reaches prompts", async t => {
+  const f = await fixture(t)
+  assert.equal((await f.send({ action: "models" })).models.length, 2)
+  const model = { providerID: "test", id: "sol", variant: "high" }
+  assert.deepEqual((await f.send({ action: "model", model })).model, model)
+  const state = await f.send()
+  assert.deepEqual(state.model, model)
+  const reopened = await createChat(f.runtime)
+  reopened.register({ client: f.client, directory: f.p.dataDir })
+  f.p.bridge.setChatHandler(reopened.handle)
+  assert.deepEqual((await f.send()).model, model)
+  await f.send(message())
+  assert.deepEqual(f.inputs[0].body.model, { providerID: "test", modelID: "sol" })
+  assert.equal(f.inputs[0].body.variant, "high")
+  assert.equal(f.calls.find(c => c[0] === "model")[1].url, "/api/session/{sessionID}/model")
+})
+
+test("unavailable and busy model changes are rejected without modifying the selection", async t => {
+  const f = await fixture(t), model = { providerID: "test", id: "sol", variant: "high" }
+  await assert.rejects(f.send({ action: "model", model: { ...model, variant: "ultra" } }), { code: "reasoning_unavailable" })
+  assert.equal(f.calls.length, 0)
+  await f.send({ action: "model", model })
+  const state = await f.send()
+  f.statuses[state.sessionID] = { type: "busy" }
+  await assert.rejects(f.send({ action: "model", model: { ...model, variant: "low" } }), { code: "chat_busy" })
+  f.statuses[state.sessionID] = { type: "idle" }
+  f.catalog.connected = []
+  assert.deepEqual((await f.send({ action: "models" })).models, [])
+  await assert.rejects(f.send(message()), { code: "model_unavailable" })
+  assert.equal(f.inputs.length, 0)
+  assert.deepEqual((await f.send()).model, model)
+  f.catalog.connected = ["test"]
+  delete f.catalog.all[0].models.sol.variants.high
+  await assert.rejects(f.send(message()), { code: "reasoning_unavailable" })
+  await f.send({ action: "model", model: { providerID: "test", id: "fast" } })
+  assert.equal((await f.send()).model.variant, "default")
+})
 
 test("panel chat uses CM sessions, fixes the message target, avoids duplicate admission and restores project history", async t => {
   const f = await fixture(t)
@@ -128,4 +170,28 @@ test("oversized approval cannot be accepted from an incomplete panel preview", a
   assert.equal((await f.send()).permissions[0].reviewable, false)
   await assert.rejects(f.send({ action: "permission", permissionId: "large", response: "once" }), { code: "approval_too_large" })
   await f.send({ action: "permission", permissionId: "large", response: "reject" })
+})
+
+
+test("references arrive as CM file parts and are included in delivery identity", async t => {
+  const f = await fixture(t)
+  const attachments = [{filename:"brief.txt", mime:"text/plain", url:"data:text/plain;base64,SGVsbG8="}]
+  await f.send(message({attachments}))
+  assert.deepEqual(f.inputs[0].body.parts[1], {type:"file", ...attachments[0]})
+  await f.send(message({attachments}))
+  assert.equal(f.inputs.length, 1)
+  await assert.rejects(f.send(message({attachments:[{...attachments[0],filename:"other.txt"}]})), {code:"invalid_payload"})
+  await assert.rejects(f.send(message()), {code:"invalid_payload"})
+})
+
+test("invalid references are rejected before creating or submitting a conversation", async t => {
+  const f = await fixture(t)
+  const file = {filename:"brief.txt", mime:"text/plain", url:"data:text/plain;base64,SGVsbG8="}
+  for (const attachments of [{}, Array(5).fill(file), [{...file,mime:"text/html"}], [{...file,url:"file:///private"}],
+    [{...file,filename:"../brief.txt"}], [{...file,url:"data:text/plain;base64,????"}]]) {
+    await assert.rejects(f.send(message({attachments})), {code:"invalid_payload"})
+  }
+  const large={...file,url:"data:text/plain;base64,"+Buffer.alloc(1100000).toString("base64")}
+  await assert.rejects(f.send(message({attachments:[large,large]})), {code:"payload_too_large"})
+  assert.equal(f.calls.length,0)
 })

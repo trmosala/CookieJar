@@ -242,7 +242,7 @@ function request(descriptor, credential, endpoint, body, timeout) {
                     if (!record(value)) throw error("invalid_response", "Expected response object");
                     if (res.statusCode !== 200 || value.error) {
                         var code = value.error && value.error.code;
-                        var rejected=error(typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? code : "bridge_error", "Bridge rejected request");
+                        var rejected=error(typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? code : "bridge_error", endpoint==="/chat" && typeof value.error.message==="string" ? value.error.message.slice(0,8192) : "Bridge rejected request");
                         if(["/pair","/connect","/compatibility"].indexOf(endpoint)>=0 && ["incompatible","incompatible_version"].indexOf(code)>=0 &&
                             record(value.error.details) && Object.prototype.hasOwnProperty.call(value.error.details,"compatibility"))
                             rejected.details={compatibility:compatibilityMetadata(value.error.details.compatibility)};
@@ -264,7 +264,14 @@ HostRPC.prototype.call = function (method, params, expectedProject) {
     self.pending = true;
     return new Promise(function (resolve, reject) {
         var expired = false, finished = false;
-        var timer = setTimeout(function () { expired = true; self.uncertain = true; reject(error("outcome_uncertain", "evalScript timed out; it was not cancelled and must not be retried")); }, self.timeout);
+        var timer = setTimeout(function () {
+            expired = true;
+            // AE modal dialogs defer status callbacks. Keep the request pending until
+            // its callback returns, without treating this read as an uncertain edit.
+            if(method==="status") { reject(error("host_busy", "Close the AE dialog to reconnect")); return; }
+            self.uncertain = true;
+            reject(error("outcome_uncertain", "evalScript timed out; it was not cancelled and must not be retried"));
+        }, self.timeout);
         var envelope={method:method,params:params};
         if(expectedProject)envelope.expectedProject=expectedProject;
         var payload = JSON.stringify(JSON.stringify(envelope)).replace(/\u2028/g,"\\u2028").replace(/\u2029/g,"\\u2029");
@@ -733,7 +740,7 @@ Client.prototype.command=function(cmd){
 };
 Client.prototype.tick=function(){
     var self=this;
-    if(self.inFlight || self.state.uncertain || self.state.connection==="incompatible")return Promise.resolve();
+    if(self.inFlight || self.host.pending || self.state.uncertain || self.state.connection==="incompatible")return Promise.resolve();
     self.inFlight=true;
     return Promise.resolve().then(function(){
         var d=self.store.descriptor();

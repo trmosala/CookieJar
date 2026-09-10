@@ -153,3 +153,30 @@ Two final startup/presentation fixes were built and installed: automatic selecti
 Final restart check passed: AE reopened the saved project and automatically restored the same conversation, pinned comp 14, and captured image without pairing or profile selection. The composer showed Ready with no stale error.
 
 UI simplification: matched CookieMonster/OpenCode's neutral dark styling, made chat fill the dock with a fixed composer, moved technical controls into a troubleshooting drawer, and added conditional recovery guidance. All 11 panel UI tests passed, including local/durable recovery transitions. The installed panel was visually checked in AE with the restored conversation and settings drawer. Build hashes verified.
+
+## Reference attachments (issue #18)
+
+The AE composer accepts PNG, JPEG, WebP, PDF, TXT and Markdown references through Attach, file drop, or clipboard image paste. Up to four non-empty files may be attached, with a combined 2 MiB limit. Add a prompt, check the thumbnails/filenames, and remove unwanted references before sending. Draft references are held in memory and cleared when the AE project changes or the message is accepted.
+
+References use CookieMonster's normal file message parts and selected model. Text briefs become model context through CM's existing text-file handling. CM's provider capability handling reports when a model cannot read images or PDFs. This feature does not generate images or import assets into AE.
+
+The request fixes its composition ID on Send. Attachment content participates in the durable delivery identity. An uncertain send retains the draft and blocks another submission; inspect the conversation in CM before starting a new chat. Opening a native file dialog may temporarily defer AE status reads; closing it reconnects automatically, without marking a read-only timeout as an uncertain edit. Edit/render recovery protections remain unchanged.
+
+Validation: automated coverage includes file-part delivery, duplicate identity, invalid/oversized data, browse/drop/paste, removal, project changes during reads, uncertain delivery, and delayed modal status callbacks. Live Windows AE 26.3 testing verified the file picker, preview/removal, automatic reconnect after a prolonged picker, and admission of an image-plus-prompt message through the installed panel.
+
+Live model result: CM_GPT-5.6 Sol - High correctly described the attached white “Live from After Effects” text and its placement after a bounded comp-14 inspection; comp 1 remained active. A tools-disabled prompt exposed the CM/WPP `o1_code_required_tool_not_called` provider error, which was surfaced in AE. The normal inspection-plus-reference workflow completed with idle status and no error. The full suite passed 309 tests before the modal fix; 44 focused panel/transport tests passed after it, followed by the final four composer/dialog tests and 40-script syntax check. Native clipboard paste and drag/drop have automated coverage but were not separately exercised with OS input.
+
+
+## Model and reasoning selection (issue #19)
+
+Choose a Model above the composer, then a Reasoning level when the provider supports separate variants. Changes save to the existing CM session, and reopening the panel restores them. CM/WPP presets such as “CM_GPT-5.6 Sol - High” already include reasoning in the model name; their separate reasoning control shows Model default. No additional login or provider setup is required in AE.
+
+The catalog refreshes every 15 seconds. Disconnected CM, no connected models, unavailable saved models, unsupported reasoning and failed saves have explicit states. Model controls are disabled while a reply or save is pending and while message delivery is uncertain. Before submitting a message, the backend rechecks the selected model and its reasoning against CM's current catalog.
+
+Validation: 312 full-suite tests passed, followed by six composer tests after the final dropdown refresh adjustment. The build verified 12 artifact hashes and syntax checks passed for 40 scripts. Live testing loaded 39 configured models, saved both a WPP preset and GPT-5.6 Sol / High in CM, rejected an unsupported reasoning level, and restored the saved preset after restarting AE. Native UI inspection confirmed the controls disable during a live reply. The legacy plugin SDK does not expose the session model endpoint; the plugin reuses its authenticated transport for CM's existing `/api/session/{sessionID}/model` endpoint and verifies the resulting session selection.
+
+The end-to-end smoke prompt completed on CM_GPT-5.6 Sol - Low: one bounded `ae_inspect` call returned comp 14 as “Codex Live Bridge Test”, with idle status and no error. The original High preset was restored after testing.
+
+Final native check: keyboard selection in the installed AE model picker changed High to Low, and CM state confirmed the new preset. High was restored afterward. A delayed state-poll regression test verifies that an old response cannot overwrite a newer confirmed selection.
+
+Final complete suite: 315 tests passed with zero failures after the stale-poll fix. The final installed panel reconnected to the saved project and retained its CM model selection.
