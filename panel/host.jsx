@@ -841,9 +841,86 @@ var CookieMonsterAE = (function () {
         str(value.id,"transaction id");str(value.sessionID,"session");str(value.bindingID,"binding");
         return stringify(value);
     }
+    var RESTORE_PROOF = "compact-restore-v1";
+    function restoreGuard() {
+        ready(false);requireFiles();
+        var nativeProject=app.project, identity=project(), epoch=projectEpoch, revision, dirty, callback;
+        try { revision=nativeProject.revision;dirty=nativeProject.dirty;callback=app.onError; }
+        catch(e){fail("restore_unsupported","Native restore guards are unavailable");}
+        if(typeof revision!=="number" || !isFinite(revision) || revision<1 || revision>9007199254740991 || Math.floor(revision)!==revision ||
+            typeof dirty!=="boolean" || !(callback === undefined || callback === null || typeof callback==="string"))
+            fail("restore_unsupported","Native revision, dirty and callback checks must be supported");
+        if(!identity.saved || nativeProject.renderQueue.rendering!==false || !(callback === undefined || callback === null || callback===""))
+            fail("unsafe_state","Restore requires a saved idle project without an error callback");
+        if(!isValid(nativeProject) || app.project!==nativeProject || stringify(project())!==stringify(identity) ||
+            projectEpoch!==epoch || nativeProject.revision!==revision || nativeProject.dirty!==dirty ||
+            app.onError!==callback || nativeProject.renderQueue.rendering!==false || !capability().fileNetwork)
+            fail("unsafe_state","Native project changed during compact guard read");
+        return {protocol:RESTORE_PROOF,project:identity,projectEpoch:epoch,revision:revision,dirty:dirty,
+            busy:false,callbacksClear:true,capabilities:capability()};
+    }
+    function manualRestore(p) {
+        var preparing=p.phase==="restore_prepare", fields="phase transaction recoveryId expected path";
+        object(p,preparing ? fields : fields+" verifiedCheckpoint",preparing ? fields : fields+" verifiedCheckpoint");
+        if(!p.expected || p.expected.protocol!==RESTORE_PROOF)fail("restore_unsupported","Matching compact restore receipt required");
+        ready(true);requireFiles();str(p.recoveryId,"restore id");
+        var identity=owner(p.transaction), rec=recovery, approved=restoreGuard();
+        if(stringify(p.expected)!==stringify(approved))fail("unsafe_state","Approved compact restore guard changed");
+        if(preparing){
+            if(rec || transaction)fail("unsafe_state","Another transaction requires recovery");
+            str(p.path,"emergency path");
+            var slash=String.fromCharCode(92),local=p.path.split(slash).join("/");
+            if((local.charAt(0)!=="/" && (!/^[A-Za-z]:/.test(local) || local.charAt(2)!=="/")) ||
+                local.substr(0,2)==="//" || !/[.]aepx?$/i.test(local))fail("invalid_path","Absolute local recovery project required");
+            var file=new File(p.path);
+            if(file.exists)fail("unsafe_state","Emergency destination already exists");
+            rec={id:p.recoveryId,owner:identity,projectObject:app.project,project:approved.project,
+                receipt:approved,phase:"saving",manual:true};
+            recovery=rec;plan=null;
+            try {
+                if(stringify(restoreGuard())!==stringify(approved))fail("unsafe_state","State changed before Save As");
+                rec.projectObject.save(file);
+                if(!isValid(rec.projectObject) || app.project!==rec.projectObject)fail("unsafe_state","Save As replaced the native project");
+                var saved=restoreGuard();
+                // A save-only increment and a serialized edit are indistinguishable.
+                // Refuse every revision change before permitting publication or close.
+                if(saved.project.path!==file.fsName || saved.projectEpoch!==approved.projectEpoch || saved.dirty!==false ||
+                    saved.revision!==approved.revision)
+                    fail("unsafe_state","Save As did not preserve native ownership and revision");
+                rec.receipt=saved;rec.phase="saved";
+                return {status:"recovery_saved",project:saved.project,receipt:saved};
+            }catch(e){uncertain=true;fail("uncertain_outcome","Emergency save was not confirmed; do not close or retry");}
+        }
+        if(!rec || !rec.manual || rec.phase!=="saved" || rec.id!==p.recoveryId || rec.owner!==identity ||
+            !isValid(rec.projectObject) || app.project!==rec.projectObject || stringify(rec.receipt)!==stringify(approved))
+            fail("unsafe_state","No matching single-use compact restore preparation");
+        object(p.verifiedCheckpoint,"id hash size","id hash size");str(p.verifiedCheckpoint.id,"checkpoint");
+        if(!/^[a-f0-9]{64}$/.test(p.verifiedCheckpoint.hash))fail("invalid_payload","Verified emergency hash required");
+        num(p.verifiedCheckpoint.size,1,5*1024*1024*1024,true);
+        var canonicalFile=pathFile(p.path);
+        if(!/[.]aepx?$/i.test(canonicalFile.fsName))fail("invalid_path","Expected a verified AE project");
+        if(approved.dirty!==false || stringify(restoreGuard())!==stringify(rec.receipt) ||
+            !isValid(rec.projectObject) || app.project!==rec.projectObject)
+            fail("unsafe_state","Current state changed before close");
+        rec.phase="closing";
+        try {
+            if(!rec.projectObject.close(CloseOptions.DO_NOT_SAVE_CHANGES))fail("unsafe_state","Project close was refused");
+            var opened=app.open(canonicalFile);
+            if(!opened || !isValid(opened) || app.project!==opened ||
+                (isValid(rec.projectObject) && opened===rec.projectObject))
+                fail("unsafe_state","Open did not return the actual new native project");
+            var restored=restoreGuard();
+            if(restored.project.path!==canonicalFile.fsName || restored.dirty!==false ||
+                restored.projectEpoch===rec.receipt.projectEpoch)
+                fail("unsafe_state","Reopened identity, epoch or clean state did not confirm");
+            recovery=null;transaction=null;
+            return {status:"recovered",project:restored.project,receipt:restored};
+        }catch(e){uncertain=true;fail("uncertain_outcome","Recovery close/open was not confirmed; retain backups without retry");}
+    }
     function executePhase(p) {
         str(p.phase,"phase");
         if(uncertain)fail("uncertain_outcome","Unknown host outcome cannot authorize recovery");
+        if(p.phase==="restore_prepare" || p.phase==="restore_finish")return manualRestore(p);
         if(p.phase==="begin"){
             object(p,"phase transaction actions","phase transaction actions");
             var identity=owner(p.transaction);
@@ -860,20 +937,10 @@ var CookieMonsterAE = (function () {
             if(result.status==="complete")transaction=null;
             return result;
         }
-        if(p.phase==="restore_prepare"){
-            object(p,"phase transaction recoveryId expected path","phase transaction recoveryId expected path");
-            ready(true);
-            if(recovery || transaction)fail("unsafe_state","Another transaction requires recovery");
-            str(p.recoveryId,"restore id");
-            var approved=inspect();
-            if(stringify(p.expected)!==stringify(approved))fail("unsafe_state","Approved restore snapshot changed");
-            recovery={id:p.recoveryId,owner:owner(p.transaction),projectObject:app.project,project:project(),snapshot:stringify(approved),phase:"stopped",manual:true};
-            plan=null;
-        }
-        var preparing=p.phase==="recovery_prepare" || p.phase==="restore_prepare";
-        object(p,preparing ? "phase transaction recoveryId expected path" : (p.phase==="restore_finish" ? "phase transaction recoveryId expected verifiedCheckpoint path" : "phase transaction recoveryId expected verifiedCheckpoint"),"phase transaction recoveryId expected");
+        var preparing=p.phase==="recovery_prepare";
+        object(p,preparing ? "phase transaction recoveryId expected path" : "phase transaction recoveryId expected verifiedCheckpoint","phase transaction recoveryId expected");
         var rec=recovery,identity=owner(p.transaction);
-        if(rec && !!rec.manual!==(p.phase==="restore_prepare" || p.phase==="restore_finish"))fail("unsafe_state","Recovery mode changed");
+        if(rec && rec.manual)fail("unsafe_state","Recovery mode changed");
         if(!rec || rec.id!==p.recoveryId || (rec.owner && rec.owner!==identity) || app.project!==rec.projectObject || stringify(p.expected)!==rec.snapshot || stringify(inspect())!==rec.snapshot)
             fail("unsafe_state","Stopped snapshot changed; preserve current edits and recover manually");
         requireFiles();
@@ -904,12 +971,12 @@ var CookieMonsterAE = (function () {
                 return {status:"recovery_saved",project:project(),snapshot:saved};
             }catch(saveError){uncertain=true;fail("uncertain_outcome","Emergency save failed; do not close or retry");}
         }
-        if((p.phase!=="recovery_finish" && p.phase!=="restore_finish") || rec.phase!=="saved")fail("invalid_payload","Unknown recovery phase");
+        if(p.phase!=="recovery_finish" || rec.phase!=="saved")fail("invalid_payload","Unknown recovery phase");
         object(p.verifiedCheckpoint,"id hash size","id hash size");str(p.verifiedCheckpoint.id,"checkpoint");
         if(!/^[a-f0-9]{64}$/.test(p.verifiedCheckpoint.hash))fail("invalid_payload","Verified emergency hash required");
         num(p.verifiedCheckpoint.size,1,9007199254740991,true);
         if(app.project.dirty!==false)fail("unsafe_state","Dirty or unknown state after emergency verification");
-        var canonicalFile=pathFile(rec.manual ? p.path : rec.project.path);
+        var canonicalFile=pathFile(rec.project.path);
         if(!/[.]aepx?$/i.test(canonicalFile.fsName))fail("invalid_path","Expected a verified AE project");
         if(app.onError)fail("unsafe_state","Application error callback prevents automatic close");
         if(app.project!==rec.projectObject || stringify(inspect())!==rec.snapshot || app.project.dirty!==false)
@@ -922,7 +989,7 @@ var CookieMonsterAE = (function () {
             if(!app.open(canonicalFile))fail("unsafe_state","Canonical reopen was refused");
             var restored=inspect();
             if(app.project.dirty!==false)fail("unsafe_state","Reopened project changed before confirmation");
-            if(rec.manual ? restored.project.path!==canonicalFile.fsName : stringify(restored.project)!==stringify(rec.project))fail("unsafe_state","Recovery identity did not return");
+            if(stringify(restored.project)!==stringify(rec.project))fail("unsafe_state","Recovery identity did not return");
             recovery=null;transaction=null;
             return {status:"recovered",project:restored.project,snapshot:restored};
         }catch(closeError){uncertain=true;fail("uncertain_outcome","Recovery close/open could not be confirmed; emergency checkpoint retained");}
@@ -1030,7 +1097,13 @@ var CookieMonsterAE = (function () {
                 result={project:project(),activeCompId:currentComp ? currentComp.id : null,compositions:compositions,
                     aeVersion:String(app.version),capabilities:capability(),busy:busy,uncertain:uncertain};
             }
-            else if(request.method==="inspect"){object(p,"query");result=own(p,"query") ? inspectQuery(p.query) : inspect();}
+            else if(request.method==="inspect"){
+                object(p,"query restore");
+                if(own(p,"restore")){
+                    if(own(p,"query") || p.restore!==RESTORE_PROOF)fail("restore_unsupported","Matching compact restore protocol required");
+                    result=restoreGuard();
+                }else result=own(p,"query") ? inspectQuery(p.query) : inspect();
+            }
             else if(request.method==="preflight"){
                 object(p,"actions","actions");ready(true);var snapshot=inspect();result=validate(p.actions);plan={actions:stringify(result.actions),snapshot:stringify(snapshot),imports:importPins(result.actions)};
             } else if(request.method==="execute"){

@@ -42,7 +42,7 @@ After explicitly installing the plugin and selecting the reviewed config, fully 
 
 Artifacts require `{id, path, permissions, optional?}`; paths are absolute or file URLs. Files are resolved and syntax-checked with `node --check`, never imported for validation. Existing plugin strings/tuples are preserved. Invalid optional artifacts produce warnings without inserting their entries/defaults; required failures are errors that the consumer must reject. Syntax checks do not validate imports, hook compatibility, artifact authenticity or sandbox safety.
 
-Existing permission rules keep their order; global string policy is preserved. New defaults are subordinate to user rules, not permission to rewrite them. The current adapter separately rejects auto-allow for privileged operations, including matching wildcard/agent rules. A preserved but incompatible policy may therefore block startup or an operation; review the explicitly selected config rather than silently widening permissions or changing browser policy. The desktop owner must confirm its actual loader and permission semantics.
+Existing permission rules keep their order; global string policy is preserved. New defaults are subordinate to user rules, not permission to rewrite them. The current adapter separately rejects auto-allow for privileged operations except checkpoint-backed `ae_execute`, including matching wildcard/agent rules. A preserved but incompatible policy may therefore block startup or an operation; review the explicitly selected config rather than silently widening permissions or changing browser policy. The desktop owner must confirm its actual loader and permission semantics.
 
 ## Adapter Policy
 
@@ -53,7 +53,7 @@ Existing permission rules keep their order; global string policy is preserved. N
 - `ae_render_retire`: `ask` for previewed inventory of proven terminal/quiescent owned artifacts. Published outputs and shared source checkpoints stay untouched; same-volume private claims are required.
 - `ae_templates`: `ask`, not read-only. Host discovery temporarily adds/removes a render-queue item, validates the saved bound project and takes an execution lock.
 - `ae_render_status` and `ae_render_result`: `allow`; recovery/control still needs its explicit authorization path.
-- Mutation/control tools: `ask`. `ae_execute` reviews exact source with a current revision and checkpoint; the removed raw tools have no active defaults or Session gate.
+- `ae_execute`: `allow` by default. A current revision and a verified checkpoint are mandatory before dispatch; checkpoint failure prevents execution. Explicit `ask` or `deny` rules remain supported. Other mutation/control tools retain `ask`; the removed raw tools have no active defaults or Session gate.
 
 Restore/credential, render-retirement and desktop permission-override fixes have been re-reviewed with no remaining concrete findings in those scoped reviews. Rollback remains conditional on stopped/unchanged state; interruption preserves locks/backups. Retirement interruptions require manual recovery, never automatic plan replay; see [operations](OPERATIONS.md).
 

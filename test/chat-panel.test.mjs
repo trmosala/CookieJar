@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
 import {readFileSync} from 'node:fs'
-function fixture() {
+function fixture(saved = new Map()) {
   class Element {
     constructor(){this.children=[];this.events={};this.value='';this.disabled=false}
     set textContent(v){this.text=v;this.children=[]}
@@ -24,7 +24,7 @@ function fixture() {
   client.confirmRestore=async()=>{restores++;client.restoreApproval=null;if(failRestore)throw {message:'Interrupted'};return {currentCheckpointId:'current-backup',emergencyPath:'backup.aep',warning:'Current work preserved.',recoveryCopy:false};}
   let failSend=false, model=null, status='idle', failModel=false, refresh, holdState=false, releaseState
   const catalog=[{id:'sol',providerID:'test',name:'Sol',provider:'Test',variants:['low','high']},{id:'fast',providerID:'test',name:'Fast',provider:'Test',variants:[]}]
-  const context={window:{addEventListener(){}},document:{getElementById:el,createElement:()=>new Element()},setInterval(fn){refresh=fn;},clearInterval(){},
+  const context={window:{addEventListener(){},localStorage:{getItem:key=>saved.get(key),setItem:(key,value)=>saved.set(key,value)}},document:{getElementById:el,createElement:()=>new Element()},setInterval(fn){refresh=fn;},clearInterval(){},
     FileReader:class {readAsDataURL(file){this.file=file;readers.push(this)}}}
   vm.runInNewContext(readFileSync(new URL('../panel/chat.js',import.meta.url),'utf8'),context)
   const chat=context.window.CookieMonsterChat(client,{state:{credential:'test'},save(){}},{requestId:()=> 'a'.repeat(40),async request(d,c,p,b){calls.push(b);if(b.action==='checkpoints')return {result:{checkpoints:checkpointList}};if(b.action==='state' && holdState){const prior=model;await new Promise(resolve=>{releaseState=resolve});return {result:{status:'idle',model:prior,messages:[],workspaces:[]}};}if(b.action==='send' && failSend)throw {code:'disconnected',message:'Disconnected'};if(b.action==='models')return {result:{models:catalog}};if(b.action==='model'){if(failModel)throw {message:'Model unavailable'};model=b.model;return {result:{model}};}return {result:b.action==='send'? {delivery:'accepted'}:{status,model,sessionID:'ses-test',messages,workspaces:[]}}}})
@@ -34,6 +34,72 @@ function fixture() {
   el('chat-input').value='Describe this';el('chat-input').events.input()
   return {el,chat,client,readers,calls,tick,drop,finish,messages,panelCalls,set checkpointList(v){checkpointList=v},set failRestore(v){failRestore=v},get restores(){return restores},refresh:()=>refresh(),releaseState:()=>releaseState(),set holdState(v){holdState=v},set failSend(v){failSend=v},set failModel(v){failModel=v},set status(v){status=v}}
 }
+test('message restore uses the first checkpoint for its exact parent request and opens review only',async()=>{
+  const f=fixture()
+  f.checkpointList=[{id:'before-one'},{id:'later-one'}]
+  f.messages.push({id:'one',role:'user',parts:[{type:'text',text:'Edit this'}]},
+    {id:'two',role:'user',parts:[{type:'text',text:'Another request'}]},
+    {role:'assistant',parentID:'one',parts:[{type:'checkpoint',id:'before-one',label:'Before edit'},{type:'checkpoint',id:'later-one',label:'Later edit'}]})
+  await f.tick()
+  const rows=f.el('chat-messages').children
+  const restore=rows[0].children.at(-1).children.at(-1)
+  const unrelated=rows[1].children.at(-1).children.at(-1)
+  assert.equal(restore.disabled,false)
+  assert.equal(unrelated.disabled,true)
+  restore.click();await f.tick()
+  assert.equal(f.panelCalls.at(-1).args.id,'before-one')
+  assert.equal(f.restores,0)
+  assert.equal(f.el('chat-restore-review').hidden,false)
+})
+
+test('disclosures preserve manual choices during streaming and reset with the project',async()=>{
+  const f=fixture();f.status='busy'
+  const message={id:'stream',role:'assistant',parts:[{id:'tool',type:'tool',text:'ae_inspect · running'},
+    {id:'image',type:'image',url:'data:image/png;base64,SGVsbG8=',filename:'Frame'},
+    {id:'answer',type:'text',text:'A'.repeat(1300)}]}
+  f.messages.push(message);await f.tick();await f.refresh()
+  const row=()=>f.el('chat-messages').children[0]
+  assert.equal(row().children[1].open,true)
+  assert.equal(row().children[2].open,false)
+  assert.equal(row().children[3].open,false)
+  row().children[1].children[0].events.click({preventDefault(){}})
+  row().children[2].children[0].events.click({preventDefault(){}})
+  message.parts.push({id:'reason',type:'reasoning',text:'Reported reasoning summary'})
+  await f.refresh()
+  assert.equal(row().children[1].open,false)
+  assert.equal(row().children[2].open,true)
+  assert.match(row().children[1].textContent,/Reported reasoning summary/)
+  f.status='idle';await f.refresh()
+  assert.equal(row().children[1].open,false)
+  f.chat.update({...f.client.state,project:{id:'two',path:'two.aep'}});await f.refresh()
+  assert.equal(row().children[2].open,false)
+})
+
+test('activity automatically collapses when streaming ends without a manual choice',async()=>{
+  const f=fixture();f.status='busy';f.messages.push({id:'stream',role:'assistant',parts:[{type:'tool',text:'Running'}]})
+  await f.tick();await f.refresh();assert.equal(f.el('chat-messages').children[0].children[1].open,true)
+  f.status='idle';await f.refresh();assert.equal(f.el('chat-messages').children[0].children[1].open,false)
+})
+
+test('older turns collapse together and manual choices survive a panel reload',async()=>{
+  const saved=new Map()
+  const conversation=Array.from({length:4},(_,i)=>[
+    {id:'user-'+i,role:'user',parts:[{type:'text',text:'Request '+i}]},
+    {id:'answer-'+i,role:'assistant',parentID:'user-'+i,parts:[{type:'text',text:'Answer '+i}]},
+  ]).flat()
+  const first=fixture(saved);first.messages.push(...conversation);await first.tick();await first.refresh()
+  const turns=()=>first.el('chat-messages').children.filter(c=>c.className==='chat-disclosure chat-turn')
+  assert.equal(turns().length,2)
+  assert.equal(turns()[0].open,false)
+  assert.match(turns()[0].textContent,/Answer 0/)
+  turns()[0].children[0].events.click({preventDefault(){}})
+  assert.equal(turns()[0].open,true)
+  const reloaded=fixture(saved);reloaded.messages.push(...conversation);await reloaded.tick();await reloaded.refresh()
+  const restored=reloaded.el('chat-messages').children.filter(c=>c.className==='chat-disclosure chat-turn')
+  assert.equal(restored[0].open,true)
+  assert.equal(restored[1].open,false)
+})
+
 test('model picker saves supported reasoning and clears it when switching models',async()=>{
   const f=fixture();await f.tick()
   assert.equal(f.el('chat-model').disabled,false)
@@ -151,8 +217,42 @@ test('checkpoint cards reject foreign ownership and stale reviews',async()=>{
 test('oversized restore review explains the limit without claiming a restore',async()=>{
   const f=fixture();f.client.state.binding={sessionID:'ses-test',state:'active'};f.checkpointList=[{id:'cp-one'}]
   f.messages.push({role:'assistant',parts:[{type:'checkpoint',id:'cp-one',label:'Before this edit'}]});await f.tick()
-  f.client.panel=async()=>{throw {code:'response_too_large',message:'Full snapshot too large'}}
+  f.client.panel=async()=>{throw {code:'response_too_large',message:'Review response too large'}}
   f.el('chat-messages').children[0].children[1].children[2].click();await f.tick()
-  assert.match(f.el('chat-error').textContent,/too large for verified chat restore/)
+  assert.match(f.el('chat-error').textContent,/review exceeded its response limit/)
   assert.equal(f.el('chat-restore-review').hidden,true);assert.equal(f.restores,0)
+})
+
+test('unsupported compact restore explains compatibility without falling back or confirming',async()=>{
+  const f=fixture();f.client.state.binding={sessionID:'ses-test',state:'active'};f.checkpointList=[{id:'cp-one'}]
+  f.messages.push({role:'assistant',parts:[{type:'checkpoint',id:'cp-one',label:'Before this edit'}]});await f.tick()
+  let calls=0
+  f.client.panel=async()=>{calls++;throw {code:'restore_unsupported',message:'Legacy host'}}
+  f.el('chat-messages').children[0].children[1].children[2].click();await f.tick()
+  assert.match(f.el('chat-error').textContent,/matching compact-restore support/)
+  assert.equal(f.el('chat-restore-review').hidden,true);assert.equal(f.restores,0)
+  await f.refresh();assert.equal(calls,1)
+})
+
+test('project checkpoint picker reviews a selected checkpoint without a message card and blocks busy restores',async()=>{
+  const f=fixture();await f.tick()
+  const toggle=f.el('chat-checkpoints-toggle'),review=f.el('chat-checkpoint-review')
+  f.checkpointList=[{id:'older',createdAt:'2026-09-10T10:00:00Z'},{id:'newer',createdAt:'2026-09-11T10:00:00Z'}]
+  toggle.events.click.call(toggle);await f.tick()
+  assert.equal(f.el('chat-checkpoints').hidden,false)
+  assert.equal(f.el('chat-checkpoint-picker').value,'newer')
+  assert.equal(review.disabled,false)
+  f.el('chat-checkpoint-picker').value='older';f.el('chat-checkpoint-picker').events.change()
+  review.events.click.call(review);await f.tick()
+  assert.equal(f.panelCalls.at(-1).args.id,'older')
+  assert.equal(f.restores,0)
+  assert.equal(f.el('chat-restore-review').hidden,false)
+  f.el('chat-restore-cancel').click()
+  f.status='busy';await f.refresh()
+  assert.equal(review.disabled,true)
+  const count=f.panelCalls.length;review.events.click.call(review);await f.tick()
+  assert.equal(f.panelCalls.length,count)
+  f.chat.update({...f.client.state,project:{id:'two',path:'two.aep'}})
+  assert.equal(f.el('chat-checkpoints').hidden,true)
+  assert.equal(f.el('chat-checkpoint-picker').value,'')
 })

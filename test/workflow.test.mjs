@@ -9,6 +9,7 @@ import { createCheckpoints, createGrants } from "../src/storage.mjs"
 import { hash, PROPOSAL_TTL } from "../src/protocol.mjs"
 import { panelFixture, simulatedHost, restoreFixture } from "./bridge-panel.mjs"
 import { hostDouble, manualRestoreBridge } from "./workflow-host.mjs"
+import { RESTORE_PROOF, restoreFingerprint } from "../src/bridge.mjs"
 import fs from "node:fs/promises"
 import vm from "node:vm"
 import { setTimeout as delay } from "node:timers/promises"
@@ -72,7 +73,10 @@ async function fixture(t, options = {}) {
     p.state.project = status.project
     if (reply.error) throw Object.assign(new Error(reply.error.message), { code: reply.error.code })
     return reply.result
-  } : simulatedHost
+  } : async (command, p) => command.method === "inspect" && command.params.restore === RESTORE_PROOF
+    ? { protocol: RESTORE_PROOF, project: structuredClone(p.state.project), projectEpoch: "simulated-native",
+      revision: p.state.revision || 1, dirty: false, busy: false, callbacksClear: true, capabilities: { fileNetwork: true } }
+    : simulatedHost(command, p)
   const workflow = createWorkflow({ bridge: p.bridge, checkpoints, grants, now: () => clock })
   await p.start(async command => {
     events.push(command.method)
@@ -97,8 +101,6 @@ test("production manual restore traverses bridge transport host source and real 
     assert.notDeepEqual(original, source)
     h.props[0].setValue(42)
     // Real plugin approval tokens and /panel handler; renderer is unrelated to restore.
-    const nativeSave = h.project.save.bind(h.project)
-    h.project.save = file => { nativeSave(file); h.project.revision++ }
     await createRuntime({ factories: { bridge: async () => p.bridge,
       renderer: async () => ({ list: async () => [], close: async () => {} }) } })
     const review = await transport.request(client.descriptor, f.store.state.credential, "/panel",
@@ -246,6 +248,141 @@ async function manualFixture(t, realStorage = false) {
   return { ...f, bridge, workflow, checkpoint, canonical, advance(ms) { clock += ms } }
 }
 
+test("compact restore saves over 4 MiB and 28000 properties without scene traversal through real bridge", async t => {
+  const f = await fixture(t, { actualHost: true, realStorage: true })
+  const h = f.actual, canonical = h.project.file.fsName
+  const comp = h.largeScene()
+  h.project.save(h.project.file)
+  const source = await readFile(canonical)
+  assert.ok(source.length > 4 * 1024 * 1024)
+  assert.ok(h.props.length > 25000)
+  assert.ok(h.call("inspect").error, "full scene exceeds the legacy inspection budget")
+  const checkpoint = await f.checkpoints.create({ projectPath: canonical,
+    projectId: f.p.state.project.id, planHash: "large-source", pinned: true })
+  h.props[0].setValue(42)
+  let traversals = 0
+  comp.layer = () => { traversals++; throw new Error("Restore must not traverse layers or properties") }
+  const start = f.p.log.length
+  const review = await f.workflow.inspectRestore("session")
+  const result = await f.workflow.restore("session", checkpoint.id, async (_, metadata) => {
+    assert.equal(metadata.fingerprint, review.fingerprint)
+    assert.equal((await f.workflow.inspectRestore("session")).fingerprint, review.fingerprint)
+    assert.ok(JSON.stringify(metadata).length < 8192)
+  })
+  assert.equal(traversals, 0)
+  assert.equal(h.closes, 1)
+  assert.deepEqual(await readFile(canonical), source)
+  const backup = await f.checkpoints.verify(result.currentCheckpointId)
+  assert.equal(JSON.parse(await readFile(backup.path)).props[0].value, 42)
+  assert.equal(h.props[0].value, 100)
+  assert.equal(f.p.bridge.binding("session").lock, null)
+  for (const command of f.p.log.slice(start)) {
+    assert.ok(JSON.stringify(command).length < 8192)
+    if (command.method === "inspect") assert.deepEqual(command.params, { restore: RESTORE_PROOF })
+    else assert.ok(["restore_prepare", "restore_finish"].includes(command.params.phase))
+  }
+  assert.equal(result.protocol, RESTORE_PROOF)
+  assert.notEqual(result.receipt.projectEpoch, review.projectEpoch)
+})
+
+test("compact approvals reject same-path same-counter reopen and dirty-only edits before save", async t => {
+  for (const mode of ["reopen", "dirty"]) {
+    const f = await manualFixture(t)
+    const before = await f.workflow.inspectRestore("session")
+    await assert.rejects(f.workflow.restore("session", f.checkpoint.id, async () => {
+      if (mode === "reopen") {
+        f.actual.app.open(f.actual.project.file)
+        f.actual.project.revision = before.revision
+        f.actual.project.dirty = before.dirty
+      } else f.actual.project.dirty = !before.dirty
+    }), { code: "stale_fingerprint" })
+    assert.equal(f.actual.closes, 0)
+    assert.equal(f.bridge.state.lock, null)
+    assert.equal(f.bridge.events.filter(e => e.method === "execute").length, 0)
+  }
+})
+
+test("compact reconciliation expiry during workflow and final unlock inspections retains durable lock without replay", async t => {
+  for (const expireOn of [2, 3]) await t.test(`compact inspection ${expireOn}`, async t => {
+    let inspections = 0, expire = true
+    const f = await fixture(t, { actualHost: true, handler: async (command, p, host) => {
+      const result = await host(command, p)
+      if (command.method === "inspect" && command.params.restore === RESTORE_PROOF &&
+          ++inspections === expireOn && expire) f.advance(PROPOSAL_TTL)
+      return result
+    } })
+    await f.p.bridge.lock("session", { kind: "restore", proof: RESTORE_PROOF })
+    await f.p.bridge.markUncertain("session", "Unconfirmed compact restore")
+    const before = f.p.bridge.binding("session", { allowLocked: true }).lock
+    const durable = await readFile(path.join(f.p.dataDir, "bridge-state.json"))
+    const original = await readFile(f.actual.project.file.fsName)
+    const unlock = t.mock.method(f.p.bridge, "unlock")
+    await assert.rejects(f.workflow.reconcile("session", async () => {}), { code: "proposal_expired" })
+    assert.equal(inspections, expireOn)
+    assert.equal(unlock.mock.callCount(), expireOn === 2 ? 0 : 1)
+    assert.deepEqual(f.p.bridge.binding("session", { allowLocked: true }).lock, before)
+    assert.deepEqual(await readFile(path.join(f.p.dataDir, "bridge-state.json")), durable)
+    expire = false
+    const result = await f.workflow.reconcile("session", async () => {})
+    assert.equal(result.proof, "explicit_review")
+    assert.equal(f.p.bridge.binding("session").lock, null)
+    assert.deepEqual(JSON.parse(await readFile(path.join(f.p.dataDir, "bridge-state.json"))).locks, [])
+    assert.ok(f.p.log.every(c => c.method === "inspect" && c.params.restore === RESTORE_PROOF))
+    assert.equal(f.actual.closes, 0)
+    assert.deepEqual(await readFile(f.actual.project.file.fsName), original)
+  })
+})
+
+test("large-scene compact restore uncertainty retains backups and requires explicit review without traversal", async t => {
+  const f = await fixture(t, { actualHost: true, realStorage: true })
+  const comp = f.actual.largeScene()
+  f.actual.project.save(f.actual.project.file)
+  assert.ok((await readFile(f.actual.project.file.fsName)).length > 4 * 1024 * 1024)
+  assert.ok(f.actual.props.length > 25000)
+  let traversals = 0
+  comp.layer = () => { traversals++; throw new Error("Reconciliation must not traverse layers or properties") }
+  const checkpoint = await f.checkpoints.create({ projectPath: f.actual.project.file.fsName,
+    projectId: f.p.state.project.id, planHash: "freshness-source", pinned: true })
+  f.actual.props[0].setValue(42)
+  const unlock = f.p.bridge.unlock.bind(f.p.bridge)
+  let inject = true
+  f.p.bridge.unlock = async (...args) => {
+    if (inject) { inject = false; f.actual.props[0].setValue(19) }
+    return unlock(...args)
+  }
+  let failure
+  await assert.rejects(f.workflow.restore("session", checkpoint.id, async () => {}), error => {
+    failure = error
+    return error.code === "stale_fingerprint"
+  })
+  assert.equal(f.actual.props[0].value, 19)
+  assert.equal(f.actual.closes, 1)
+  const backup = await f.checkpoints.verify(failure.details.currentCheckpointId)
+  assert.equal(backup.inUse, true)
+  assert.equal(JSON.parse(await readFile(backup.path)).props[0].value, 42)
+  assert.equal(f.p.bridge.binding("session", { allowLocked: true }).lock.state, "uncertain")
+  await assert.rejects(f.p.bridge.unlock("session"), { code: "permission_required" })
+  await assert.rejects(f.workflow.reconcile("session"), { code: "permission_required" })
+  await assert.rejects(f.workflow.reconcile("session", async () => false), { code: "permission_denied" })
+  await assert.rejects(f.workflow.reconcile("session", async () => f.actual.props[0].setValue(20)),
+    { code: "stale_fingerprint" })
+  const result = await f.workflow.reconcile("session", async (summary, metadata) => {
+    assert.match(summary, /NOT full scene proof/)
+    assert.equal(metadata.actualProjectReviewRequired, true)
+    assert.equal(metadata.protocol, RESTORE_PROOF)
+    assert.equal(metadata.snapshot.items, undefined)
+  })
+  assert.equal(result.proof, "explicit_review")
+  assert.equal(f.p.bridge.binding("session").lock, null)
+  assert.equal(f.p.log.filter(c => c.params.phase === "restore_finish").length, 1)
+  assert.equal((await f.checkpoints.verify(backup.id)).inUse, true)
+  assert.equal(traversals, 0)
+  for (const command of f.p.log) {
+    assert.ok(JSON.stringify(command).length < 8192)
+    if (command.method === "inspect") assert.deepEqual(command.params, { restore: RESTORE_PROOF })
+  }
+})
+
 test("manual canonical restore saves dirty state and verifies current backup before replacing original", async t => {
   const f = await manualFixture(t, true)
   const before = await readFile(f.canonical)
@@ -254,8 +391,10 @@ test("manual canonical restore saves dirty state and verifies current backup bef
     permissions++
     assert.match(summary, /Source:/)
     assert.match(summary, /Destination file:/)
+    assert.match(summary, /do not prove scene equivalence/)
+    assert.match(summary, /Any Save As revision change stops restoration before publication or close/)
     assert.equal(metadata.sourceTimestamp, Date.parse(f.checkpoint.createdAt))
-    assert.equal(metadata.fingerprint, hash(f.actual.call("inspect").result))
+    assert.equal(metadata.fingerprint, restoreFingerprint(f.actual.call("inspect", { restore: RESTORE_PROOF }).result, f.bridge.state.connectionId))
     metadata.checkpoint.hash = "tampered callback metadata"
   })
   assert.equal(permissions, 1)
@@ -275,12 +414,12 @@ test("manual canonical restore saves dirty state and verifies current backup bef
     ["restore_prepare", "restore_finish"])
 })
 
-test("manual restore accepts only the native Save As revision increment", async t => {
-  for (const delta of [1, 2]) {
+test("manual restore refuses ambiguous Save As revision changes before publication or close", async t => {
+  for (const delta of [0, 1, 2]) {
     const f = await manualFixture(t)
     const save = f.actual.project.save.bind(f.actual.project)
     f.actual.project.save = file => { save(file); f.actual.project.revision += delta }
-    if (delta === 1) {
+    if (delta === 0) {
       const result = await f.workflow.restore("session", f.checkpoint.id, async () => {})
       assert.equal(result.canonicalReplaced, true)
       const backup = await f.checkpoints.verify(result.currentCheckpointId)
@@ -687,7 +826,10 @@ test("workflow uses real checkpoint storage and grants through native HTTP", asy
   const p = await panelFixture(t)
   const checkpoints = createCheckpoints({ dataDir: p.dataDir })
   const w = createWorkflow({ bridge: p.bridge, checkpoints, grants: createGrants() })
-  await p.start(simulatedHost)
+  await p.start((command, panel) => command.method === "inspect" && command.params.restore === RESTORE_PROOF
+    ? { protocol: RESTORE_PROOF, project: structuredClone(panel.state.project), projectEpoch: "simulated-native",
+      revision: 1, dirty: false, busy: false, callbacksClear: true, capabilities: { fileNetwork: true } }
+    : simulatedHost(command, panel))
   const before = structuredClone(p.state)
   const plan = await w.propose("session", [{ type: "layer.create", name: "Stored" }])
   const result = await w.execute("session", plan.token, async () => {})

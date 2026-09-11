@@ -5,11 +5,65 @@ import { readFile, stat } from "node:fs/promises"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { panelFixture, request } from "./bridge-panel.mjs"
-import { createBridge } from "../src/bridge.mjs"
+import { createBridge, RESTORE_PROOF, restoreReceipt, restoreFingerprint } from "../src/bridge.mjs"
 import { hash, releaseMetadata } from "../src/protocol.mjs"
 import { randomUUID } from "node:crypto"
+import fs from "node:fs"
+import { syncBuiltinESMExports } from "node:module"
 
 const exec = promisify(execFile)
+const receipt = state => ({ protocol: RESTORE_PROOF, project: structuredClone(state.project),
+  projectEpoch: "native-original", revision: state.revision, dirty: false, busy: false,
+  callbacksClear: true, capabilities: { fileNetwork: true } })
+const restoreReason = p => ({ kind: "restore", proof: RESTORE_PROOF, checkpointId: "source",
+  planHash: hash("plan"), fingerprint: restoreFingerprint(receipt(p.state), p.connectionId) })
+
+for (const permanent of [false, true]) {
+  test(`Windows bridge replacement ${permanent ? "exhausts retries without replacing state" : "recovers from transient sharing errors"}`, { skip: process.platform !== "win32" }, async t => {
+    const p = await panelFixture(t)
+    const file = path.join(p.dataDir, "bridge-state.json")
+    const before = await readFile(file)
+    const rename = fs.promises.rename
+    let attempts = 0
+    fs.promises.rename = async (source, destination) => {
+      if (destination === file && (++attempts <= 2 || permanent))
+        throw Object.assign(new Error("Simulated Windows sharing conflict"), { code: "EPERM" })
+      return rename(source, destination)
+    }
+    syncBuiltinESMExports()
+    try {
+      if (permanent) {
+        await assert.rejects(p.bridge.lock("session", { kind: "test" }), { code: "EPERM" })
+        assert.equal(attempts, 10)
+        assert.deepEqual(await readFile(file), before)
+        assert.throws(() => p.bridge.binding("session"), { code: "storage_failed" })
+      } else {
+        const lock = await p.bridge.lock("session", { kind: "test" })
+        assert.equal(attempts, 3)
+        assert.equal(JSON.parse(await readFile(file)).locks[0].id, lock.id)
+        assert.equal(p.bridge.binding("session", { allowLocked: true }).lock.id, lock.id)
+      }
+    } finally {
+      fs.promises.rename = rename
+      syncBuiltinESMExports()
+    }
+  })
+}
+
+test("compact receipt schemas reject partial full and unknown proofs and fingerprints bind connection epoch and dirty state", () => {
+  const project = { id: "p", path: path.resolve("test.aep"), saved: true }
+  const valid = receipt({ project, revision: 1 })
+  assert.equal(restoreReceipt(valid, project), valid)
+  for (const patch of [{ items: [] }, { dirty: null }, { busy: true }, { callbacksClear: false },
+    { projectEpoch: "" }, { revision: 0 }, { revision: 1.5 }, { capabilities: {} }])
+    assert.throws(() => restoreReceipt({ ...valid, ...patch }, project))
+  for (const protocol of [undefined, "compact-restore-v0"])
+    assert.throws(() => restoreReceipt({ ...valid, protocol }, project), { code: "restore_unsupported" })
+  const fingerprint = restoreFingerprint(valid, "connection-a")
+  for (const changed of [{ ...valid, dirty: true }, { ...valid, projectEpoch: "reopened" }, { ...valid, revision: 2 }])
+    assert.notEqual(restoreFingerprint(changed, "connection-a"), fingerprint)
+  assert.notEqual(restoreFingerprint(valid, "connection-b"), fingerprint)
+})
 
 test("compatibility runtime metadata validates release targets and credential-free HTTPS URLs", () => {
   const defaults = releaseMetadata()
@@ -230,16 +284,17 @@ test("manual restore protocol validates scope proof phase replay and durable fal
   p.state.revision = 1
   const original = structuredClone(p.state.project)
   const transaction = { id: randomUUID(), sessionID: "session", bindingID: p.bridge.binding("session").id }
-  const prepare = { phase: "restore_prepare", transaction, recoveryId: randomUUID(), expected: structuredClone(p.state),
+  const prepare = { phase: "restore_prepare", transaction, recoveryId: randomUUID(), expected: receipt(p.state),
     path: path.join(p.dataDir, "workflow-emergency-" + randomUUID() + ".aep") }
-  const reason = { kind: "restore", checkpointId: "source", planHash: hash("plan"), fingerprint: hash(p.state) }
+  const reason = restoreReason(p)
   await p.bridge.lock("session", reason)
   for (const [params, code] of [
     [{ ...prepare, transaction: { ...transaction, sessionID: "foreign" } }, "stale_binding"],
     [{ ...prepare, transaction: { ...transaction, bindingID: "foreign" } }, "stale_binding"],
-    [{ ...prepare, expected: { ...p.state, revision: 2 } }, "unsafe_state"],
-    [{ ...prepare, expected: Object.fromEntries(Object.entries(p.state).filter(([key]) => key !== "activeCompId")) }, "invalid_payload"],
-    [{ ...prepare, expected: { ...p.state, project: { ...original, id: "foreign" } } }, "invalid_payload"],
+    [{ ...prepare, expected: { ...receipt(p.state), revision: 2 } }, "unsafe_state"],
+    [{ ...prepare, expected: Object.fromEntries(Object.entries(receipt(p.state)).filter(([key]) => key !== "dirty")) }, "invalid_payload"],
+    [{ ...prepare, expected: { ...receipt(p.state), project: { ...original, id: "foreign" } } }, "invalid_host_result"],
+    [{ ...prepare, expected: structuredClone(p.state) }, "restore_unsupported"],
     [{ ...prepare, path: path.join(p.dataDir, "artist.aep") }, "invalid_path"],
     [{ ...prepare, extra: true }, "invalid_payload"],
     [{ ...prepare, phase: "restore_finish", verifiedCheckpoint: { id: "backup", hash: hash("bytes"), size: 1 } }, "unsafe_state"],
@@ -251,15 +306,16 @@ test("manual restore protocol validates scope proof phase replay and durable fal
     assert.equal(durable.restore.phase, command.params.phase === "restore_prepare" ? "preparing" : "finishing")
     p.state.project = { id: "path:" + hash(command.params.path), path: command.params.path, saved: true }
     return { status: command.params.phase === "restore_prepare" ? "recovery_saved" : "recovered",
-      project: p.state.project, snapshot: structuredClone(p.state) }
+      project: p.state.project, receipt: { ...receipt(p.state),
+        projectEpoch: command.params.phase === "restore_prepare" ? "native-original" : "native-opened" } }
   })
   const saved = await p.bridge.call("session", "execute", prepare, { allowLocked: true })
   assert.equal(p.bridge.binding("session", { allowLocked: true }).project.path, prepare.path)
-  await assert.rejects(p.bridge.call("session", "execute", prepare, { allowLocked: true }), { code: "invalid_payload" })
+  await assert.rejects(p.bridge.call("session", "execute", prepare, { allowLocked: true }), { code: "invalid_host_result" })
   await assert.rejects(p.bridge.call("session", "save", {}, { allowLocked: true }), { code: "restore_in_progress" })
   await assert.rejects(p.bridge.unlock("session"), { code: "recovery_target_mismatch" })
   const finish = { phase: "restore_finish", transaction, recoveryId: prepare.recoveryId,
-    expected: saved.snapshot, path: path.join(p.dataDir, "workflow-recovery-" + randomUUID() + ".aep"),
+    expected: saved.receipt, path: path.join(p.dataDir, "workflow-recovery-" + randomUUID() + ".aep"),
     verifiedCheckpoint: { id: "backup", hash: hash("bytes"), size: 1 } }
   await assert.rejects(p.bridge.call("session", "execute", finish, { allowLocked: true }), { code: "unsafe_state" })
   await p.bridge.recordOutcome("session", { outcome: "dispatched", planHash: reason.planHash,
@@ -267,7 +323,7 @@ test("manual restore protocol validates scope proof phase replay and durable fal
   for (const [params, code] of [
     [{ ...finish, transaction: { ...transaction, id: randomUUID() } }, "unsafe_state"],
     [{ ...finish, recoveryId: "foreign" }, "unsafe_state"],
-    [{ ...finish, expected: { ...saved.snapshot, revision: 2 } }, "unsafe_state"],
+    [{ ...finish, expected: { ...saved.receipt, revision: 2 } }, "unsafe_state"],
     [{ ...finish, verifiedCheckpoint: { ...finish.verifiedCheckpoint, id: "other" } }, "unsafe_state"],
     [{ ...finish, verifiedCheckpoint: { ...finish.verifiedCheckpoint, hash: "bad" } }, "invalid_payload"],
     [{ ...finish, path: path.join(p.dataDir, "artist.aep") }, "invalid_path"],
@@ -275,7 +331,7 @@ test("manual restore protocol validates scope proof phase replay and durable fal
   const restored = await p.bridge.call("session", "execute", finish, { allowLocked: true })
   assert.equal(restored.project.path, finish.path)
   assert.equal(p.log.length, 2)
-  await assert.rejects(p.bridge.call("session", "execute", { ...finish, expected: restored.snapshot }, { allowLocked: true }),
+  await assert.rejects(p.bridge.call("session", "execute", { ...finish, expected: restored.receipt }, { allowLocked: true }),
     { code: "unsafe_state" })
   assert.equal((await p.send("/reply", { id: p.log[1].id, result: restored })).body.error.code, "invalid_reply")
   await p.bridge.markUncertain("session", "Recovery copy requires review")
@@ -291,18 +347,20 @@ test("manual restore protocol validates scope proof phase replay and durable fal
 })
 
 test("manual restore rejects forged prepare replies without advancing durable state", async t => {
-  for (const mode of ["path", "snapshot", "status"]) {
+  for (const mode of ["path", "snapshot", "save_increment", "status", "epoch", "dirty", "protocol"]) {
     const p = await panelFixture(t)
     p.state.revision = 1
     const original = structuredClone(p.state.project)
     const params = { phase: "restore_prepare", transaction: { id: randomUUID(), sessionID: "session",
-      bindingID: p.bridge.binding("session").id }, recoveryId: randomUUID(), expected: structuredClone(p.state),
+      bindingID: p.bridge.binding("session").id }, recoveryId: randomUUID(), expected: receipt(p.state),
       path: path.join(p.dataDir, "workflow-emergency-" + randomUUID() + ".aep") }
-    await p.bridge.lock("session", { kind: "restore", checkpointId: "source", planHash: hash("plan"), fingerprint: hash(p.state) })
+    await p.bridge.lock("session", restoreReason(p))
     await p.start(async () => {
       const project = { id: "saved", path: mode === "path" ? original.path : params.path, saved: true }
       return { status: mode === "status" ? "recovered" : "recovery_saved", project,
-        snapshot: { ...p.state, project, revision: mode === "snapshot" ? 3 : 1 } }
+        receipt: { ...receipt(p.state), project, revision: mode === "snapshot" ? 3 : mode === "save_increment" ? 2 : 1,
+          projectEpoch: mode === "epoch" ? "replaced" : "native-original",
+          dirty: mode === "dirty", protocol: mode === "protocol" ? "old" : RESTORE_PROOF } }
     })
     await assert.rejects(p.bridge.call("session", "execute", params, { allowLocked: true }), { code: "outcome_uncertain" })
     const lock = JSON.parse(await readFile(path.join(p.dataDir, "bridge-state.json"))).locks[0]
@@ -315,15 +373,15 @@ test("manual restore rejects forged prepare replies without advancing durable st
 })
 
 test("manual restore forged finish and foreign replies cannot confirm a path transition", async t => {
-  for (const fault of ["path", "snapshot", "identity"]) {
+  for (const fault of ["path", "snapshot", "identity", "epoch", "dirty"]) {
     const p = await panelFixture(t)
     p.state.revision = 1
     const original = structuredClone(p.state.project)
     const transaction = { id: randomUUID(), sessionID: "session", bindingID: p.bridge.binding("session").id }
-    const prepare = { phase: "restore_prepare", transaction, recoveryId: randomUUID(), expected: structuredClone(p.state),
+    const prepare = { phase: "restore_prepare", transaction, recoveryId: randomUUID(), expected: receipt(p.state),
       path: path.join(p.dataDir, "workflow-emergency-" + randomUUID() + ".aep") }
     const planHash = hash("plan")
-    await p.bridge.lock("session", { kind: "restore", checkpointId: "source", planHash, fingerprint: hash(p.state) })
+    await p.bridge.lock("session", restoreReason(p))
     await p.start(async command => {
       const project = command.params.phase === "restore_prepare"
         ? { id: "emergency", path: prepare.path, saved: true } : { ...original }
@@ -331,16 +389,17 @@ test("manual restore forged finish and foreign replies cannot confirm a path tra
         if (fault === "path") project.path = path.join(p.dataDir, "foreign.aep")
         if (fault === "identity") project.id = "foreign"
       } else p.state.project = project
-      const snapshot = { ...p.state, project }
-      if (command.params.phase === "restore_finish" && fault === "snapshot") delete snapshot.items
-      return { status: command.params.phase === "restore_prepare" ? "recovery_saved" : "recovered", project, snapshot }
+      const proof = { ...receipt(p.state), project }
+      if (command.params.phase === "restore_finish") proof.projectEpoch = "native-opened"
+      if (command.params.phase === "restore_finish" && fault === "snapshot") delete proof.dirty
+      return { status: command.params.phase === "restore_prepare" ? "recovery_saved" : "recovered", project, receipt: proof }
     })
     const saved = await p.bridge.call("session", "execute", prepare, { allowLocked: true })
     await p.stop()
     await p.bridge.recordOutcome("session", { outcome: "dispatched", checkpointId: "source",
       currentCheckpointId: "backup", planHash })
     const finish = { phase: "restore_finish", transaction, recoveryId: prepare.recoveryId,
-      expected: saved.snapshot, path: original.path, verifiedCheckpoint: { id: "backup", hash: hash("bytes"), size: 1 } }
+      expected: saved.receipt, path: original.path, verifiedCheckpoint: { id: "backup", hash: hash("bytes"), size: 1 } }
     const foreign = await request(p.port, "/pair", { code: p.bridge.pairingCode("foreign").code,
       panelId: "foreign-panel", protocol: 1, version: "0.2.2" })
     await request(p.port, "/connect", { panelId: "foreign-panel", protocol: 1, version: "0.2.2",
@@ -354,9 +413,11 @@ test("manual restore forged finish and foreign replies cannot confirm a path tra
     const project = { ...original }
     if (fault === "path") project.path = path.join(p.dataDir, "foreign.aep")
     if (fault === "identity") project.id = "foreign"
-    const snapshot = { ...p.state, project }
-    if (fault === "snapshot") delete snapshot.items
-    await p.send("/reply", { id: command.id, result: { status: "recovered", project, snapshot } })
+    const proof = { ...receipt(p.state), project, projectEpoch: "native-opened" }
+    if (fault === "snapshot") delete proof.dirty
+    if (fault === "epoch") proof.projectEpoch = saved.receipt.projectEpoch
+    if (fault === "dirty") proof.dirty = true
+    await p.send("/reply", { id: command.id, result: { status: "recovered", project, receipt: proof } })
     await rejected
     const lock = JSON.parse(await readFile(path.join(p.dataDir, "bridge-state.json"))).locks[0]
     assert.equal(lock.state, "uncertain")
@@ -372,9 +433,9 @@ test("manual restore reconnect during dispatched prepare preserves original and 
   const original = structuredClone(p.state.project)
   const prepare = { phase: "restore_prepare",
     transaction: { id: randomUUID(), sessionID: "session", bindingID: p.bridge.binding("session").id },
-    recoveryId: randomUUID(), expected: structuredClone(p.state),
+    recoveryId: randomUUID(), expected: receipt(p.state),
     path: path.join(p.dataDir, "workflow-emergency-" + randomUUID() + ".aep") }
-  await p.bridge.lock("session", { kind: "restore", checkpointId: "source", planHash: hash("plan"), fingerprint: hash(p.state) })
+  await p.bridge.lock("session", restoreReason(p))
   const pending = p.bridge.call("session", "execute", prepare, { allowLocked: true })
   const rejected = assert.rejects(pending, { code: "outcome_uncertain" })
   let command

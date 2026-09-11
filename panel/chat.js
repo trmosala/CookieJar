@@ -6,7 +6,8 @@
         var state=client.state, projectKey="", generation=0, polling=false, sending=false, timer,
             messagesKey="", approvalsKey="", compKey="", snapshot=null, takeover=false, serverError="", attachments=[], deliveryUnknown=false, refreshError="",
             catalog=[], catalogKey="", catalogAt=0, catalogLoading=false, modelSaving=false, modelError="", modelRevision=0,
-            checkpointList=[], checkpointButtons=[], checkpointAt=0, checkpointLoading=false, restoreWorking=false, restoreReview=null;
+            checkpointList=[], checkpointButtons=[], checkpointAt=0, checkpointLoading=false, restoreWorking=false, restoreReview=null,
+            collapseState={}, collapseSession="", historyMessages=[], historyCursor=null, historyLoaded=false, historyLoading=false;
         function projectIdentity(s) { return s.project ? JSON.stringify(s.project) : ""; }
         function pins() { if(!store.state.chatPins)store.state.chatPins={};return store.state.chatPins; }
         function pinKey() { return "project:"+(state.project && state.project.id); }
@@ -20,10 +21,16 @@
         function controls() {
             var connected=state.connection==="connected", busy=sending || modelSaving || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
             var restoring=snapshot && snapshot.restore && ["pending","unconfirmed"].indexOf(snapshot.restore.status)>=0;
+            var restoreBlocked=!connected || !!busy || !!restoring || !!client.panelPending || state.busy || state.uncertain || !!state.lock || deliveryUnknown || !!(snapshot && snapshot.owned) || !!(state.binding && state.binding.sessionID!==(snapshot && snapshot.sessionID));
+            el("chat-checkpoints-toggle").disabled=restoreWorking || !!restoreReview;
+            el("chat-checkpoint-picker").disabled=checkpointLoading || !checkpointList.length || restoreBlocked;
+            el("chat-checkpoint-review").disabled=checkpointLoading || restoreBlocked || !checkpointList.some(function(c){return c.id===el("chat-checkpoint-picker").value;});
+            el("chat-checkpoint-help").textContent=checkpointLoading ? "Loading checkpoints…" : !connected ? "Connect to load this project's checkpoints." : !snapshot || !snapshot.sessionID ? "Start a conversation to see this project's checkpoints." : !checkpointList.length ? "No checkpoints yet. A checkpoint is saved before an edit runs." : restoreBlocked ? "Restoring is unavailable while work or recovery is in progress. Finish or stop the current task first." : "Restores the whole project. You can review and cancel before anything changes.";
             checkpointButtons.forEach(function(item){
                 var available=checkpointList.some(function(c){return c.id===item.id;});
                 item.button.disabled=!available || !connected || !!busy || !!restoring || !!client.panelPending || state.busy || state.uncertain || !!state.lock || !!(snapshot && snapshot.owned) || !!(state.binding && state.binding.sessionID!==(snapshot && snapshot.sessionID));
                 item.status.textContent=available ? "Saved state before this edit. Verified again when you review Restore." : "Checkpoint unavailable or not loaded for this project.";
+                item.button.title=available ? "Restore project to before this request" : "No checkpoint available for this request";
             });
             el("chat-model").disabled=!connected || !!busy || deliveryUnknown || !catalog.length;
             el("chat-reasoning").disabled=el("chat-model").disabled || !el("chat-model").value || el("chat-reasoning").children.length<=1;
@@ -51,6 +58,7 @@
         function restoreNotice(text) { el("chat-restore-status").textContent=text;el("chat-restore-status").hidden=!text; }
         function cancelRestore() { restoreReview=null;client.restoreApproval=null;el("chat-restore-review").hidden=true;controls(); }
         function reviewRestore(id) {
+            el("advanced").open=false;
             var g=generation;restoreWorking=true;controls();
             request("bind").then(function(){return client.heartbeat();}).then(function(){
                 if(g!==generation)throw {message:"Project changed; review the restore again"};
@@ -59,13 +67,78 @@
                 if(g!==generation || !client.restoreApproval)return;
                 restoreReview=client.restoreApproval;el("chat-restore-operation").textContent=result.operation;
                 el("chat-restore-review").hidden=false;el("chat-restore-cancel").focus();
-            },function(e){if(g===generation)error(e.code==="response_too_large" || e.code==="payload_too_large" ? {message:"This project is too large for verified chat restore. Nothing was changed. Your checkpoint is still available; use After Effects to open a copy manually."} : e);}).then(function(){restoreWorking=false;controls();});
+            },function(e){
+                if(g===generation)error(e.code==="restore_unsupported" ?
+                    {message:"Chat restore requires matching compact-restore support in the bridge and AE host. Nothing was changed. Update the matching integration before reviewing again; no full-scene fallback will run."} :
+                    e.code==="response_too_large" || e.code==="payload_too_large" ? {message:"Restore review exceeded its response limit. Nothing was changed. Your checkpoint is still available; use After Effects to open a copy manually."} : e);
+            }).then(function(){restoreWorking=false;controls();});
         }
         function refreshCheckpoints() {
             if(checkpointLoading || restoreWorking || restoreReview || !snapshot || !snapshot.sessionID)return Promise.resolve();
-            var g=generation;checkpointLoading=true;
-            return request("checkpoints").then(function(data){if(g===generation){checkpointList=data.checkpoints || [];checkpointAt=Date.now();}},function(){if(g===generation){checkpointList=[];checkpointAt=Date.now();}}).then(function(){checkpointLoading=false;controls();});
+            var g=generation;checkpointLoading=true;controls();
+            return request("checkpoints").then(function(data){if(g===generation){checkpointList=data.checkpoints || [];checkpointAt=Date.now();drawCheckpoints();}},function(e){if(g===generation){checkpointList=[];checkpointAt=Date.now();drawCheckpoints();error({message:"Could not load checkpoints. Close and reopen Restore checkpoint to try again. "+(e.message || "")});}}).then(function(){checkpointLoading=false;controls();});
         }
+        // Port CookieMonster's controlled disclosure state: streaming rerenders
+        // must not override a user's choice. Native details replaces Solid/Kobalte.
+        function disclosure(key, title, expanded) {
+            var box=node("details",undefined,"chat-disclosure"),summary=node("summary",title);
+            box.open=Object.prototype.hasOwnProperty.call(collapseState,key) ? collapseState[key] : expanded;
+            summary.addEventListener("click",function(e){e.preventDefault();box.open=!box.open;collapseState[key]=box.open;saveCollapse();});
+            box.appendChild(summary);return box;
+        }
+        function saveCollapse() {
+            try {
+                var keys=Object.keys(collapseState);keys.slice(0,Math.max(0,keys.length-500)).forEach(function(k){delete collapseState[k];});
+                window.localStorage.setItem("cookiejar-collapse:"+projectKey+":"+collapseSession,JSON.stringify(collapseState));
+            }catch(e){/* Disclosure state is optional; storage errors must not block editing. */}
+        }
+        function loadCollapse() {
+            collapseState={};
+            try { var raw=window.localStorage.getItem("cookiejar-collapse:"+projectKey+":"+collapseSession),saved=raw && raw.length<64000 ? JSON.parse(raw) : {};
+                Object.keys(saved || {}).slice(-500).forEach(function(k){if(typeof saved[k]==="boolean")collapseState[k]=saved[k];});
+            }catch(e){}
+        }
+        function formatted(part) {
+            var box=node("div",undefined,"chat-text chat-markdown"),count=0;
+            function append(parent,items,depth){
+                (items || []).forEach(function(item){
+                    if(++count>6000 || depth>20 || !item || typeof item!=="object")return;
+                    var allowed=["p","h1","h2","h3","h4","h5","h6","strong","em","del","code","pre","blockquote","ol","ul","li","br","hr","span","table","thead","tbody","tr","th","td"];
+                    var child=node(allowed.indexOf(item.tag)>=0 ? item.tag : "span",typeof item.text==="string" ? item.text : undefined);
+                    if(Array.isArray(item.children))append(child,item.children,depth+1);parent.appendChild(child);
+                });
+            }
+            if(Array.isArray(part.markdown))append(box,part.markdown,0);else box.textContent=part.text;
+            return box;
+        }
+        el("chat-history").addEventListener("click",function(){
+            if(historyLoading || !historyCursor || !snapshot)return;
+            var g=generation,session=snapshot.sessionID,box=el("chat-messages"),height=box.scrollHeight,top=box.scrollTop;
+            historyLoading=true;this.disabled=true;this.textContent="Loading history…";
+            request("history",{before:historyCursor}).then(function(page){
+                if(g!==generation || session!==page.sessionID || !snapshot || snapshot.sessionID!==session)return;
+                historyMessages=(page.messages || []).concat(historyMessages);historyCursor=page.nextCursor;historyLoaded=true;
+                draw(snapshot);box.scrollTop=top+box.scrollHeight-height;
+            },function(e){if(g===generation)error(e);}).then(function(){historyLoading=false;el("chat-history").disabled=false;el("chat-history").textContent="Load earlier messages";});
+        });
+        function drawCheckpoints() {
+            var picker=el("chat-checkpoint-picker"),previous=picker.value;picker.textContent="";
+            var list=checkpointList.slice().sort(function(a,b){return String(b.createdAt || "").localeCompare(String(a.createdAt || ""));});
+            if(!list.length){var empty=node("option","No checkpoints available");empty.value="";picker.appendChild(empty);}
+            list.forEach(function(c,index){
+                var date=new Date(c.createdAt),label=isNaN(date.getTime()) ? "Checkpoint "+c.id : date.toLocaleString()+" · "+c.id.slice(0,8);
+                var option=node("option",(index===0 ? "Latest · " : "")+label);option.value=c.id;picker.appendChild(option);
+            });
+            picker.value=list.some(function(c){return c.id===previous;}) ? previous : list.length ? list[0].id : "";
+        }
+        el("chat-checkpoints-toggle").addEventListener("click",function(){
+            if(this.disabled)return;
+            var open=el("chat-checkpoints").hidden;el("chat-checkpoints").hidden=!open;
+            this.setAttribute("aria-expanded",String(open));
+            if(open){drawCheckpoints();controls();refreshCheckpoints();}
+        });
+        el("chat-checkpoint-picker").addEventListener("change",controls);
+        el("chat-checkpoint-review").addEventListener("click",function(){if(!this.disabled)reviewRestore(el("chat-checkpoint-picker").value);});
         el("chat-restore-cancel").addEventListener("click",cancelRestore);
         el("chat-restore-confirm").addEventListener("click",function(){
             if(restoreWorking || !restoreReview || restoreReview!==client.restoreApproval)return;
@@ -83,7 +156,7 @@
             if(key===catalogKey)return;catalogKey=key;
             var picker=el("chat-model");picker.textContent="";
             var blank=node("option","CookieMonster default");blank.value="";blank.disabled=true;picker.appendChild(blank);
-            catalog.forEach(function(m){var option=node("option",m.name+" · "+m.provider);option.value=modelKey(m);picker.appendChild(option);});
+            catalog.forEach(function(m){var option=node("option",m.name);option.title=m.provider;option.value=modelKey(m);picker.appendChild(option);});
             if(current && !catalog.some(function(m){return modelKey(m)===modelKey(current);})){var missing=node("option",current.id+" · Unavailable");missing.value=modelKey(current);missing.disabled=true;picker.appendChild(missing);}
             picker.value=current ? modelKey(current) : "";
             drawReasoning(current && current.variant || "default");
@@ -150,6 +223,12 @@
         });
         function draw(data) {
             snapshot=data;
+            if(collapseSession!==data.sessionID){collapseSession=data.sessionID;loadCollapse();messagesKey="";historyMessages=[];historyLoaded=false;historyCursor=null;}
+            if(!historyLoaded)historyCursor=data.nextCursor || null;
+            var combined=historyMessages.concat(data.messages || []),seen={},merged=[];
+            for(var mi=combined.length-1;mi>=0;mi--){var msg=combined[mi];if(msg.id && seen["id:"+msg.id])continue;if(msg.id)seen["id:"+msg.id]=true;merged.unshift(msg);}
+            if(historyLoaded){historyMessages=merged.filter(function(m){return !!m.id;});data=Object.assign({},data,{messages:merged});}
+            el("chat-history").hidden=!historyCursor;
             if(!restoreWorking && data.restore)restoreNotice(data.restore.status==="completed" ?
                 (data.restore.recoveryCopy ? "Recovery copy opened. " : "Project restored. ")+"Earlier messages are history. Your previous work is preserved in checkpoint "+data.restore.currentCheckpointId+". "+(data.restore.warning || "") :
                 data.restore.status==="reconciled" ? "Recovery was reviewed. A restore was not confirmed; earlier messages remain history. You can continue from the inspected project state." :
@@ -159,25 +238,63 @@
             el("chat-progress").textContent=data.status==="idle" ? "Ready" : "CookieMonster is working…";
             if(data.error || el("chat-error").textContent===serverError)el("chat-error").textContent=data.error || "";
             serverError=data.error || "";
-            var key=JSON.stringify(data.messages || []);
+            var key=JSON.stringify([data.messages || [],data.status]);
             if(key!==messagesKey) {
                 messagesKey=key;var box=el("chat-messages"),nearBottom=box.scrollHeight-box.scrollTop-box.clientHeight<80;
                 box.textContent="";checkpointButtons=[];
+                var users=(data.messages || []).filter(function(m){return m.role==="user";}),oldUsers=users.slice(0,-2).map(function(m){return m.id;}),turnBox=null;
+                var requestCheckpoints={};
                 (data.messages || []).forEach(function(message){
+                    if(message.role!=="assistant" || !message.parentID)return;
+                    (message.parts || []).forEach(function(part){
+                        var key="request:"+message.parentID;
+                        if(part.type==="checkpoint" && !requestCheckpoints[key])requestCheckpoints[key]=part.id;
+                    });
+                });
+                (data.messages || []).forEach(function(message,messageIndex){
+                    if(message.role==="user"){
+                        turnBox=null;
+                        if(message.id && oldUsers.indexOf(message.id)>=0){
+                            var title=(message.parts || []).filter(function(p){return p.type==="text";}).map(function(p){return p.text;}).join(" ").slice(0,100);
+                            turnBox=disclosure("turn:"+message.id,title || "Earlier exchange",false);turnBox.className+=" chat-turn";box.appendChild(turnBox);
+                        }
+                    }
                     var row=node("article",undefined,"chat-message "+(message.role==="user" ? "from-user" : "from-assistant"));
                     row.appendChild(node("h3",message.role==="user" ? "You" : "CookieMonster"));
-                    (message.parts || []).forEach(function(part){
+                    var content=row;
+                    if(message.role==="user"){content=node("div",undefined,"chat-user-bubble");row.appendChild(content);}
+                    var messageKey="message:"+(message.id || messageIndex),activity=null;
+                    (message.parts || []).forEach(function(part,partIndex){
+                        var partKey=messageKey+":"+(part.id || partIndex);
                         if(part.type==="image" && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(part.url)) {
-                            var img=node("img");img.src=part.url;img.alt=part.filename || "Composition frame";row.appendChild(img);
+                            var imageBox=disclosure(partKey,"Image · "+(part.filename || "Composition frame"),false);
+                            var img=node("img");img.src=part.url;img.alt=part.filename || "Composition frame";imageBox.appendChild(img);content.appendChild(imageBox);
                         } else if(part.type==="checkpoint") {
                             var card=node("section",undefined,"chat-checkpoint");card.appendChild(node("strong",part.label));
                             var status=node("p"),button=node("button","Restore…");button.type="button";
                             button.addEventListener("click",function(){if(!button.disabled)reviewRestore(part.id);});
                             checkpointButtons.push({id:part.id,status:status,button:button});card.appendChild(status);card.appendChild(button);row.appendChild(card);
-                        } else if(part.type==="text" || part.type==="tool")row.appendChild(node("div",part.text,part.type==="tool" ? "chat-tool" : "chat-text"));
+                        } else if(part.type==="tool" || part.type==="reasoning"){
+                            if(!activity){activity=disclosure(messageKey+":activity",!message.completed && data.status!=="idle" ? "Working…" : "Activity",!message.completed && data.status!=="idle");content.appendChild(activity);}
+                            if(part.type==="reasoning")activity.appendChild(node("h4","Reasoning"));
+                            activity.appendChild(part.type==="tool" ? node("div",part.text,"chat-tool") : formatted(part));
+                        } else if(part.type==="text"){
+                            var text=formatted(part);
+                            if(part.text.length>1200 || part.text.split("\n").length>12){
+                                var longText=disclosure(partKey,part.text.slice(0,180).replace(/\s+/g," ")+"…",false);longText.appendChild(text);content.appendChild(longText);
+                            }else content.appendChild(text);
+                        }
                     });
+                    if(message.role==="user"){
+                        var checkpointId=requestCheckpoints["request:"+message.id] || "";
+                        var footer=node("div",undefined,"chat-message-actions"),restore=node("button","↶","chat-message-restore"),hint=node("span",undefined,"sr-only");
+                        restore.type="button";restore.setAttribute("aria-label","Restore project to before this request");
+                        restore.addEventListener("click",function(){if(!restore.disabled && checkpointId)reviewRestore(checkpointId);});
+                        checkpointButtons.push({id:checkpointId,status:hint,button:restore});
+                        footer.appendChild(hint);footer.appendChild(restore);row.appendChild(footer);
+                    }
                     if(message.error)row.appendChild(node("p",message.error,"chat-failure"));
-                    box.appendChild(row);
+                    (turnBox || box).appendChild(row);
                 });
                 if(!data.messages || !data.messages.length)box.appendChild(node("p","Ask about this composition, or choose another comp above. Your conversation stays with the project.","chat-empty"));
                 if(nearBottom)box.scrollTop=box.scrollHeight;
@@ -243,9 +360,10 @@
             if(restoreReview && restoreReview!==client.restoreApproval)cancelRestore();
             if(s.connection!=="connected")el("chat-progress").textContent="Connecting to CookieMonster…";
             if(key!==projectKey) {
-                projectKey=key;generation++;attachments=[];deliveryUnknown=false;drawAttachments();snapshot=null;takeover=false;messagesKey="";approvalsKey="";compKey="";serverError="";
+                projectKey=key;generation++;attachments=[];deliveryUnknown=false;drawAttachments();snapshot=null;takeover=false;messagesKey="";approvalsKey="";compKey="";serverError="";collapseState={};collapseSession="";
                 catalog=[];catalogKey="";catalogAt=0;modelError="";drawModels();
                 checkpointList=[];checkpointButtons=[];checkpointAt=0;cancelRestore();if(!restoreWorking)restoreNotice("");
+                drawCheckpoints();el("chat-checkpoints").hidden=true;el("chat-checkpoints-toggle").setAttribute("aria-expanded","false");
                 el("chat-messages").textContent="";el("chat-approvals").textContent="";el("chat-error").textContent="";el("chat-input").value="";
                 el("chat-project-name").textContent=s.project && s.project.path ? s.project.path.split(/[\\/]/).pop() : "Unsaved project";
             }

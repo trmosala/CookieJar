@@ -14,7 +14,7 @@ export const AE_PERMISSIONS = Object.freeze({
   ae_bind: "ask",
   ae_release: "ask",
   ae_inspect: "allow",
-  ae_execute: "ask",
+  ae_execute: "allow",
   ae_grant: "ask",
   ae_capture: "ask",
   ae_checkpoints: "ask",

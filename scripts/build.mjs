@@ -76,6 +76,10 @@ export async function build(directory = root) {
     }
     await copyFile(join(directory, "compatibility.json"), join(stage, "compatibility.json"));
     await copyFile(join(dirname(zodPackage), "LICENSE"), join(stage, "cm-ae", "ZOD-LICENSE.txt"));
+    if (pkg.dependencies?.marked) {
+      const markedPackage = require.resolve("marked/package.json");
+      await copyFile(join(dirname(markedPackage), "LICENSE.md"), join(stage, "cm-ae", "MARKED-LICENSE.txt"));
+    }
     await writeFile(join(stage, "cm-ae", "permissions.json"), JSON.stringify(AE_PERMISSIONS, null, 2) + "\n");
     const artifacts = [];
     for (const path of await files(stage)) {

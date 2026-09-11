@@ -38,6 +38,25 @@ async function fixture(t) {
 }
 const message = (extra = {}) => ({ action: "send", text: "Make this title blue", compId: 1, requestId: "a".repeat(40), ...extra })
 
+test("history uses the server cursor and the current scoped session, returning bounded formatted pages", async t => {
+  const f = await fixture(t)
+  await f.send(message())
+  f.client.session.messages = async options => {
+    assert.equal(options.path.id, "ses_chat1")
+    assert.equal(options.query.limit, 60)
+    const older = options.query.before === "cursor-next"
+    return { data: [{ info: { id: older ? "old" : "new", role: "assistant" }, parts: [{ id: "text", type: "text", text: "**formatted**" }] }],
+      response: { headers: { get: () => older ? null : "cursor-next" } } }
+  }
+  const state = await f.send()
+  assert.equal(state.nextCursor, "cursor-next")
+  assert.equal(state.messages[0].parts[0].markdown[0].children[0].tag, "strong")
+  const page = await f.send({ action: "history", before: state.nextCursor })
+  assert.equal(page.messages[0].id, "old")
+  assert.equal(page.nextCursor, null)
+  await assert.rejects(f.send({ action: "history", before: "" }), { code: "invalid_payload" })
+})
+
 test("temporary restore project polls never release the pending conversation", async t => {
   const f = await fixture(t)
   const sent = await f.send(message())
@@ -212,6 +231,13 @@ test("invalid references are rejected before creating or submitting a conversati
 
 test("completed edits expose only their actual pre-edit checkpoint and restore state survives reopening", async t => {
   const f = await fixture(t), sent = await f.send(message())
+  const queries = []
+  const inspectQuery = f.runtime.workflow.inspectQuery
+  f.runtime.workflow.inspect = () => assert.fail("Chat context must not read a full scene")
+  f.runtime.workflow.inspectRestore = () => assert.fail("Chat context is separate from restore guards")
+  f.runtime.workflow.inspectQuery = (sessionID, query) => {
+    queries.push(query); return inspectQuery(sessionID, query)
+  }
   f.messages.push({ info: {id:"edit",role:"assistant"}, parts:[
     {type:"tool",tool:"ae_execute",state:{status:"completed",output:JSON.stringify({checkpointId:"cp-before",result:"done"})}},
     {type:"text",text:"checkpointId: fake"},
@@ -225,7 +251,9 @@ test("completed edits expose only their actual pre-edit checkpoint and restore s
   await f.chat.recordRestore(sent.sessionID,{status:"completed",checkpointId:"cp-before",currentCheckpointId:"cp-current",recoveryCopy:false})
   const reopened=await createChat(f.runtime);reopened.register({client:f.client,directory:f.p.dataDir});f.p.bridge.setChatHandler(reopened.handle)
   assert.equal((await f.send()).restore.currentCheckpointId,"cp-current")
+  assert.deepEqual(queries, [], "restore audit and reopening do not refresh scene context")
   await f.send(message({requestId:"b".repeat(40)}))
+  assert.deepEqual(queries, [{ compId: 1, depth: 0 }])
   assert.match(f.inputs.at(-1).body.system,/cp-before/)
   assert.match(f.inputs.at(-1).body.system,/never replay previous edits/)
   f.statuses[sent.sessionID]={type:"busy"}

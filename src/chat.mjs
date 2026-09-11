@@ -2,6 +2,7 @@ import path from "node:path"
 import { lstat, readFile, realpath } from "node:fs/promises"
 import { secureWrite } from "./storage.mjs"
 import { fail, hash } from "./protocol.mjs"
+import { markdown } from "./markdown.mjs"
 
 // The panel owns presentation and AE context; CM owns messages, models and permissions.
 export async function createChat(runtime) {
@@ -29,6 +30,12 @@ export async function createChat(runtime) {
     return response?.data
   }
   const options = r => ({ path: { id: r.sessionID }, query: { directory: r.directory }, signal: AbortSignal.timeout(20000) })
+  async function messagePage(r, before) {
+    const response = await clientFor(r).session.messages({ ...options(r), query: { directory: r.directory, limit: 60, ...(before ? { before } : {}) } })
+    const messages = await result(Promise.resolve(response))
+    const cursor = response?.response?.headers?.get?.("x-next-cursor") || null
+    return { messages: displayMessages(messages), nextCursor: cursor }
+  }
   async function models(r) {
     const data = await result(clientFor(r).provider.list({ query: { directory: r.directory }, signal: AbortSignal.timeout(20000) }))
     return (data?.all || []).filter(p => data.connected?.includes(p.id)).flatMap(p =>
@@ -84,7 +91,7 @@ export async function createChat(runtime) {
       const canonical = await realpath(project.path)
       const list = await runtime.checkpoints.list(project.id)
       check()
-      return { checkpoints: list.filter(c => c.projectId === project.id && c.projectPath === canonical).map(c => ({ id: c.id })) }
+      return { checkpoints: list.filter(c => c.projectId === project.id && c.projectPath === canonical).map(c => ({ id: c.id, createdAt: c.createdAt })) }
     }
     if (body.action === "bind" && !r) fail("chat_unavailable", "Open a project conversation before restoring")
     if (body.action === "models") {
@@ -94,17 +101,24 @@ export async function createChat(runtime) {
       check()
       return { models: catalog }
     }
+    if (body.action === "history") {
+      if (!r) fail("chat_unavailable", "Open a conversation before loading history")
+      if (typeof body.before !== "string" || !body.before.length || body.before.length > 4096) fail("invalid_payload", "A bounded history cursor is required")
+      const page = await messagePage(r, body.before)
+      check()
+      return { sessionID: r.sessionID, ...page }
+    }
     if (body.action === "state") {
       if (!r) return { sessionID: null, messages: [], permissions: [], workspaces, owned, status: "idle" }
       const client = clientFor(r)
       const [messages, statuses, model] = await Promise.all([
-        result(client.session.messages({ ...options(r), query: { directory: r.directory, limit: 60 } })),
+        messagePage(r),
         result(client.session.status({ query: { directory: r.directory }, signal: AbortSignal.timeout(20000) })),
         selection(r),
       ])
       check()
       return { sessionID: r.sessionID, directory: r.directory, workspaces, owned, model,
-        messages: displayMessages(messages), restore: r.restore || null, permissions: [...(permissions.get(r.sessionID)?.values() || [])].slice(0, 1),
+        ...messages, restore: r.restore || null, permissions: [...(permissions.get(r.sessionID)?.values() || [])].slice(0, 1),
         status: statuses?.[r.sessionID]?.type || "idle", error: errors.get(r.sessionID) || null,
         delivery: r.requests.at(-1)?.status || null }
     }
@@ -209,7 +223,7 @@ export async function createChat(runtime) {
           " If lastRestore is present, prior messages describe historical states. Inspect the current project before any edit; never replay previous edits automatically. " +
           " Resolve this comp to that fixed ID for the whole request even if the active viewer changes. " +
           "You may inspect and work on other compositions by ID without changing the viewer. Ask about ambiguous names. " +
-          "Use exact-source approval and checkpoints for edits. If clarification is needed, ask in your reply.",
+          "Use ae_execute with a current inspection revision for edits; it verifies a checkpoint before running. Do not request an extra confirmation for checkpoint-backed scripts. If product intent needs clarification, ask in your reply.",
         parts: [{ type: "text", text: body.text }, ...attachments],
       } }))
       request.status = "accepted"
@@ -279,7 +293,7 @@ export async function createChat(runtime) {
         fail("stale_project", "This conversation cannot retarget after a project change")
     },
     handle(input) {
-      if (["state", "models", "checkpoints"].includes(input.body.action)) return handle(input)
+      if (["state", "history", "models", "checkpoints"].includes(input.body.action)) return handle(input)
       if (input.body.action === "stop") {
         generations.set(input.panelId, (generations.get(input.panelId) || 0) + 1)
         return handle(input).then(async value => {
@@ -306,16 +320,22 @@ function displayMessages(messages) {
   let imageBudget = 5 * 1024 * 1024, textBudget = 400000
   return (Array.isArray(messages) ? messages : []).slice(-60).reverse().map(message => ({
     id: message.info.id, role: message.info.role, error: message.info.error?.data?.message || null,
+    parentID: message.info.role === "assistant" ? message.info.parentID || null : null,
+    completed: typeof message.info.time?.completed === "number",
     parts: (message.parts || []).flatMap(part => {
       if (part.type === "text" && !part.synthetic && textBudget > 0) {
         const text = String(part.text).slice(0, Math.min(64000, textBudget)); textBudget -= text.length
-        return [{ type: "text", text }]
+        return [{ type: "text", id: part.id, text, ...(message.info.role === "assistant" ? { markdown: markdown(text) } : {}) }]
+      }
+      if (part.type === "reasoning" && message.info.role === "assistant" && textBudget > 0 && part.text?.trim()) {
+        const text = String(part.text).slice(0, Math.min(64000, textBudget)); textBudget -= text.length
+        return [{ type: "reasoning", id: part.id, text, markdown: markdown(text) }]
       }
       const files = part.type === "file" ? [part] : part.type === "tool" ? part.state?.attachments || [] : []
       const images = files.flatMap(file => {
         if (typeof file.url !== "string" || !/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(file.url) || file.url.length > imageBudget) return []
         imageBudget -= file.url.length
-        return [{ type: "image", url: file.url, filename: file.filename || "Composition frame" }]
+        return [{ type: "image", id: file.id, url: file.url, filename: file.filename || "Composition frame" }]
       })
       if (part.type === "tool") {
         const cards = []
@@ -326,7 +346,7 @@ function displayMessages(messages) {
               cards.push({ type: "checkpoint", id: output.checkpointId, label: "Before this edit" })
           } catch { /* A malformed tool result must never become a restore control. */ }
         }
-        return [{ type: "tool", text: part.tool + " · " + (part.state?.status || "pending") }, ...cards, ...images]
+        return [{ type: "tool", id: part.id, text: part.tool + " · " + (part.state?.status || "pending") }, ...cards, ...images]
       }
       return part.type === "file" && !images.length ? [{ type: "text", text: "Attached: " + String(part.filename || "Reference").slice(0, 255) }] : images
     }),

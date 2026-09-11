@@ -3,6 +3,12 @@
     "use strict";
     function el(id) { return document.getElementById(id); }
     var client, host, store, api, chat, working = false, checkpoints = [], serviceContext = "", diagnosticURL = null, serviceTimer, restoreOperation = null, restoreResult = "";
+    window.addEventListener("keydown",function(e){
+        if(e.key==="Escape" && el("advanced").open){el("advanced").open=false;el("settings-toggle").focus();}
+    });
+    window.addEventListener("click",function(e){
+        if(el("advanced").open && !el("advanced").contains(e.target))el("advanced").open=false;
+    });
     function serviceStatus(message) {
         // Operation evidence is not current-project metadata; refreshes must not erase backup locations.
         el("services-status").textContent=message+(restoreResult ? "\n\n"+restoreResult : "");
@@ -61,7 +67,8 @@
     function render(s) {
         if(chat)chat.update(s);
         var recovery=!!(s.uncertain || s.lock);
-        el("connection-status").textContent=recovery ? "Paused" : s.connection==="connected" ? "Connected" : "Connecting…";
+        el("connection-status").className=s.connection==="connected" ? "is-connected" : "is-disconnected";
+        el("connection-status").textContent=s.connection==="connected" ? (recovery ? "Connected · Paused" : "Connected") : s.connection==="connecting" ? "Connecting…" : s.connection==="disconnected" ? "Disconnected" : "Not connected";
         el("recovery-notice").hidden=!recovery;
         el("recovery-message").textContent=s.uncertain ? "An action was interrupted. Wait for AE to finish, then check your project and render queue before continuing. The action will not be repeated." : "The connection is back. Ask CookieMonster to review the interrupted action in chat before making more changes.";
         el("reconcile").hidden=!s.uncertain;

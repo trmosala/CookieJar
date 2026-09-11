@@ -4,6 +4,7 @@ import path from "node:path"
 import { randomBytes, randomUUID, createHash } from "node:crypto"
 import net from "node:net"
 import { lstat, readFile, open, rename, unlink } from "node:fs/promises"
+import { setTimeout as delay } from "node:timers/promises"
 import { secureDirectory } from "./storage.mjs"
 import { AEError, fail, canonical, assertObject, assertString, PROTOCOL, VERSION, UPDATE_URL,
   validVersion, validProtocol, releaseMetadata } from "./protocol.mjs"
@@ -50,16 +51,25 @@ function activeComp(value = null) {
   return value
 }
 
-function restoreSnapshot(value, expectedProject) {
-  assertObject(value)
-  if (!sameProject(project(value.project), expectedProject) || !Number.isSafeInteger(value.revision) ||
-      value.revision < 1 || value.busy !== false || !Array.isArray(value.items) ||
-      !Array.isArray(value.selection) || !Array.isArray(value.installedEffects))
-    fail("invalid_payload", "Restore requires a complete idle snapshot of the expected project")
+export const RESTORE_PROOF = "compact-restore-v1"
+
+export function restoreReceipt(value, expectedProject) {
+  if (value?.protocol !== RESTORE_PROOF)
+    fail("restore_unsupported", "A matching compact restore host is required; scene snapshots are not restore proofs")
+  schema(value, ["protocol", "project", "projectEpoch", "revision", "dirty", "busy", "callbacksClear", "capabilities"])
+  const identity = project(value.project)
+  if (!identity.saved || !sameProject(identity, expectedProject) ||
+      typeof value.projectEpoch !== "string" || !value.projectEpoch.length || value.projectEpoch.length > 256 ||
+      value.projectEpoch.includes("\u0000") || !Number.isSafeInteger(value.revision) || value.revision < 1 ||
+      typeof value.dirty !== "boolean" || value.busy !== false || value.callbacksClear !== true)
+    fail("invalid_host_result", "Invalid compact restore identity, epoch, revision, dirty or idle guards")
   capabilities(value.capabilities)
-  if (!Object.hasOwn(value, "activeCompId")) fail("invalid_payload", "Restore snapshot lacks active composition state")
-  activeComp(value.activeCompId)
+  if (!value.capabilities.fileNetwork) fail("capability_missing", "Restore requires file access")
   return value
+}
+
+export function restoreFingerprint(value, connectionId) {
+  return digest(canonical({ kind: RESTORE_PROOF, connectionId, receipt: value }))
 }
 
 function sameProject(a, b) {
@@ -170,7 +180,14 @@ async function startBridge({
       await handle.sync()
       await handle.close()
       handle = null
-      await rename(temporary, file)
+      for (let attempt = 0; ; attempt++) {
+        try { await rename(temporary, file); break } catch (error) {
+          // Match the render journal's bounded Windows replacement retry. Keep
+          // the original destination intact; exhausted writes still fail closed.
+          if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(error.code) || attempt === 9) throw error
+          await delay(20 * (attempt + 1))
+        }
+      }
     } finally {
       await handle?.close()
       await unlink(temporary).catch(error => { if (error.code !== "ENOENT") throw error })
@@ -267,7 +284,7 @@ async function startBridge({
     return view(b)
   }
   const bridge = {
-    dataDir, canonicalRestore: true,
+    dataDir, canonicalRestore: true, compactRestore: RESTORE_PROOF,
     compatibility(sessionID) {
       return { ...compatibility(), pendingPanels: [...pairing.values()]
         .filter(entry => entry.sessionID === sessionID && entry.expiresAt > now() && entry.peer)
@@ -377,7 +394,7 @@ async function startBridge({
       await persist()
       return clone(lock)
     },
-    async unlock(sessionID) {
+    async unlock(sessionID, { restoreReview, authorizeRestoreReview } = {}) {
       const b = binding(sessionID, { allowLocked: true })
       const c = live.get(b.connectionId)
       if (c.pending || c.busy) fail("host_busy", "Cannot unlock while AE is busy")
@@ -388,6 +405,24 @@ async function startBridge({
       if (lock.restore && lock.state === "executing" &&
           (lock.restore.phase !== "finished" || lock.evidence?.outcome !== "confirmed"))
         fail("restore_in_progress", "Manual restore is not confirmed; retain its lock")
+      if (lock.reason?.kind === "restore" && lock.reason.proof === RESTORE_PROOF) {
+        const reviewedLock = canonical(lock)
+        const expected = lock.state === "executing" ? lock.evidence?.expectedFingerprint : restoreReview
+        if (!expected || lock.state !== "executing" && restoreReview !== c.restoreObserved)
+          fail("permission_required", "Compact restore uncertainty requires explicit actual-project review")
+        const reviewed = lock.state !== "executing" || restoreReview !== undefined
+        if (reviewed && typeof authorizeRestoreReview !== "function")
+          fail("permission_required", "Compact restore review requires final synchronous authorization")
+        const receipt = await bridge.call(sessionID, "inspect", { restore: RESTORE_PROOF }, { allowLocked: true })
+        const latest = binding(sessionID, { allowLocked: true })
+        if (latest.id !== b.id || live.get(b.connectionId) !== c || !sameProject(latest.project, b.project) ||
+            canonical(lock) !== reviewedLock || targetLock(c.id, b.project) !== lock ||
+            restoreFingerprint(receipt, c.id) !== expected)
+          fail("stale_fingerprint", "Compact restore state or recovery lock changed before unlock")
+        // Use the review owner's deadline/clock after the last await, before removing the lock.
+        if (reviewed && authorizeRestoreReview() !== true)
+          fail("permission_required", "Compact restore review authorization was not confirmed synchronously")
+      }
       c.restore = null
       state.locks = state.locks.filter(value => value !== lock)
       await persist()
@@ -411,6 +446,13 @@ async function startBridge({
           lock.connectionId !== b.connectionId || !sameProject(lock.project, b.project) ||
           live.get(b.connectionId)?.pending)
         fail("lock_required", "Only the idle executing owner may record outcome evidence")
+      if (lock.reason?.proof === RESTORE_PROOF && ["confirmed", "recovery_copy"].includes(evidence.outcome)) {
+        const c = live.get(b.connectionId)
+        if (lock.restore?.phase !== "finished" || !c.restore?.finishedFingerprint ||
+            evidence.expectedFingerprint !== c.restore.finishedFingerprint ||
+            evidence.expectedFingerprint !== c.restoreObserved)
+          fail("unsafe_state", "Compact restore outcome requires a matching opened receipt and fresh read")
+      }
       lock.evidence = clone(evidence)
       await persist()
     },
@@ -443,6 +485,11 @@ async function startBridge({
           lock.connectionId !== b.connectionId || !sameProject(lock.project, b.project)))
         fail("lock_required", "Acquire this session's durable executing lock before changing AE state")
       const manual = method === "execute" && ["restore_prepare", "restore_finish"].includes(payload.phase)
+      if (method === "inspect" && Object.hasOwn(payload, "restore")) {
+        schema(payload, ["restore"])
+        if (payload.restore !== RESTORE_PROOF) fail("restore_unsupported", "Unsupported compact restore protocol")
+        c.restoreObserved = null
+      }
       if (lock?.restore && method !== "inspect" && !manual)
         fail("restore_in_progress", "Only inspection and the authorized manual restore may run")
       if (method === "execute" && payload.phase) {
@@ -474,17 +521,18 @@ async function startBridge({
           fail("unsafe_state", "No prepared recovery transition")
         if (manual) {
           assertString(payload.recoveryId, "restore id", 256)
-          restoreSnapshot(payload.expected, b.project)
+          restoreReceipt(payload.expected, b.project)
           assertString(payload.path, "restore path", 32768)
           const privatePath = prefix => path.isAbsolute(payload.path) && path.resolve(payload.path) === payload.path &&
             path.dirname(payload.path) === dataDir &&
             new RegExp("^workflow-" + prefix + "-[a-f0-9-]+[.]aepx?$").test(path.basename(payload.path))
           if (payload.phase === "restore_prepare") {
-            if (c.stopped || c.restore || lock.restore || lock.recoveryOriginal || lock.reason?.kind !== "restore")
+            if (c.stopped || c.restore || lock.restore || lock.recoveryOriginal || lock.reason?.kind !== "restore" ||
+                lock.reason.proof !== RESTORE_PROOF)
               fail("unsafe_state", "Manual restore requires a fresh restore lock without stopped or uncertain execution")
             assertString(lock.reason.checkpointId, "checkpoint id", 256)
             if (!/^[a-f0-9]{64}$/.test(lock.reason.planHash) ||
-                digest(canonical(payload.expected)) !== lock.reason.fingerprint)
+                restoreFingerprint(payload.expected, c.id) !== lock.reason.fingerprint)
               fail("unsafe_state", "Restore snapshot does not match the approved lock")
             if (!privatePath("emergency")) fail("invalid_path", "Restore save must use a private emergency project")
           } else {
@@ -702,8 +750,8 @@ async function startBridge({
       fail("disconnected", "Heartbeat expired; reconnect and explicitly rebind")
     }
     if (endpoint === "/chat") {
-      schema(body, ["action", "project"], ["text", "requestId", "compId", "directory", "permissionId", "response", "takeover", "attachments", "model"])
-      if (!["state", "send", "new", "stop", "permission", "models", "model", "checkpoints", "bind"].includes(body.action)) fail("invalid_payload", "Unknown chat action")
+      schema(body, ["action", "project"], ["text", "requestId", "compId", "directory", "permissionId", "response", "takeover", "attachments", "model", "before"])
+      if (!["state", "history", "send", "new", "stop", "permission", "models", "model", "checkpoints", "bind"].includes(body.action)) fail("invalid_payload", "Unknown chat action")
       const expected = project(body.project), credentialHash = credential.hash
       const check = () => {
         if (live.get(c.id) !== c || !c.connected || credential.hash !== credentialHash || !sameProject(c.project, expected))
@@ -840,7 +888,7 @@ async function startBridge({
             fail("invalid_host_result", "Invalid stopped execution evidence")
           c.stopped = clone(r.recovery)
         } else if (p.phase === "restore_prepare" || p.phase === "restore_finish") {
-          schema(r, ["status", "project", "snapshot"])
+          schema(r, ["status", "project", "receipt"])
           const next = project(r.project), rec = c.restore
           const b = bindings.get(pending.command.sessionID), lock = targetLock(c.id, pending.project)
           const preparing = p.phase === "restore_prepare"
@@ -851,27 +899,22 @@ async function startBridge({
               !sameProject(b.project, pending.project) || lock?.state !== "executing" ||
               lock.sessionID !== pending.command.sessionID || lock.restore?.id !== rec.id)
             fail("invalid_host_result", "Manual restore reply does not match the executing owner")
-          restoreSnapshot(r.snapshot, next)
+          restoreReceipt(r.receipt, next)
+          if (r.receipt.dirty !== false) fail("invalid_host_result", "Restore transition must return a clean project")
           if (preparing) {
-            const normalized = clone(r.snapshot), prior = clone(p.expected)
-            if (normalized.revision !== prior.revision && normalized.revision !== prior.revision + 1)
-              fail("invalid_host_result", "Manual emergency save advanced beyond its Save As revision")
-            normalized.project = prior.project
-            delete normalized.fingerprint; delete prior.fingerprint
-            // Native Save As refreshes the revision and property locators synchronously.
-            const savedRevision = value => {
-              if (!value || typeof value !== "object") return
-              if (value.locator) value.locator.revision = prior.revision
-              for (const child of Object.values(value)) savedRevision(child)
+            const prior = p.expected
+            if (r.receipt.projectEpoch !== prior.projectEpoch ||
+                r.receipt.revision !== prior.revision)
+              fail("invalid_host_result", "Manual emergency save changed the approved revision")
+            rec.snapshot = canonical(r.receipt)
+          } else {
+            if (r.receipt.projectEpoch === p.expected.projectEpoch)
+              fail("invalid_host_result", "Open must establish a new native project epoch")
+            if (p.path === rec.original.path) {
+              if (!sameProject(next, rec.original)) fail("invalid_host_result", "Original identity did not return")
+              delete lock.recoveryOriginal
             }
-            normalized.revision = prior.revision
-            savedRevision(normalized)
-            if (canonical(normalized) !== canonical(prior))
-              fail("invalid_host_result", "Manual emergency save changed the approved scene or revision")
-            rec.snapshot = canonical(r.snapshot)
-          } else if (p.path === rec.original.path) {
-            if (!sameProject(next, rec.original)) fail("invalid_host_result", "Original identity did not return")
-            delete lock.recoveryOriginal
+            rec.finishedFingerprint = restoreFingerprint(r.receipt, c.id)
           }
           rec.phase = preparing ? "saved" : "finished"
           lock.restore.phase = rec.phase
@@ -908,8 +951,13 @@ async function startBridge({
     if (!body.error) {
       try {
         result = clone(body.result)
+        if (pending.command.method === "inspect" && pending.command.params.restore === RESTORE_PROOF) {
+          restoreReceipt(result, pending.project)
+          c.restoreObserved = restoreFingerprint(result, c.id)
+        }
         if (pending.command.method === "inspect" && result?.activeCompId !== undefined) activeComp(result.activeCompId)
-      } catch { body.error = { code: "invalid_host_result", message: "Host reply is not finite JSON or has invalid metadata" } }
+      } catch (error) { body.error = { code: error.code === "restore_unsupported" ? error.code : "invalid_host_result",
+        message: "Host reply is not finite JSON or has invalid metadata or unsupported restore protocol" } }
     }
     c.pending = null
     clearTimeout(pending.timer)

@@ -53,7 +53,7 @@ test("bundled config preserves browser entries/policy, isolates invalid artifact
   await assert.rejects(mergeBundledPlugins({ plugin: {} }, []), TypeError);
   const defaults = (await mergeBundledPlugins({}, [artifact])).config.permission;
   assert.equal(defaults.ae_inspect, "allow");
-  assert.equal(defaults.ae_execute, "ask");
+  assert.equal(defaults.ae_execute, "allow");
   assert.equal(defaults.ae_templates, "ask");
   assert.equal(defaults.ae_render_list, "allow");
   assert.equal(defaults.ae_render_recover, "ask");
@@ -93,7 +93,7 @@ test("multiple bundles preserve options through path aliases and omit failed opt
   const fresh = await mergeBundledPlugins({}, artifacts);
   assert.equal(fresh.config.plugin.length, 2);
   assert.equal(fresh.config.permission.browser_click, "ask");
-  assert.equal(fresh.config.permission.ae_execute, "ask");
+  assert.equal(fresh.config.permission.ae_execute, "allow");
   assert.equal(Object.hasOwn(fresh.config.permission, "missing_tool"), false);
   assert.deepEqual(fresh.diagnostics.map(({ id, severity, code }) => [id, severity, code]),
     [["missing", "warning", "ARTIFACT_UNAVAILABLE"]]);
@@ -149,6 +149,7 @@ test("build bundles dependencies but preserves the real worker URL and reproduci
   await mkdir(join(fixture, "node_modules"), { recursive: true });
   const require = createRequire(import.meta.url);
   await cp(dirname(require.resolve("zod/package.json")), join(fixture, "node_modules", "zod"), { recursive: true });
+  await cp(dirname(require.resolve("marked/package.json")), join(fixture, "node_modules", "marked"), { recursive: true });
   await copyFile(join(root, "package.json"), join(fixture, "package.json"));
   await copyFile(join(root, "compatibility.json"), join(fixture, "compatibility.json"));
   for (const name of ["render-worker.mjs", "protocol.mjs"]) {

@@ -8,9 +8,9 @@
 
 <meta name="viewport" content="width=device-width,initial-scale=1">
 
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
 
-<title>CookieMonster AE</title>
+<title>CookieJar-AE</title>
 
 <link rel="stylesheet" href="panel.css">
 
@@ -20,62 +20,16 @@
 
 <main>
 
-<header><div class="brand"><span class="brand-mark" aria-hidden="true">C</span><h1>CookieMonster</h1><span class="host-label">After Effects</span></div><span id="connection-status" role="status">Connecting…</span></header>
-
-<section class="chat" aria-label="Project chat">
-
-<div class="chat-heading"><h2 id="chat-project-name">Opening projectâ€¦</h2><button id="chat-new" type="button">New chat</button></div>
-
-<label class="sr-only" for="chat-comp">Composition</label>
-
-<select id="chat-comp"><option value="follow">Follow active composition</option></select>
-
-<p id="chat-target">Following active composition</p>
-
-<section id="recovery-notice" class="notice" aria-label="Recovery needed" hidden><h2>Check After Effects before continuing</h2><p id="recovery-message"></p><button id="reconcile" type="button">I checked AE — continue</button></section>
-
-<p id="connection-notice" class="notice" role="status" hidden></p>
-
-<p id="capture" class="capture" role="status" aria-live="assertive" hidden></p>
-
-<select id="chat-workspace" aria-label="CookieMonster workspace" hidden></select>
-
-<button id="chat-takeover" type="button" hidden>Take control for this chat</button>
-
-<div id="chat-messages" role="log" aria-label="Conversation"></div>
-
-<div id="chat-approvals" aria-live="polite"></div>
-
-<p id="chat-error" role="alert"></p>
-
-<p id="chat-restore-status" class="notice" role="status" hidden></p>
-<section id="chat-restore-review" class="chat-approval" hidden aria-label="Review project restore">
-<h3>Restore the project to before this edit?</h3>
-<p>Your current work will be saved and backed up first. This restores the whole project, not just this composition. Chat history stays visible as history; previous edits will not run again.</p>
-<pre id="chat-restore-operation"></pre>
-<button id="chat-restore-confirm" type="button">Save current work and restore</button>
-<button id="chat-restore-cancel" type="button">Cancel</button>
+<header><div class="brand"><img class="brand-mark" src="brand-dev.png" alt="" aria-hidden="true"><h1>CookieJar-AE</h1><span class="host-label">After Effects</span></div><div class="header-controls"><span id="connection-status" class="is-disconnected" role="status">Not connected</span><details id="advanced"><summary id="settings-toggle" aria-label="Settings and troubleshooting" title="Settings &amp; troubleshooting">☰</summary><div class="advanced-content"><h2>Settings &amp; troubleshooting</h2>
+<section class="settings-checkpoints" aria-label="Restore project checkpoint">
+<button id="chat-checkpoints-toggle" type="button" aria-expanded="false" aria-controls="chat-checkpoints">Restore checkpoint…</button>
+<section id="chat-checkpoints" aria-label="Project checkpoints" hidden>
+<label for="chat-checkpoint-picker">Saved project state</label>
+<select id="chat-checkpoint-picker" aria-describedby="chat-checkpoint-help"></select>
+<p id="chat-checkpoint-help" role="status"></p>
+<button id="chat-checkpoint-review" type="button" disabled>Review restore…</button>
 </section>
-
-<form id="chat-form">
-
-<div class="chat-model-controls"><label>Model<select id="chat-model"><option value="">CookieMonster default</option></select></label><label>Reasoning<select id="chat-reasoning"><option value="default">Default</option></select></label></div>
-<p id="chat-model-status" role="status"></p>
-
-<label class="sr-only" for="chat-input">Message CookieMonster</label>
-
-<div id="chat-attachments" aria-live="polite"></div>
-<input id="chat-files" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf,.txt,.md" multiple hidden>
-<textarea id="chat-input" rows="3" maxlength="16000" placeholder="What should we work on?"></textarea>
-
-<p class="attachment-help">Drop or paste references · Up to 4 files, 2 MB total</p>
-<div class="chat-actions"><button id="chat-attach" type="button">Attach</button><button id="chat-mention" type="button">@ Mention comp</button><span id="chat-progress" role="status">Connectingâ€¦</span><button id="chat-stop" type="button" disabled>Stop</button><button id="chat-send" type="submit" disabled>Send</button></div>
-
-</form>
-
-</section>
-
-<details id="advanced"><summary>Settings &amp; troubleshooting</summary><div class="advanced-content"><p class="qualification">Development build · Use disposable projects for testing.</p>
+</section><p class="qualification">Development build · Use disposable projects for testing.</p>
 
 <p>Targets AE 25/26. No point versions certified. Use disposable projects until the qualification matrix is supplied.</p>
 
@@ -217,7 +171,69 @@
 
 </section>
 
-</div></details>
+</div></details></div></header>
+
+<section class="chat" aria-label="Project chat">
+
+<div class="chat-heading"><h2 id="chat-project-name">Opening project…</h2><button id="chat-new" type="button">New chat</button></div>
+
+
+
+<label class="sr-only" for="chat-comp">Composition</label>
+
+<select id="chat-comp"><option value="follow">Follow active composition</option></select>
+
+<p id="chat-target">Following active composition</p>
+
+<section id="recovery-notice" class="notice" aria-label="Recovery needed" hidden><h2>Check After Effects before continuing</h2><p id="recovery-message"></p><button id="reconcile" type="button">I checked AE — continue</button></section>
+
+<p id="connection-notice" class="notice" role="status" hidden></p>
+
+<p id="capture" class="capture" role="status" aria-live="assertive" hidden></p>
+
+<select id="chat-workspace" aria-label="CookieMonster workspace" hidden></select>
+
+<button id="chat-takeover" type="button" hidden>Take control for this chat</button>
+
+<button id="chat-history" type="button" hidden>Load earlier messages</button>
+<div id="chat-messages" role="log" aria-label="Conversation"></div>
+
+<div id="chat-approvals" aria-live="polite"></div>
+
+<p id="chat-error" role="alert"></p>
+
+<p id="chat-restore-status" class="notice" role="status" hidden></p>
+<section id="chat-restore-review" class="chat-approval" hidden aria-label="Review project restore">
+<h3>Restore the project to before this edit?</h3>
+<p>Your current work will be saved and backed up first. This restores the whole project, not just this composition. Chat history stays visible as history; previous edits will not run again.</p>
+<pre id="chat-restore-operation"></pre>
+<button id="chat-restore-confirm" type="button">Save current work and restore</button>
+<button id="chat-restore-cancel" type="button">Cancel</button>
+</section>
+
+<form id="chat-form">
+
+<label class="sr-only" for="chat-input">Message CookieMonster</label>
+
+<div id="chat-attachments" aria-live="polite"></div>
+<input id="chat-files" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf,.txt,.md" multiple hidden>
+<textarea id="chat-input" rows="2" maxlength="16000" placeholder="Ask anything about your composition…"></textarea>
+
+<div class="chat-actions">
+<button id="chat-attach" class="composer-icon" type="button" aria-label="Attach references" title="Attach references · Up to 4 files, 2 MB total">+</button>
+<div class="chat-model-controls"><span class="composer-model-mark" aria-hidden="true">✧</span><label><span class="sr-only">Model</span><select id="chat-model" title="Model"><option value="">CookieMonster default</option></select></label><label class="composer-reasoning"><span class="sr-only">Reasoning</span><select id="chat-reasoning" title="Reasoning effort"><option value="default">Default</option></select></label></div>
+<button id="chat-mention" class="composer-icon" type="button" aria-label="Mention current composition" title="Mention current composition">@</button>
+<button id="chat-stop" class="composer-icon" type="button" aria-label="Stop generation" title="Stop generation" disabled>■</button>
+<button id="chat-send" class="composer-icon" type="submit" aria-label="Send message" title="Send message" disabled>↑</button>
+</div>
+<p id="chat-model-status" role="status"></p>
+<span id="chat-progress" class="sr-only" role="status">Connecting…</span>
+
+</form>
+
+</section>
+
+
 
 </main>
 
