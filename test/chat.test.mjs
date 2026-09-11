@@ -38,6 +38,19 @@ async function fixture(t) {
 }
 const message = (extra = {}) => ({ action: "send", text: "Make this title blue", compId: 1, requestId: "a".repeat(40), ...extra })
 
+test("temporary restore project polls never release the pending conversation", async t => {
+  const f = await fixture(t)
+  const sent = await f.send(message())
+  await f.chat.recordRestore(sent.sessionID, { status: "pending", checkpointId: "cp-source" })
+  const before = f.calls.filter(c => c[0] === "abort").length
+  await assert.rejects(f.chat.handle({ body: { action: "state" },
+    project: { ...f.p.state.project, path: f.p.state.project.path + ".emergency.aep" },
+    panelId: "test-panel", connectionId: f.p.connectionId, check() {} }), { code: "restore_in_progress" })
+  assert.equal(f.calls.filter(c => c[0] === "abort").length, before)
+  assert.equal(f.p.bridge.binding(sent.sessionID).state, "active")
+  assert.equal((await f.send()).restore.status, "pending")
+})
+
 test("model selection uses CM session configuration, survives reopening and reaches prompts", async t => {
   const f = await fixture(t)
   assert.equal((await f.send({ action: "models" })).models.length, 2)

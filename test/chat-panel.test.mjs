@@ -125,6 +125,18 @@ test('chat checkpoint cards review exact operation, preserve work, and never ret
   f.el('chat-restore-confirm').click();await f.tick();assert.equal(f.restores,1)
 })
 
+test('pending restore suppresses chat polling through temporary project changes',async()=>{
+  const f=fixture();f.client.state.binding={sessionID:'ses-test',state:'active'};f.checkpointList=[{id:'cp-one'}]
+  f.messages.push({role:'assistant',parts:[{type:'checkpoint',id:'cp-one',label:'Before this edit'}]});await f.tick()
+  f.el('chat-messages').children[0].children[1].children[2].click();await f.tick()
+  let finish;f.client.confirmRestore=()=>new Promise(resolve=>{finish=resolve})
+  f.el('chat-restore-confirm').click();await f.tick()
+  f.chat.update({...f.client.state,project:{id:'emergency',path:'emergency.aep'}})
+  const count=f.calls.length;await f.refresh();assert.equal(f.calls.length,count)
+  f.chat.update(f.client.state);finish({currentCheckpointId:'backup',emergencyPath:'emergency.aep',warning:'Retained'})
+  await f.tick();assert.match(f.el('chat-restore-status').textContent,/restored/)
+})
+
 test('checkpoint cards reject foreign ownership and stale reviews',async()=>{
   const f=fixture();f.client.state.binding={sessionID:'ses-test',state:'active'};f.checkpointList=[{id:'cp-one'}]
   f.messages.push({role:'assistant',parts:[{type:'checkpoint',id:'cp-one',label:'Before this edit'}]});await f.tick()

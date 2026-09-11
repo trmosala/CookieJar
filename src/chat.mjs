@@ -69,6 +69,8 @@ export async function createChat(runtime) {
     const key = hash([panelId, project.path || project.id])
     const previous = active.get(panelId)
     if (previous && previous !== key && records[previous]) {
+      if (records[previous].restore?.status === "pending")
+        fail("restore_in_progress", "Wait for the current restore before switching project conversations")
       await pause(records[previous].sessionID)
       await runtime.bridge.release(records[previous].sessionID)
     }
