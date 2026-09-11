@@ -302,7 +302,7 @@ test("manual restore rejects forged prepare replies without advancing durable st
     await p.start(async () => {
       const project = { id: "saved", path: mode === "path" ? original.path : params.path, saved: true }
       return { status: mode === "status" ? "recovered" : "recovery_saved", project,
-        snapshot: { ...p.state, project, revision: mode === "snapshot" ? 2 : 1 } }
+        snapshot: { ...p.state, project, revision: mode === "snapshot" ? 3 : 1 } }
     })
     await assert.rejects(p.bridge.call("session", "execute", params, { allowLocked: true }), { code: "outcome_uncertain" })
     const lock = JSON.parse(await readFile(path.join(p.dataDir, "bridge-state.json"))).locks[0]

@@ -97,6 +97,8 @@ test("production manual restore traverses bridge transport host source and real 
     assert.notDeepEqual(original, source)
     h.props[0].setValue(42)
     // Real plugin approval tokens and /panel handler; renderer is unrelated to restore.
+    const nativeSave = h.project.save.bind(h.project)
+    h.project.save = file => { nativeSave(file); h.project.revision++ }
     await createRuntime({ factories: { bridge: async () => p.bridge,
       renderer: async () => ({ list: async () => [], close: async () => {} }) } })
     const review = await transport.request(client.descriptor, f.store.state.credential, "/panel",

@@ -854,8 +854,18 @@ async function startBridge({
           restoreSnapshot(r.snapshot, next)
           if (preparing) {
             const normalized = clone(r.snapshot), prior = clone(p.expected)
+            if (normalized.revision !== prior.revision && normalized.revision !== prior.revision + 1)
+              fail("invalid_host_result", "Manual emergency save advanced beyond its Save As revision")
             normalized.project = prior.project
             delete normalized.fingerprint; delete prior.fingerprint
+            // Native Save As refreshes the revision and property locators synchronously.
+            const savedRevision = value => {
+              if (!value || typeof value !== "object") return
+              if (value.locator) value.locator.revision = prior.revision
+              for (const child of Object.values(value)) savedRevision(child)
+            }
+            normalized.revision = prior.revision
+            savedRevision(normalized)
             if (canonical(normalized) !== canonical(prior))
               fail("invalid_host_result", "Manual emergency save changed the approved scene or revision")
             rec.snapshot = canonical(r.snapshot)
