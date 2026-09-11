@@ -23,17 +23,64 @@ function fixture(saved = new Map()) {
   client.panel=async(action,args)=>{panelCalls.push({action,args});if(action==='checkpoints')return checkpointList;client.restoreApproval={token:'review'};return {operation:'Save current project and restore checkpoint before the edit'};}
   client.confirmRestore=async()=>{restores++;client.restoreApproval=null;if(failRestore)throw {message:'Interrupted'};return {currentCheckpointId:'current-backup',emergencyPath:'backup.aep',warning:'Current work preserved.',recoveryCopy:false};}
   let failSend=false, model=null, status='idle', failModel=false, refresh, holdState=false, releaseState
+  let skills=[], skillDirectory='D:\\\\workspace', sessionID='ses-test', failSkillSave=false
   const catalog=[{id:'sol',providerID:'test',name:'Sol',provider:'Test',variants:['low','high']},{id:'fast',providerID:'test',name:'Fast',provider:'Test',variants:[]}]
   const context={window:{addEventListener(){},localStorage:{getItem:key=>saved.get(key),setItem:(key,value)=>saved.set(key,value)}},document:{getElementById:el,createElement:()=>new Element()},setInterval(fn){refresh=fn;},clearInterval(){},
     FileReader:class {readAsDataURL(file){this.file=file;readers.push(this)}}}
   vm.runInNewContext(readFileSync(new URL('../panel/chat.js',import.meta.url),'utf8'),context)
-  const chat=context.window.CookieMonsterChat(client,{state:{credential:'test'},save(){}},{requestId:()=> 'a'.repeat(40),async request(d,c,p,b){calls.push(b);if(b.action==='checkpoints')return {result:{checkpoints:checkpointList}};if(b.action==='state' && holdState){const prior=model;await new Promise(resolve=>{releaseState=resolve});return {result:{status:'idle',model:prior,messages:[],workspaces:[]}};}if(b.action==='send' && failSend)throw {code:'disconnected',message:'Disconnected'};if(b.action==='models')return {result:{models:catalog}};if(b.action==='model'){if(failModel)throw {message:'Model unavailable'};model=b.model;return {result:{model}};}return {result:b.action==='send'? {delivery:'accepted'}:{status,model,sessionID:'ses-test',messages,workspaces:[]}}}})
+  const chat=context.window.CookieMonsterChat(client,{state:{credential:'test'},save(){}},{requestId:()=> 'a'.repeat(40),async request(d,c,p,b){calls.push(b);if(b.action==='skills')return {result:{skills,directory:skillDirectory,sessionID}};if(b.action==='skillReview')return {result:{token:'review',directory:skillDirectory,destination:'skills/'+b.draft.name+'/SKILL.md'}};if(b.action==='skillSave'){if(failSkillSave)throw {message:'Save not confirmed'};return {result:{name:b.draft.name,destination:'SKILL.md'}};}if(b.action==='checkpoints')return {result:{checkpoints:checkpointList}};if(b.action==='state' && holdState){const prior=model;await new Promise(resolve=>{releaseState=resolve});return {result:{status:'idle',model:prior,messages:[],workspaces:[]}};}if(b.action==='send' && failSend)throw {code:'disconnected',message:'Disconnected'};if(b.action==='models')return {result:{models:catalog}};if(b.action==='model'){if(failModel)throw {message:'Model unavailable'};model=b.model;return {result:{model}};}return {result:b.action==='send'? {delivery:'accepted'}:{status,model,sessionID,directory:skillDirectory,messages,workspaces:[skillDirectory]}}}})
   const tick=()=>new Promise(r=>setImmediate(r))
   const drop=(name='ref.png',size=10)=>el('chat-form').events.drop({preventDefault(){},dataTransfer:{files:[{name,size}]}})
   const finish=r=>{r.result='data:image/png;base64,SGVsbG8=';r.onload()}
   el('chat-input').value='Describe this';el('chat-input').events.input()
-  return {el,chat,client,readers,calls,tick,drop,finish,messages,panelCalls,set checkpointList(v){checkpointList=v},set failRestore(v){failRestore=v},get restores(){return restores},refresh:()=>refresh(),releaseState:()=>releaseState(),set holdState(v){holdState=v},set failSend(v){failSend=v},set failModel(v){failModel=v},set status(v){status=v}}
+  return {el,chat,client,readers,calls,tick,drop,finish,messages,panelCalls,set skills(v){skills=v},set skillDirectory(v){skillDirectory=v},set sessionID(v){sessionID=v},set failSkillSave(v){failSkillSave=v},set checkpointList(v){checkpointList=v},set failRestore(v){failRestore=v},get restores(){return restores},refresh:()=>refresh(),releaseState:()=>releaseState(),set holdState(v){holdState=v},set failSend(v){failSend=v},set failModel(v){failModel=v},set status(v){status=v}}
 }
+test('skill picker searches and clears on workspace, session and project changes',async()=>{
+  const f=fixture();await f.tick()
+  f.skills=[{name:'brand-motion',description:'Logo easing',source:'b'.repeat(64),revision:'c'.repeat(64)},{name:'titles',description:'Text',source:'d'.repeat(64),revision:'e'.repeat(64)}]
+  f.el('chat-skills-refresh').click();await f.tick()
+  f.el('chat-skill-search').value='logo';f.el('chat-skill-search').events.input()
+  assert.equal(f.el('chat-skill-picker').children.length,2)
+  f.el('chat-skill-picker').value='0';f.el('chat-skill-picker').events.change.call(f.el('chat-skill-picker'))
+  assert.match(f.el('chat-skill-status').textContent,/Selected: brand-motion \(not loaded\)/)
+  f.el('chat-form').events.submit({preventDefault(){}});await f.tick()
+  assert.equal(f.calls.find(c=>c.action==='send').skill.name,'brand-motion')
+  f.sessionID='new-session';await f.refresh()
+  assert.equal(f.el('chat-skill-picker').value,'')
+  f.el('chat-skills-refresh').click();await f.tick()
+  f.el('chat-skill-picker').value='0';f.el('chat-skill-picker').events.change.call(f.el('chat-skill-picker'))
+  f.el('chat-workspace').events.change()
+  assert.equal(f.el('chat-skill-picker').value,'')
+  f.chat.update({...f.client.state,project:{id:'two',path:'two.aep'}})
+  assert.equal(f.el('chat-skill-picker').value,'')
+  assert.equal(f.el('chat-workspace').value,'')
+})
+
+test('save technique drafts only completed reply text, reviews edits, and never retries failed saves',async()=>{
+  const f=fixture()
+  f.messages.push({id:'answer',role:'assistant',completed:true,parts:[
+    {type:'reasoning',text:'Not a technique'},
+    {type:'text',text:'Keep logo fixed.'},{type:'text',text:'Use ease out.'},
+  ]})
+  await f.tick()
+  f.el('chat-messages').children[0].children.at(-1).click()
+  assert.equal(f.el('technique-instructions').value,'Keep logo fixed.\n\nUse ease out.')
+  assert.equal(f.calls.some(c=>c.action==='skillSave'),false)
+  f.el('technique-name').value='brand-motion';f.el('technique-description').value='Logo easing'
+  f.el('technique-review-button').click();await f.tick()
+  assert.equal(f.el('technique-confirm').hidden,false)
+  assert.match(f.el('technique-review').textContent,/This CM workspace/)
+  f.el('technique-instructions').value='Edited';f.el('technique-instructions').events.input()
+  assert.equal(f.el('technique-confirm').hidden,true)
+  f.el('technique-review-button').click();await f.tick()
+  f.failSkillSave=true;f.el('technique-confirm').click();await f.tick()
+  assert.equal(f.calls.filter(c=>c.action==='skillSave').length,1)
+  assert.equal(f.calls.find(c=>c.action==='skillSave').draft.instructions,'Edited')
+  f.el('technique-confirm').click();await f.tick()
+  assert.equal(f.calls.filter(c=>c.action==='skillSave').length,1)
+  assert.match(f.el('technique-status').textContent,/No automatic retry/)
+})
+
 test('message restore uses the first checkpoint for its exact parent request and opens review only',async()=>{
   const f=fixture()
   f.checkpointList=[{id:'before-one'},{id:'later-one'}]

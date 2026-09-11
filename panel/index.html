@@ -20,7 +20,28 @@
 
 <main>
 
-<header><div class="brand"><img class="brand-mark" src="brand-dev.png" alt="" aria-hidden="true"><h1>CookieJar-AE</h1><span class="host-label">After Effects</span></div><div class="header-controls"><span id="connection-status" class="is-disconnected" role="status">Not connected</span><details id="advanced"><summary id="settings-toggle" aria-label="Settings and troubleshooting" title="Settings &amp; troubleshooting">☰</summary><div class="advanced-content"><h2>Settings &amp; troubleshooting</h2>
+<header><div class="brand"><img class="brand-mark" src="brand-dev.png" alt="" aria-hidden="true"><h1>CookieJar-AE</h1><span class="host-label">After Effects</span><h2 id="chat-project-name" class="header-project-name">Opening project…</h2></div>
+<div class="header-composition">
+<label class="sr-only" for="chat-comp">Composition</label>
+<select id="chat-comp" aria-describedby="chat-target"><option value="follow">Follow active composition</option></select>
+<p id="chat-target">Following active composition</p>
+</div>
+<div class="header-controls"><span id="connection-status" class="is-disconnected" role="status">Not connected</span><details id="advanced"><summary id="settings-toggle" aria-label="Settings and troubleshooting" title="Settings &amp; troubleshooting">☰</summary><div class="advanced-content" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+<aside class="settings-sidebar">
+<div class="settings-sidebar-heading"><h2 id="settings-title">Settings</h2><button id="settings-close" class="settings-close" type="button" aria-label="Close settings">×</button></div>
+<p class="settings-nav-label">Preferences</p>
+<nav class="settings-nav" aria-label="Settings sections">
+<button id="settings-nav-general" class="settings-nav-item is-active" type="button" aria-controls="settings-general" aria-current="page">General</button>
+<button id="settings-nav-connection" class="settings-nav-item" type="button" aria-controls="settings-connection">Connection</button>
+<button id="settings-nav-capture" class="settings-nav-item" type="button" aria-controls="settings-capture">Capture &amp; recovery</button>
+<button id="settings-nav-permissions" class="settings-nav-item" type="button" aria-controls="settings-permissions">Permissions</button>
+<button id="settings-nav-services" class="settings-nav-item" type="button" aria-controls="settings-services">Bridge services</button>
+</nav>
+<div class="settings-build"><span>Development build</span><small>Panel 0.2.2</small></div>
+</aside>
+<div class="settings-content">
+<section id="settings-general" class="settings-page" aria-labelledby="settings-general-heading">
+<div class="settings-page-header"><p>Settings</p><h2 id="settings-general-heading">General</h2><span>Project recovery and build information.</span></div>
 <section class="settings-checkpoints" aria-label="Restore project checkpoint">
 <button id="chat-checkpoints-toggle" type="button" aria-expanded="false" aria-controls="chat-checkpoints">Restore checkpoint…</button>
 <section id="chat-checkpoints" aria-label="Project checkpoints" hidden>
@@ -29,11 +50,15 @@
 <p id="chat-checkpoint-help" role="status"></p>
 <button id="chat-checkpoint-review" type="button" disabled>Review restore…</button>
 </section>
-</section><p class="qualification">Development build · Use disposable projects for testing.</p>
+</section><div class="settings-card"><h3>Build qualification</h3><p class="qualification">Development build · Use disposable projects for testing.</p>
 
 <p>Targets AE 25/26. No point versions certified. Use disposable projects until the qualification matrix is supplied.</p>
 
-<section aria-labelledby="status-heading">
+</div>
+</section>
+<section id="settings-connection" class="settings-page" aria-labelledby="status-heading" hidden>
+<div class="settings-page-header"><p>Settings</p><h2>Connection</h2><span>CookieMonster, bridge, project, and session status.</span></div>
+<section class="settings-card" aria-labelledby="status-heading">
 
 <h2 id="status-heading">Connection</h2>
 
@@ -47,7 +72,7 @@
 
 <p>Connects automatically to CookieMonster on this computer. Ask CookieMonster to inspect AE to start working. If several AE instances are open, select the target in chat.</p>
 
-<details>
+<details class="settings-card">
 
 <summary id="pair-heading">Connection recovery &amp; advanced settings</summary>
 
@@ -75,7 +100,10 @@
 
 </details>
 
-<section aria-labelledby="capture-heading">
+</section>
+<section id="settings-capture" class="settings-page" aria-labelledby="capture-heading" hidden>
+<div class="settings-page-header"><p>Settings</p><h2>Capture &amp; recovery</h2><span>Frame capture and interrupted-action safeguards.</span></div>
+<section class="settings-card">
 
 <h2 id="capture-heading">Capture &amp; Recovery</h2>
 
@@ -85,11 +113,13 @@
 
 <p>Timed-out scripts are never retried. Wait for AE to return, inspect the project and queue, then clear the local latch. Rebind and reconcile the durable lock in chat separately.</p>
 
-
+</section>
 
 </section>
 
-<section aria-labelledby="preference-heading">
+<section id="settings-permissions" class="settings-page" aria-labelledby="preference-heading" hidden>
+<div class="settings-page-header"><p>Settings</p><h2>Permissions</h2><span>After Effects file and network access required by the bridge.</span></div>
+<section class="settings-card">
 
 <h2 id="preference-heading">File &amp; Network Permission</h2>
 
@@ -98,8 +128,11 @@
 <p>Windows: Edit &gt; Preferences &gt; Scripting &amp; Expressions. macOS: After Effects &gt; Settings (Preferences) &gt; Scripting &amp; Expressions. Enable &quot;Allow Scripts to Write Files and Access Network&quot; yourself. This panel never changes that preference.</p>
 
 </section>
+</section>
 
-<section aria-labelledby="services-heading">
+<section id="settings-services" class="settings-page" aria-labelledby="services-heading" hidden>
+<div class="settings-page-header"><p>Settings</p><h2>Bridge services</h2><span>Checkpoints, render jobs, diagnostics, and compatibility.</span></div>
+<section class="settings-card settings-services-card">
 
 <h2 id="services-heading">Bridge Services</h2>
 
@@ -170,20 +203,17 @@
 <p><a id="release-source" target="_blank" rel="noopener noreferrer" hidden>Public Release Source</a> Release source is not an approved internal installer. Ask your administrator when updates are not configured.</p>
 
 </section>
+</section>
 
-</div></details></div></header>
+</div></div></details></div></header>
 
 <section class="chat" aria-label="Project chat">
 
-<div class="chat-heading"><h2 id="chat-project-name">Opening project…</h2><button id="chat-new" type="button">New chat</button></div>
+<div class="chat-heading"><button id="chat-new" type="button">New chat</button></div>
 
 
 
-<label class="sr-only" for="chat-comp">Composition</label>
 
-<select id="chat-comp"><option value="follow">Follow active composition</option></select>
-
-<p id="chat-target">Following active composition</p>
 
 <section id="recovery-notice" class="notice" aria-label="Recovery needed" hidden><h2>Check After Effects before continuing</h2><p id="recovery-message"></p><button id="reconcile" type="button">I checked AE — continue</button></section>
 
@@ -211,7 +241,30 @@
 <button id="chat-restore-cancel" type="button">Cancel</button>
 </section>
 
+<section id="chat-technique" class="chat-approval" hidden aria-label="Save technique">
+<h3>Save technique</h3>
+<p>Edit the completed reply into reusable instructions. Remove project-specific details and secrets. Only these reviewed fields will be saved.</p>
+<label for="technique-name">Name</label><input id="technique-name" maxlength="64" placeholder="brand-title-motion">
+<label for="technique-description">Description</label><input id="technique-description" maxlength="1024">
+<label for="technique-instructions">Instructions</label><textarea id="technique-instructions" rows="8" maxlength="64000"></textarea>
+<label for="technique-scope">Scope</label><select id="technique-scope"><option value="workspace">This CM workspace</option><option value="global">Global CM skills</option></select>
+<p id="technique-workspace"></p>
+<p>Workspace skills are shared by conversations using that CM directory, not isolated to this .aep file.</p>
+<pre id="technique-review"></pre>
+<p id="technique-status" role="status"></p>
+<button id="technique-review-button" type="button">Review save</button>
+<button id="technique-confirm" type="button" hidden>Confirm create-only save</button>
+<button id="technique-cancel" type="button">Cancel</button>
+</section>
+
 <form id="chat-form">
+<details id="chat-skills"><summary>Skills</summary>
+<label for="chat-skill-search">Search skills</label><input id="chat-skill-search" type="search" maxlength="256" placeholder="Name or description">
+<select id="chat-skill-picker" aria-label="Reusable skill"><option value="">No skill selected</option></select>
+<button id="chat-skills-refresh" type="button">Refresh skills</button>
+<p id="chat-skill-workspace"></p>
+</details>
+<p id="chat-skill-status" role="status"></p>
 
 <label class="sr-only" for="chat-input">Message CookieMonster</label>
 

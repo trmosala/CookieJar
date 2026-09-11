@@ -1,4 +1,5 @@
 import path from "node:path"
+import { createHash } from "node:crypto"
 import { lstat, readFile, realpath } from "node:fs/promises"
 import { secureWrite } from "./storage.mjs"
 import { fail, hash } from "./protocol.mjs"
@@ -42,6 +43,36 @@ export async function createChat(runtime) {
       Object.values(p.models || {}).map(m => ({ providerID: p.id, id: m.id, name: m.name || m.id,
         provider: p.name || p.id, variants: Object.keys(m.variants || {}).filter(v => !m.variants[v]?.disabled) })))
   }
+  async function skillRequest(r, action, body) {
+    const transport = clientFor(r)._client
+    if (!transport?.get || !transport?.post) fail("skills_unavailable", "Update CookieMonster to enable reviewed skills")
+    const response = await transport[body === undefined ? "get" : "post"]({
+      url: "/skill/" + action, query: { directory: r.directory },
+      ...(body === undefined ? {} : { body, headers: { "Content-Type": "application/json" } }),
+      signal: AbortSignal.timeout(20000),
+    })
+    if (response?.error) fail("skill_error", response.error.data?.message || response.error.message ||
+      "Skills unavailable. Update CookieMonster or refresh the picker; nothing will retry automatically")
+    return response?.data
+  }
+  function skillSelection(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) ||
+        Object.keys(value).some(k => !["name", "source", "revision", "directory", "sessionID"].includes(k)) ||
+        typeof value.name !== "string" || !value.name || value.name.length > 256 ||
+        !/^[a-f0-9]{64}$/.test(value.source) || !/^[a-f0-9]{64}$/.test(value.revision) ||
+        typeof value.directory !== "string" || !(value.sessionID === null || typeof value.sessionID === "string"))
+      fail("invalid_payload", "Invalid selected skill")
+    return { name: value.name, source: value.source, revision: value.revision }
+  }
+  function skillDraft(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) ||
+        Object.keys(value).some(k => !["name", "description", "instructions", "scope"].includes(k)) ||
+        typeof value.name !== "string" || value.name.length > 64 ||
+        typeof value.description !== "string" || value.description.length > 1024 ||
+        typeof value.instructions !== "string" || value.instructions.length > 64000 ||
+        !["workspace", "global"].includes(value.scope)) fail("invalid_payload", "Invalid technique draft")
+    return { name: value.name, description: value.description, instructions: value.instructions, scope: value.scope }
+  }
   async function selection(r) {
     return (await result(clientFor(r).session.get(options(r))))?.model || null
   }
@@ -72,7 +103,8 @@ export async function createChat(runtime) {
     const { body, project, panelId, connectionId, check } = input
     check()
     const attachments = body.action === "send" ? validateAttachments(body.attachments) : []
-    const messageHash = () => hash(attachments.length ? [body.text, body.compId, attachments] : [body.text, body.compId])
+    const messageHash = () => hash(body.skill ? [body.text, body.compId, attachments, body.skill] :
+      attachments.length ? [body.text, body.compId, attachments] : [body.text, body.compId])
     const key = hash([panelId, project.path || project.id])
     const previous = active.get(panelId)
     if (previous && previous !== key && records[previous]) {
@@ -86,6 +118,62 @@ export async function createChat(runtime) {
     const workspaces = [...clients.keys()].sort()
     const current = (await runtime.bridge.connections()).find(c => c.id === connectionId)
     const owned = !!current?.binding && current.binding.sessionID !== r?.sessionID
+    const matchingWorkspace = dir => project.path && (project.path === dir || project.path.startsWith(dir + path.sep))
+    if (["skills", "skillReview", "skillSave"].includes(body.action)) {
+      const directory = r?.directory || body.directory || workspaces.filter(matchingWorkspace).sort((a, b) => b.length - a.length)[0]
+      if (!directory || !clients.has(directory)) fail("chat_workspace", "Choose a CM workspace explicitly to use skills")
+      if (r && body.directory && body.directory !== r.directory) fail("stale_workspace", "Start a new conversation to change workspace")
+      if (!matchingWorkspace(directory) && !r?.workspaceConfirmed && body.directory !== directory)
+        fail("chat_workspace", "Confirm this conversation's CM workspace before using skills")
+      if (r && body.directory === directory && !r.workspaceConfirmed) { r.workspaceConfirmed = true; await save(); check() }
+      if (body.action === "skills") {
+        const skills = await skillRequest({ directory }, "catalog")
+        check()
+        if (!Array.isArray(skills)) fail("skills_unavailable", "Update CookieMonster: fresh skill metadata is unavailable")
+        return { directory, sessionID: r?.sessionID || null, skills: skills.map(s => ({
+          ...skillSelection({ name: s.name, source: s.source, revision: s.revision, directory, sessionID: r?.sessionID || null }),
+          description: typeof s.description === "string" ? s.description.slice(0, 1024) : "",
+        })) }
+      }
+      if (!r || body.sessionID !== r.sessionID) fail("stale_session", "Conversation changed; review the technique again")
+      const draft = skillDraft(body.draft)
+      if (body.action === "skillReview") {
+        const review = await skillRequest(r, "review", draft)
+        check()
+        if (!review?.token || review.directory !== directory || review.scope !== draft.scope || typeof review.destination !== "string")
+          fail("skills_unavailable", "CM did not return a valid technique review")
+        if (!/^[a-f0-9]{64}$/.test(review.digest)) fail("skills_unavailable", "CM review is missing its content receipt")
+        r.skillReview = { token: review.token, digest: hash([draft, directory, r.sessionID]),
+          cmDigest: review.digest, destination: review.destination, status: "reviewed" }
+        await save()
+        return review
+      }
+      const review = r.skillReview
+      if (!review || body.token !== review.token || review.status !== "reviewed" ||
+          review.digest !== hash([draft, directory, r.sessionID]))
+        fail("stale_review", "This save was already attempted or the draft changed. Check the destination before reviewing again")
+      review.status = "sending"
+      await save()
+      check()
+      try {
+        const receipt = await skillRequest(r, "create", { ...draft, token: body.token })
+        if (!receipt || receipt.name !== draft.name || receipt.directory !== directory || receipt.scope !== draft.scope ||
+            receipt.digest !== review.cmDigest || receipt.destination !== review.destination ||
+            receipt.description !== draft.description ||
+            receipt.revision !== createHash("sha256").update(JSON.stringify(
+              `---\nname: ${JSON.stringify(draft.name)}\ndescription: ${JSON.stringify(draft.description)}\n---\n${draft.instructions}`,
+            )).digest("hex"))
+          fail("skill_save_unknown", "CM save receipt could not be verified")
+        skillSelection({ name: receipt.name, source: receipt.source, revision: receipt.revision, directory, sessionID: r.sessionID })
+        review.status = "saved"; review.receipt = receipt
+        await save()
+        check()
+        return receipt
+      } catch (e) {
+        if (review.status !== "saved") { review.status = "unknown"; await save() }
+        fail("skill_save_unknown", "Save was not confirmed and will not retry. Refresh skills and check the destination. " + e.message)
+      }
+    }
     if (body.action === "checkpoints") {
       if (!r || !project.path) return { checkpoints: [] }
       const canonical = await realpath(project.path)
@@ -117,7 +205,7 @@ export async function createChat(runtime) {
         selection(r),
       ])
       check()
-      return { sessionID: r.sessionID, directory: r.directory, workspaces, owned, model,
+      return { sessionID: r.sessionID, directory: r.directory, workspaceConfirmed: !!r.workspaceConfirmed || !!matchingWorkspace(r.directory), workspaces, owned, model,
         ...messages, restore: r.restore || null, permissions: [...(permissions.get(r.sessionID)?.values() || [])].slice(0, 1),
         status: statuses?.[r.sessionID]?.type || "idle", error: errors.get(r.sessionID) || null,
         delivery: r.requests.at(-1)?.status || null }
@@ -148,6 +236,19 @@ export async function createChat(runtime) {
         return { sessionID: r.sessionID, delivery: duplicate.status }
       }
     }
+    let chosenSkill
+    if (body.action === "send" && body.skill) {
+      chosenSkill = skillSelection(body.skill)
+      const directory = r?.directory || body.directory || workspaces.filter(matchingWorkspace).sort((a, b) => b.length - a.length)[0]
+      if (body.skill.sessionID !== (r?.sessionID || null) || body.skill.directory !== directory ||
+          !clients.has(directory) || (!matchingWorkspace(directory) && !r?.workspaceConfirmed && body.directory !== directory))
+        fail("stale_skill", "Skill selection belongs to another conversation or workspace. Select it again")
+      const validated = await skillRequest({ directory }, "validate", chosenSkill)
+      if (!validated || validated.name !== chosenSkill.name || validated.source !== chosenSkill.source ||
+          validated.revision !== chosenSkill.revision)
+        fail("skill_error", "CM did not confirm this exact skill revision. Update CM or refresh the picker")
+      check()
+    }
     // Validate before creating a conversation; rejected choices have no side effects.
     let chosen
     if (body.action === "model") {
@@ -160,7 +261,7 @@ export async function createChat(runtime) {
         .sort((a, b) => b.length - a.length)
       const directory = body.directory || matching[0] || (workspaces.length === 1 ? workspaces[0] : null)
       if (!directory || !clients.has(directory)) fail("chat_workspace", "Select a CookieMonster workspace for this project")
-      const fresh = { directory, requests: [] }
+      const fresh = { directory, requests: [], workspaceConfirmed: body.directory === directory || !!matchingWorkspace(directory) }
       const session = await result(clientFor(fresh).session.create({ query: { directory }, signal: AbortSignal.timeout(20000),
         body: { title: "After Effects · " + (project.path ? path.basename(project.path) : "Unsaved project") } }))
       check()
@@ -224,7 +325,11 @@ export async function createChat(runtime) {
           " Resolve this comp to that fixed ID for the whole request even if the active viewer changes. " +
           "You may inspect and work on other compositions by ID without changing the viewer. Ask about ambiguous names. " +
           "Use ae_execute with a current inspection revision for edits; it verifies a checkpoint before running. Do not request an extra confirmation for checkpoint-backed scripts. If product intent needs clarification, ask in your reply.",
-        parts: [{ type: "text", text: body.text }, ...attachments],
+        parts: [{ type: "text", text: body.text, ...(chosenSkill ? { metadata: { cmSkill: chosenSkill } } : {}) },
+          ...(chosenSkill ? [{ type: "text", synthetic: true,
+            text: "The user selected skill " + JSON.stringify(chosenSkill.name) +
+              ". Load it with the native skill tool before applying its technique. If loading fails, report the error; do not substitute another skill or claim it loaded." }] : []),
+          ...attachments],
       } }))
       request.status = "accepted"
     } catch (e) {
@@ -274,7 +379,7 @@ export async function createChat(runtime) {
       if (!Object.values(records).some(r => r.sessionID === sessionID)) return
       if (["permission.asked", "permission.updated"].includes(event.type)) {
         if (!permissions.has(sessionID)) permissions.set(sessionID, new Map())
-        const details = JSON.stringify(p.metadata || p.patterns || {}, null, 2)
+        const details = JSON.stringify(p.patterns?.length ? { patterns: p.patterns, metadata: p.metadata || {} } : p.metadata || {}, null, 2)
         permissions.get(sessionID).set(p.id, { id: p.id, title: p.title || p.permission || p.type,
           details: details.length > 300000 ? "This approval is too large to review here. Review it in CookieMonster." : details,
           reviewable: details.length <= 300000 })
@@ -339,6 +444,10 @@ function displayMessages(messages) {
       })
       if (part.type === "tool") {
         const cards = []
+        if (message.info.role === "assistant" && part.tool === "skill" && part.state?.status === "completed" &&
+            typeof part.state.metadata?.name === "string" && typeof part.state.metadata?.dir === "string")
+          cards.push({ type: "skill", name: part.state.metadata.name.slice(0, 256),
+            source: part.state.metadata.source, revision: part.state.metadata.revision })
         if (message.info.role === "assistant" && part.tool === "ae_execute" && part.state?.status === "completed" && typeof part.state.output === "string" && part.state.output.length < 4 * 1024 * 1024) {
           try {
             const output = JSON.parse(part.state.output)

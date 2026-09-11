@@ -36,6 +36,78 @@ async function fixture(t) {
   }
   return { p, chat, runtime, client, catalog, selections, calls, inputs, messages, statuses, send, set admitted(fn) { admitted = fn } }
 }
+test("selected skills retain native prompt context, dedup identity, errors and truthful load metadata", async t => {
+  const f = await fixture(t)
+  const metadata = { name: "brand-motion", source: "b".repeat(64), revision: "c".repeat(64) }
+  f.client._client.get = async options => {
+    assert.equal(options.url, "/skill/catalog")
+    return { data: [{ ...metadata, description: "Brand motion", content: "Must not reach picker" }] }
+  }
+  const post = f.client._client.post
+  f.client._client.post = async options => {
+    if (options.url !== "/skill/validate") return post(options)
+    assert.deepEqual(options.body, metadata)
+    return { data: metadata }
+  }
+  const catalog = await f.send({ action: "skills", directory: f.p.dataDir })
+  assert.equal(catalog.skills[0].content, undefined)
+  const skill = { ...metadata, directory: catalog.directory, sessionID: catalog.sessionID }
+  const sent = await f.send(message({ skill, directory: catalog.directory }))
+  assert.deepEqual(f.inputs[0].body.parts[0].metadata.cmSkill, metadata)
+  assert.match(f.inputs[0].body.system, /After Effects chat panel/)
+  assert.equal(f.inputs[0].body.tools.question, false)
+  assert.equal(f.inputs[0].body.parts[1].synthetic, true)
+  await f.send(message({ skill, directory: catalog.directory }))
+  assert.equal(f.inputs.length, 1)
+  await assert.rejects(f.send(message({ skill: { ...skill, revision: "d".repeat(64) } })), { code: "invalid_payload" })
+  await assert.rejects(f.send(message({ requestId: "b".repeat(40), skill })), { code: "stale_skill" })
+  f.client._client.post = async () => ({ error: { data: { message: "Skill changed" } } })
+  await assert.rejects(f.send(message({ requestId: "b".repeat(40), skill: { ...skill, sessionID: sent.sessionID } })), { code: "skill_error" })
+  assert.equal(f.inputs.length, 1)
+  f.messages.push({ info: { id: "loaded", role: "assistant", time: { completed: 1 } }, parts: [
+    { type: "text", text: "I loaded brand-motion" },
+    { type: "tool", tool: "skill", state: { status: "error", metadata: { name: "failed", dir: "." } } },
+    { type: "tool", tool: "skill", state: { status: "completed", metadata: { ...metadata, dir: "." } } },
+  ] })
+  const displayed = (await f.send()).messages[0].parts.filter(p => p.type === "skill")
+  assert.equal(displayed.length, 1)
+  assert.equal(displayed[0].name, metadata.name)
+})
+
+test("skill saves require exact review and never resubmit an uncertain create", async t => {
+  const f = await fixture(t)
+  const session = await f.send(message())
+  const draft = { name: "brand-motion", description: "Brand motion", instructions: "Keep logo fixed", scope: "workspace" }
+  let creates = 0
+  f.client._client.get = async () => ({ data: [] })
+  f.client._client.post = async options => {
+    if (options.url === "/skill/review") return { data: { token: "review", digest: "d".repeat(64),
+      directory: f.p.dataDir, destination: "SKILL.md", scope: draft.scope } }
+    creates++
+    throw new Error("Connection lost")
+  }
+  const body = { draft, sessionID: session.sessionID, directory: f.p.dataDir }
+  await assert.rejects(f.send({ action: "skillSave", ...body, token: "review" }), { code: "stale_review" })
+  await f.send({ action: "skillReview", ...body })
+  await assert.rejects(f.send({ action: "skillSave", ...body, token: "review", draft: { ...draft, instructions: "Other" } }), { code: "stale_review" })
+  await assert.rejects(f.send({ action: "skillSave", ...body, token: "review" }), { code: "skill_save_unknown" })
+  await assert.rejects(f.send({ action: "skillSave", ...body, token: "review" }), { code: "stale_review" })
+  assert.equal(creates, 1)
+  await f.send({ action: "new" })
+  await assert.rejects(f.send({ action: "skillReview", ...body }), { code: "stale_session" })
+})
+
+test("skills never fall back to a sole unrelated CM workspace", async t => {
+  const f = await fixture(t)
+  const unregister = f.chat.register({ client: f.client, directory: "Z:\\\\unrelated" })
+  f.p.state.project = { ...f.p.state.project, id: "foreign", path: "Z:\\\\another\\\\scene.aep" }
+  await f.p.send("/heartbeat", { project: f.p.state.project, capabilities: f.p.state.capabilities, busy: false })
+  f.client._client.get = async () => ({ data: [] })
+  await assert.rejects(f.send({ action: "skills" }), { code: "chat_workspace" })
+  assert.equal((await f.send({ action: "skills", directory: "Z:\\\\unrelated" })).directory, "Z:\\\\unrelated")
+  unregister()
+})
+
 const message = (extra = {}) => ({ action: "send", text: "Make this title blue", compId: 1, requestId: "a".repeat(40), ...extra })
 
 test("history uses the server cursor and the current scoped session, returning bounded formatted pages", async t => {
@@ -155,6 +227,22 @@ test("inline permissions are scoped, exact, once-only and disappear after reply"
   await f.send({ action: "permission", permissionId: "per_one", response: "once" })
   assert.equal((await f.send()).permissions.length, 0)
   assert.equal(f.calls.find(c => c[0] === "permission")[1].path.id, sent.sessionID)
+})
+
+test("native skill permission events expose the requested name even with empty metadata", async t => {
+  const f = await fixture(t), sent = await f.send(message())
+  for (const metadata of [{}, { name: "brand-motion", source: "b".repeat(64), revision: "c".repeat(64) }]) {
+    f.chat.event({ type: "permission.asked", properties: {
+      id: "per_skill", sessionID: sent.sessionID, permission: "skill",
+      patterns: ["brand-motion"], always: ["brand-motion"], metadata,
+    } })
+    const approval = (await f.send()).permissions[0]
+    assert.equal(approval.title, "skill")
+    assert.equal(approval.reviewable, true)
+    assert.match(approval.details, /brand-motion/)
+    if (metadata.revision) assert.match(approval.details, new RegExp(metadata.revision))
+    f.chat.event({ type: "permission.replied", properties: { sessionID: sent.sessionID, requestID: "per_skill" } })
+  }
 })
 
 test("chat never silently takes another conversation and project switches select separate sessions", async t => {

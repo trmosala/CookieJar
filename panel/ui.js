@@ -3,6 +3,26 @@
     "use strict";
     function el(id) { return document.getElementById(id); }
     var client, host, store, api, chat, working = false, checkpoints = [], serviceContext = "", diagnosticURL = null, serviceTimer, restoreOperation = null, restoreResult = "";
+    var settingsPages=[
+        ["general","settings-general"],
+        ["connection","settings-connection"],
+        ["capture","settings-capture"],
+        ["permissions","settings-permissions"],
+        ["services","settings-services"]
+    ];
+    function selectSettingsPage(selected) {
+        settingsPages.forEach(function(item){
+            var button=el("settings-nav-"+item[0]),page=el(item[1]),active=item[0]===selected;
+            page.hidden=!active;
+            button.className="settings-nav-item"+(active ? " is-active" : "");
+            if(button.setAttribute){if(active)button.setAttribute("aria-current","page");else button.removeAttribute("aria-current");}
+        });
+    }
+    settingsPages.forEach(function(item){
+        el("settings-nav-"+item[0]).addEventListener("click",function(){selectSettingsPage(item[0]);});
+    });
+    el("settings-close").addEventListener("click",function(){el("advanced").open=false;el("settings-toggle").focus();});
+    selectSettingsPage("general");
     window.addEventListener("keydown",function(e){
         if(e.key==="Escape" && el("advanced").open){el("advanced").open=false;el("settings-toggle").focus();}
     });

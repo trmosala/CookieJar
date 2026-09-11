@@ -8,6 +8,84 @@
             catalog=[], catalogKey="", catalogAt=0, catalogLoading=false, modelSaving=false, modelError="", modelRevision=0,
             checkpointList=[], checkpointButtons=[], checkpointAt=0, checkpointLoading=false, restoreWorking=false, restoreReview=null,
             collapseState={}, collapseSession="", historyMessages=[], historyCursor=null, historyLoaded=false, historyLoading=false;
+        var skills=[], skillChoice=null, skillContext=null, skillLoading=false, skillEpoch=0,
+            technique=null, techniqueReview=null, techniqueBusy=false;
+        function clearSkills() {
+            skillEpoch++;skills=[];skillChoice=null;skillContext=null;skillLoading=false;
+            technique=null;techniqueReview=null;el("chat-technique").hidden=true;
+            el("chat-skill-status").textContent="";el("chat-skill-workspace").textContent="";
+            el("chat-skill-search").value="";drawSkills();
+        }
+        function drawSkills() {
+            var picker=el("chat-skill-picker"),query=el("chat-skill-search").value.toLowerCase();picker.textContent="";
+            var blank=node("option","No skill selected");blank.value="";picker.appendChild(blank);
+            skills.forEach(function(s,i){
+                if(s!==skillChoice && (s.name+" "+(s.description || "")).toLowerCase().indexOf(query)<0)return;
+                var option=node("option",s.name+(s.description ? " - "+s.description : ""));option.value=String(i);picker.appendChild(option);
+            });
+            picker.value=skillChoice ? String(skills.indexOf(skillChoice)) : "";
+        }
+        function refreshSkills() {
+            if(skillLoading || !state.project || state.connection!=="connected")return;
+            var g=generation,epoch=++skillEpoch;skillLoading=true;
+            el("chat-skill-status").textContent="Loading fresh skill metadata...";
+            request("skills",{directory:el("chat-workspace").value || undefined}).then(function(data){
+                if(g!==generation || epoch!==skillEpoch)return;
+                skills=data.skills || [];skillContext={directory:data.directory,sessionID:data.sessionID};
+                if(skillChoice){
+                    var found=skills.filter(function(s){return s.name===skillChoice.name && s.source===skillChoice.source && s.revision===skillChoice.revision;})[0];
+                    skillChoice=found || null;el("chat-skill-status").textContent=found ? "Selected: "+found.name+" (not loaded)" : "Selected skill is missing or changed. Select it again.";
+                }else el("chat-skill-status").textContent=skills.length ? "Select a skill for the next message." : "No skills available.";
+                el("chat-skill-workspace").textContent="CM workspace: "+data.directory+". Skills are not isolated per .aep.";
+                drawSkills();
+            },function(e){if(g===generation && epoch===skillEpoch){skills=[];skillChoice=null;skillContext=null;drawSkills();el("chat-skill-status").textContent=e.message || "Skills unavailable";}}).then(function(){if(epoch===skillEpoch)skillLoading=false;controls();});
+        }
+        function draftTechnique(message) {
+            if(techniqueBusy || !snapshot || !snapshot.sessionID || !message.completed || message.error)return;
+            var text=(message.parts || []).filter(function(p){return p.type==="text";}).map(function(p){return p.text;}).join("\n\n");
+            if(!text.trim() || text.length>64000){error({message:"Choose a completed reply with at most 64000 characters."});return;}
+            technique={sessionID:snapshot.sessionID,directory:snapshot.directory};techniqueReview=null;
+            el("technique-name").value="";el("technique-description").value="";el("technique-instructions").value=text;
+            el("technique-scope").value="workspace";el("technique-workspace").textContent="This CM workspace: "+(snapshot.directory || "Choose a workspace");
+            el("technique-status").textContent="Draft only. Review all fields before saving.";
+            el("technique-review").textContent="";el("technique-confirm").hidden=true;el("chat-technique").hidden=false;
+            el("technique-name").focus();controls();
+        }
+        function techniqueDraft() { return {name:el("technique-name").value,description:el("technique-description").value,
+            instructions:el("technique-instructions").value,scope:el("technique-scope").value}; }
+        ["technique-name","technique-description","technique-instructions","technique-scope"].forEach(function(id){
+            el(id).addEventListener(id==="technique-scope" ? "change" : "input",function(){techniqueReview=null;el("technique-confirm").hidden=true;el("technique-review").textContent="";});
+        });
+        el("technique-cancel").addEventListener("click",function(){if(techniqueBusy)return;technique=null;techniqueReview=null;el("chat-technique").hidden=true;controls();});
+        el("technique-review-button").addEventListener("click",function(){
+            if(!technique || techniqueBusy)return;
+            var current=technique,draft=techniqueDraft(),g=generation;techniqueBusy=true;controls();
+            request("skillReview",{draft:draft,sessionID:current.sessionID,directory:el("chat-workspace").value || current.directory}).then(function(review){
+                if(g!==generation || current!==technique || JSON.stringify(draft)!==JSON.stringify(techniqueDraft()))return;
+                techniqueReview={token:review.token,draft:draft,directory:review.directory};
+                el("technique-review").textContent="Create "+review.destination+"\nScope: "+(draft.scope==="workspace" ? "This CM workspace" : "Global CM skills")+"\nName: "+draft.name+"\nDescription: "+draft.description+"\n\n"+draft.instructions;
+                el("technique-status").textContent="Confirm this exact content and destination. Existing files will not be overwritten.";
+                el("technique-confirm").hidden=false;
+            },function(e){if(g===generation)el("technique-status").textContent=e.message || "Review failed";}).then(function(){techniqueBusy=false;controls();});
+        });
+        el("technique-confirm").addEventListener("click",function(){
+            if(!technique || !techniqueReview || techniqueBusy)return;
+            var current=technique,review=techniqueReview,g=generation;
+            if(JSON.stringify(review.draft)!==JSON.stringify(techniqueDraft()))return;
+            techniqueReview=null;techniqueBusy=true;el("technique-confirm").hidden=true;controls();
+            request("skillSave",{draft:review.draft,token:review.token,sessionID:current.sessionID,directory:review.directory}).then(function(receipt){
+                if(g!==generation || technique!==current)return;
+                el("technique-status").textContent="Saved: "+receipt.destination;technique=null;
+                el("chat-technique").hidden=true;el("chat-skill-status").textContent="Saved: "+receipt.name;refreshSkills();
+            },function(e){if(g===generation)el("technique-status").textContent=(e.message || "Save not confirmed")+". No automatic retry.";}).then(function(){techniqueBusy=false;controls();});
+        });
+        el("chat-skill-search").addEventListener("input",drawSkills);
+        el("chat-skills-refresh").addEventListener("click",refreshSkills);
+        el("chat-skills").addEventListener("toggle",function(){if(this.open)refreshSkills();});
+        el("chat-skill-picker").addEventListener("change",function(){
+            skillChoice=this.value==="" ? null : skills[Number(this.value)] || null;
+            el("chat-skill-status").textContent=skillChoice ? "Selected: "+skillChoice.name+" (not loaded)" : "No skill selected";
+        });
         function projectIdentity(s) { return s.project ? JSON.stringify(s.project) : ""; }
         function pins() { if(!store.state.chatPins)store.state.chatPins={};return store.state.chatPins; }
         function pinKey() { return "project:"+(state.project && state.project.id); }
@@ -19,9 +97,15 @@
         }
         function error(e) { el("chat-error").textContent=(e.code ? e.code+": " : "")+(e.message || String(e)); }
         function controls() {
-            var connected=state.connection==="connected", busy=sending || modelSaving || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
+            var connected=state.connection==="connected", busy=sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
             var restoring=snapshot && snapshot.restore && ["pending","unconfirmed"].indexOf(snapshot.restore.status)>=0;
             var restoreBlocked=!connected || !!busy || !!restoring || !!client.panelPending || state.busy || state.uncertain || !!state.lock || deliveryUnknown || !!(snapshot && snapshot.owned) || !!(state.binding && state.binding.sessionID!==(snapshot && snapshot.sessionID));
+            el("chat-skill-picker").disabled=!connected || !!busy || skillLoading;
+            el("chat-skills-refresh").disabled=!connected || !!busy || skillLoading;
+            el("technique-review-button").disabled=techniqueBusy || !connected;
+            el("technique-confirm").disabled=techniqueBusy || !connected;
+            el("technique-cancel").disabled=techniqueBusy;
+            ["technique-name","technique-description","technique-instructions","technique-scope"].forEach(function(id){el(id).disabled=techniqueBusy;});
             el("chat-checkpoints-toggle").disabled=restoreWorking || !!restoreReview;
             el("chat-checkpoint-picker").disabled=checkpointLoading || !checkpointList.length || restoreBlocked;
             el("chat-checkpoint-review").disabled=checkpointLoading || restoreBlocked || !checkpointList.some(function(c){return c.id===el("chat-checkpoint-picker").value;});
@@ -39,7 +123,7 @@
             el("chat-attach").disabled=!!busy || deliveryUnknown;
             el("chat-input").disabled=!!sending || deliveryUnknown;
             el("chat-stop").disabled=!connected || restoreWorking || !!restoreReview || !busy;
-            el("chat-new").disabled=!connected || sending || modelSaving || restoreWorking || !!restoreReview;
+            el("chat-new").disabled=!connected || sending || modelSaving || techniqueBusy || restoreWorking || !!restoreReview;
             el("chat-takeover").hidden=!(snapshot && snapshot.owned);
             el("chat-takeover").textContent=takeover ? "Take control on next message ✓" : "Take control for this chat";
             el("chat-target").textContent=(el("chat-comp").value==="follow" ? "Following: " : "Pinned: ")+label();
@@ -187,7 +271,7 @@
         }
         el("chat-model").addEventListener("change",function(){drawReasoning("default");saveModel();});
         el("chat-reasoning").addEventListener("change",saveModel);
-        el("chat-workspace").addEventListener("change",function(){catalogAt=0;refreshModels();});
+        el("chat-workspace").addEventListener("change",function(){clearSkills();catalogAt=0;refreshModels();if(el("chat-skills").open)refreshSkills();});
         function drawAttachments() {
             var box=el("chat-attachments");box.textContent="";
             attachments.forEach(function(a){
@@ -222,6 +306,7 @@
             if(files && files.length){e.preventDefault();addFiles(files);}
         });
         function draw(data) {
+            if(snapshot && (snapshot.sessionID!==data.sessionID || snapshot.directory!==data.directory))clearSkills();
             snapshot=data;
             if(collapseSession!==data.sessionID){collapseSession=data.sessionID;loadCollapse();messagesKey="";historyMessages=[];historyLoaded=false;historyCursor=null;}
             if(!historyLoaded)historyCursor=data.nextCursor || null;
@@ -269,6 +354,8 @@
                         if(part.type==="image" && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(part.url)) {
                             var imageBox=disclosure(partKey,"Image · "+(part.filename || "Composition frame"),false);
                             var img=node("img");img.src=part.url;img.alt=part.filename || "Composition frame";imageBox.appendChild(img);content.appendChild(imageBox);
+                        } else if(part.type==="skill") {
+                            content.appendChild(node("p","Loaded skill: "+part.name,"chat-skill-loaded"));
                         } else if(part.type==="checkpoint") {
                             var card=node("section",undefined,"chat-checkpoint");card.appendChild(node("strong",part.label));
                             var status=node("p"),button=node("button","Restore…");button.type="button";
@@ -292,6 +379,10 @@
                         restore.addEventListener("click",function(){if(!restore.disabled && checkpointId)reviewRestore(checkpointId);});
                         checkpointButtons.push({id:checkpointId,status:hint,button:restore});
                         footer.appendChild(hint);footer.appendChild(restore);row.appendChild(footer);
+                    }
+                    if(message.role==="assistant" && message.completed && !message.error && (message.parts || []).some(function(p){return p.type==="text" && p.text.trim();})){
+                        var saveTechnique=node("button","Save technique...");saveTechnique.type="button";
+                        saveTechnique.addEventListener("click",function(){draftTechnique(message);});row.appendChild(saveTechnique);
                     }
                     if(message.error)row.appendChild(node("p",message.error,"chat-failure"));
                     (turnBox || box).appendChild(row);
@@ -318,11 +409,15 @@
             var dirs=data.workspaces || [],select=el("chat-workspace"),old=select.value;
             if(JSON.stringify(dirs)!==select.workspaceKey) {
                 select.workspaceKey=JSON.stringify(dirs);select.textContent="";
-                if(dirs.length>1){var blank=node("option","Choose a CM workspace");blank.value="";select.appendChild(blank);}
+                var blank=node("option","Choose a CM workspace");blank.value="";select.appendChild(blank);
                 dirs.forEach(function(dir){var option=node("option",dir);option.value=dir;select.appendChild(option);});
-                if(data.directory || dirs.indexOf(old)>=0)select.value=data.directory || old;
+                if(data.directory && data.workspaceConfirmed)select.value=data.directory;
+                else if(dirs.indexOf(old)>=0)select.value=old;
             }
-            select.hidden=!!data.sessionID || dirs.length<=1;
+            if(data.directory && data.workspaceConfirmed)select.value=data.directory;
+            select.hidden=!!data.workspaceConfirmed || !dirs.length;
+            select.disabled=!!data.sessionID;
+            if(data.sessionID && !data.workspaceConfirmed)select.disabled=false;
             drawModels();
             controls();
         }
@@ -335,7 +430,7 @@
             e.preventDefault();if(el("chat-send").disabled)return;
             var text=el("chat-input").value.trim(),g=generation;
             sending=true;drawAttachments();el("chat-error").textContent="";controls();
-            request("send",{text:text,attachments:attachments.map(function(a){return {filename:a.filename,mime:a.mime,url:a.url};}),requestId:api.requestId(),compId:selected(),directory:el("chat-workspace").value || undefined,takeover:takeover}).then(function(data){
+            request("send",{text:text,skill:skillChoice && skillContext ? {name:skillChoice.name,source:skillChoice.source,revision:skillChoice.revision,directory:skillContext.directory,sessionID:skillContext.sessionID} : undefined,attachments:attachments.map(function(a){return {filename:a.filename,mime:a.mime,url:a.url};}),requestId:api.requestId(),compId:selected(),directory:el("chat-workspace").value || undefined,takeover:takeover}).then(function(data){
                 if(g!==generation)return;
                 if(data.delivery!=="accepted"){deliveryUnknown=true;throw {code:"delivery_unknown",message:"Delivery is uncertain. Check the conversation before resending."};}
                 el("chat-input").value="";attachments=[];drawAttachments();takeover=false;
@@ -353,14 +448,14 @@
         el("chat-takeover").addEventListener("click",function(){takeover=!takeover;controls();});
         el("chat-stop").addEventListener("click",function(){request("stop").then(refresh,error);});
         el("chat-new").addEventListener("click",function(){
-            request("new",{directory:el("chat-workspace").value || undefined}).then(function(){messagesKey="";approvalsKey="";deliveryUnknown=false;attachments=[];drawAttachments();el("chat-input").value="";return refresh();},error);
+            clearSkills();request("new",{directory:el("chat-workspace").value || undefined}).then(function(){messagesKey="";approvalsKey="";deliveryUnknown=false;attachments=[];drawAttachments();el("chat-input").value="";return refresh();},error);
         });
         function update(s) {
             state=s;var key=projectIdentity(s);
             if(restoreReview && restoreReview!==client.restoreApproval)cancelRestore();
             if(s.connection!=="connected")el("chat-progress").textContent="Connecting to CookieMonster…";
             if(key!==projectKey) {
-                projectKey=key;generation++;attachments=[];deliveryUnknown=false;drawAttachments();snapshot=null;takeover=false;messagesKey="";approvalsKey="";compKey="";serverError="";collapseState={};collapseSession="";
+                clearSkills();el("chat-workspace").value="";el("chat-workspace").workspaceKey="";projectKey=key;generation++;attachments=[];deliveryUnknown=false;drawAttachments();snapshot=null;takeover=false;messagesKey="";approvalsKey="";compKey="";serverError="";collapseState={};collapseSession="";
                 catalog=[];catalogKey="";catalogAt=0;modelError="";drawModels();
                 checkpointList=[];checkpointButtons=[];checkpointAt=0;cancelRestore();if(!restoreWorking)restoreNotice("");
                 drawCheckpoints();el("chat-checkpoints").hidden=true;el("chat-checkpoints-toggle").setAttribute("aria-expanded","false");
