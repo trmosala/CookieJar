@@ -673,7 +673,7 @@ Save current unsaved edits to a private emergency project and verify a protected
           await checkApproval(b, initial.fingerprint)
           const saved = bounded(await bridge.call(sessionID, "execute", {
             phase: "restore_prepare", transaction, recoveryId: transaction.id, expected: initial.data, path: emergencyPath,
-          }, { allowLocked: true }))
+          }, { allowLocked: true, timeoutMs: 120000 }))
           const recoveryBinding = current(sessionID, null, { write: true, allowLocked: true })
           if (recoveryBinding.id !== b.id || recoveryBinding.connectionId !== b.connectionId ||
               saved.status !== "recovery_saved" || saved.project?.path !== emergencyPath ||
@@ -681,7 +681,7 @@ Save current unsaved edits to a private emergency project and verify a protected
             fail("invalid_host_result", "Manual recovery save identity was not confirmed")
           const normalized = clone(saved.snapshot)
           normalized.project = initial.data.project
-          if (recoveryScene(normalized) !== recoveryScene(initial.data) || saved.snapshot.revision !== initial.data.revision)
+          if (recoveryScene(normalized) !== recoveryScene(initial.data) || (saved.snapshot.revision !== initial.data.revision && saved.snapshot.revision !== initial.data.revision + 1))
             fail("invalid_host_result", "Current state changed while saving")
           const created = await checkpoints.create({ projectPath: emergencyPath, projectId: saved.project.id, planHash, pinned: true })
           currentCheckpoint = await checkpoints.verify(created.id)
@@ -713,7 +713,7 @@ Save current unsaved edits to a private emergency project and verify a protected
           const opened = bounded(await bridge.call(sessionID, "execute", {
             phase: "restore_finish", transaction, recoveryId: transaction.id, expected: saved.snapshot, path: openPath,
             verifiedCheckpoint: { id: currentCheckpoint.id, hash: currentCheckpoint.hash, size: currentCheckpoint.size },
-          }, { allowLocked: true }))
+          }, { allowLocked: true, timeoutMs: 120000 }))
           const finalBinding = current(sessionID, null, { allowLocked: true })
           if (finalBinding.id !== b.id || finalBinding.connectionId !== b.connectionId || opened.status !== "recovered" ||
               opened.project?.path !== openPath || !sameProject(opened.project, finalBinding.project))

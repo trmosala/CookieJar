@@ -297,6 +297,10 @@ export function createTools(runtime) {
             check()
           }
           const result = await execute(parsed, c, askFor(r, c, name))
+          if (name === "ae_reconcile") await r.chat?.recordReconciliation(c.sessionID)
+          if (name === "ae_restore") await r.chat?.recordRestore(c.sessionID, { status: "completed",
+            checkpointId: result.checkpointId, currentCheckpointId: result.currentCheckpointId,
+            recoveryCopy: result.recoveryCopy, path: result.path, emergencyPath: result.emergencyPath, warning: result.warning })
           if (name !== "ae_release" && name !== "ae_bind") check()
           if (name !== "ae_release" && !lifetime?.aborted) r.diagnostics?.record(c.sessionID, name.slice(3), "ok", { durationMs: performance.now() - started })
           return name === "ae_capture" ? result : JSON.stringify(result ?? null)
@@ -587,6 +591,7 @@ async function panel(r, input) {
   if (a.action === "checkpoint.pin" || a.action === "checkpoint.delete")
     return mutateCheckpoint(r, c, { ...a, action: a.action.slice(11) }, consent)
   if (a.action === "checkpoint.restore.propose") {
+    await r.chat?.assertRestorable(sessionID)
     current(r, c, b, { write: true })
     const before = await snapshot(r, c, b), record = await checkpoint(r, c, b, a.id)
     let review
@@ -622,14 +627,29 @@ async function panel(r, input) {
     const record = await checkpoint(r, c, b, plan.checkpointId)
     if (record.hash !== plan.checkpointHash || (await stat(b.project.path)).mtimeMs !== plan.destinationTimestamp)
       fail("stale_fingerprint", "Reviewed source or destination changed")
-    return r.workflow.restore(sessionID, plan.checkpointId, async (operation, metadata) => {
-      if (operation !== plan.operation || hash(metadata) !== plan.reviewHash)
-        fail("stale_fingerprint", "Restore operation changed; review it again")
-      if (r.now() >= plan.expiresAt) fail("invalid_token", "Restore approval expired")
-      await snapshot(r, c, plan.binding, plan.fingerprint)
-      if ((await stat(b.project.path)).mtimeMs !== plan.destinationTimestamp) fail("stale_fingerprint", "Destination changed")
-      return true
-    })
+    await r.chat?.assertRestorable(sessionID)
+    let started = false
+    try {
+      const restored = await r.workflow.restore(sessionID, plan.checkpointId, async (operation, metadata) => {
+        if (operation !== plan.operation || hash(metadata) !== plan.reviewHash)
+          fail("stale_fingerprint", "Restore operation changed; review it again")
+        if (r.now() >= plan.expiresAt) fail("invalid_token", "Restore approval expired")
+        await snapshot(r, c, plan.binding, plan.fingerprint)
+        if ((await stat(b.project.path)).mtimeMs !== plan.destinationTimestamp) fail("stale_fingerprint", "Destination changed")
+        await r.chat?.recordRestore(sessionID, { status: "pending", checkpointId: plan.checkpointId })
+        started = true
+        return true
+      })
+      await r.chat?.recordRestore(sessionID, { status: "completed", checkpointId: restored.checkpointId,
+        currentCheckpointId: restored.currentCheckpointId, recoveryCopy: restored.recoveryCopy,
+        path: restored.path, emergencyPath: restored.emergencyPath, warning: restored.warning })
+      return restored
+    } catch (error) {
+      if (started) await r.chat?.recordRestore(sessionID, { status: "unconfirmed", checkpointId: plan.checkpointId,
+        emergencyPath: error.details?.emergencyPath || null, currentCheckpointId: error.details?.currentCheckpointId || null,
+        message: "Restore was not confirmed. Inspect After Effects and retain the recovery files before continuing." })
+      throw error
+    }
   }
   if (a.action === "renders") return jobList(r, c)
   const all = await r.renderer.list()
@@ -662,6 +682,7 @@ export async function server(_input, options = {}) {
   try { runtime = await entry.promise } catch (error) { entry.refs--; throw error }
   if (!entry.chat) entry.chat = createChat(runtime)
   const chat = await entry.chat
+  runtime.chat = chat
   const unregisterChat = chat.register(_input)
   runtime.bridge.setChatHandler(chat.handle)
   const owned = new Set(), owner = Symbol("plugin-instance")

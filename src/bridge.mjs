@@ -703,7 +703,7 @@ async function startBridge({
     }
     if (endpoint === "/chat") {
       schema(body, ["action", "project"], ["text", "requestId", "compId", "directory", "permissionId", "response", "takeover", "attachments", "model"])
-      if (!["state", "send", "new", "stop", "permission", "models", "model"].includes(body.action)) fail("invalid_payload", "Unknown chat action")
+      if (!["state", "send", "new", "stop", "permission", "models", "model", "checkpoints", "bind"].includes(body.action)) fail("invalid_payload", "Unknown chat action")
       const expected = project(body.project), credentialHash = credential.hash
       const check = () => {
         if (live.get(c.id) !== c || !c.connected || credential.hash !== credentialHash || !sameProject(c.project, expected))

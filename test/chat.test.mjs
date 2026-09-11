@@ -22,7 +22,7 @@ async function fixture(t) {
     },
     async postSessionIdPermissionsPermissionId(options) { calls.push(["permission", options]); return { data: true } },
   }
-  const runtime = { dataDir: p.dataDir, bridge: p.bridge, workflow: { async inspectQuery(sessionID, query) {
+  const runtime = { dataDir: p.dataDir, bridge: p.bridge, checkpoints: { async list() { return [] } }, workflow: { async inspectQuery(sessionID, query) {
     assert.equal(p.bridge.binding(sessionID).connectionId, p.connectionId)
     return { items: [{ id: query.compId || 1, kind: "comp", name: "Main" }] }
   } } }
@@ -194,4 +194,52 @@ test("invalid references are rejected before creating or submitting a conversati
   const large={...file,url:"data:text/plain;base64,"+Buffer.alloc(1100000).toString("base64")}
   await assert.rejects(f.send(message({attachments:[large,large]})), {code:"payload_too_large"})
   assert.equal(f.calls.length,0)
+})
+
+
+test("completed edits expose only their actual pre-edit checkpoint and restore state survives reopening", async t => {
+  const f = await fixture(t), sent = await f.send(message())
+  f.messages.push({ info: {id:"edit",role:"assistant"}, parts:[
+    {type:"tool",tool:"ae_execute",state:{status:"completed",output:JSON.stringify({checkpointId:"cp-before",result:"done"})}},
+    {type:"text",text:"checkpointId: fake"},
+    {type:"tool",tool:"ae_inspect",state:{status:"completed",output:JSON.stringify({checkpointId:"fake"})}},
+    {type:"tool",tool:"ae_execute",state:{status:"completed",output:"not JSON"}}
+  ]})
+  const cards=(await f.send()).messages[0].parts.filter(p=>p.type==="checkpoint")
+  assert.deepEqual(cards,[{type:"checkpoint",id:"cp-before",label:"Before this edit"}])
+  await f.chat.recordRestore(sent.sessionID,{status:"pending",checkpointId:"cp-before"})
+  await assert.rejects(f.send(message({requestId:"b".repeat(40)})),{code:"restore_unconfirmed"})
+  await f.chat.recordRestore(sent.sessionID,{status:"completed",checkpointId:"cp-before",currentCheckpointId:"cp-current",recoveryCopy:false})
+  const reopened=await createChat(f.runtime);reopened.register({client:f.client,directory:f.p.dataDir});f.p.bridge.setChatHandler(reopened.handle)
+  assert.equal((await f.send()).restore.currentCheckpointId,"cp-current")
+  await f.send(message({requestId:"b".repeat(40)}))
+  assert.match(f.inputs.at(-1).body.system,/cp-before/)
+  assert.match(f.inputs.at(-1).body.system,/never replay previous edits/)
+  f.statuses[sent.sessionID]={type:"busy"}
+  await assert.rejects(reopened.assertRestorable(sent.sessionID),{code:"chat_busy"})
+})
+
+
+test("restore reconnects the existing chat without sending or taking another owner", async t => {
+  const f=await fixture(t),sent=await f.send(message())
+  await f.p.bridge.release(sent.sessionID)
+  await f.send({action:"bind"})
+  assert.equal(f.p.bridge.binding(sent.sessionID).connectionId,f.p.connectionId)
+  assert.equal(f.inputs.length,1)
+  await f.p.bridge.release(sent.sessionID)
+  await f.p.bridge.bind("other",f.p.connectionId)
+  await assert.rejects(f.send({action:"bind"}),{code:"binding_owned"})
+})
+
+test("reviewed recovery releases the chat hold without claiming a successful restore", async t => {
+  const f=await fixture(t),sent=await f.send(message())
+  await f.chat.recordRestore(sent.sessionID,{status:"unconfirmed",checkpointId:"cp-before",emergencyPath:"C:/backup.aep"})
+  await assert.rejects(f.send(message({requestId:"c".repeat(40)})),{code:"restore_unconfirmed"})
+  await f.chat.recordReconciliation(sent.sessionID)
+  const state=await f.send()
+  assert.equal(state.restore.status,"reconciled")
+  assert.equal(state.restore.emergencyPath,"C:/backup.aep")
+  await f.send(message({requestId:"c".repeat(40)}))
+  assert.match(f.inputs.at(-1).body.system,/reconciled/)
+  assert.match(f.inputs.at(-1).body.system,/never replay previous edits/)
 })

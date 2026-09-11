@@ -890,6 +890,15 @@ var CookieMonsterAE = (function () {
                 if(project().path!==file.fsName)fail("unsafe_state","Emergency save did not confirm its path");
                 var saved=inspect(),prior=parse(rec.snapshot),normalized=parse(stringify(saved));
                 normalized.project=prior.project;delete normalized.fingerprint;delete prior.fingerprint;
+                // AE Save As may increment revision once without changing scene data.
+                // Only our synchronous save may refresh these locators; extra revisions still fail closed.
+                if(saved.revision!==prior.revision && saved.revision!==prior.revision+1)fail("unsafe_state","Unexpected revision while saving emergency file");
+                function savedRevision(value) {
+                    if(!value || typeof value!=="object")return;
+                    if(value.locator)value.locator.revision=prior.revision;
+                    var key;for(key in value)if(own(value,key))savedRevision(value[key]);
+                }
+                normalized.revision=prior.revision;savedRevision(normalized);
                 if(stringify(normalized)!==stringify(prior))fail("unsafe_state","State or revision changed while saving emergency file");
                 rec.snapshot=stringify(saved);rec.phase="saved";
                 return {status:"recovery_saved",project:project(),snapshot:saved};

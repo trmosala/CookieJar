@@ -503,12 +503,13 @@ test("panel pins project identity through evalScript and refuses a switch before
     assert.equal(f.project.revision,1);assert.equal(f.begins,0);
 });
 test("manual restore host close requires exact owner, saved snapshot, clean state and verified backup", t => {
-    for(const mode of ["success","owner","snapshot","dirty","unknown","proof","mode","callback","close_refused","open_edit"]){
+    for(const mode of ["success","save_revision","owner","snapshot","dirty","unknown","proof","mode","callback","close_refused","open_edit"]){
         const base=process.platform==="win32" ? path.join(os.tmpdir(),"opencode") : os.tmpdir();
         const dir=mkdtempSync(path.join(base,"cm-manual-host-"));
         t.after(()=>rmSync(dir,{recursive:true,force:true}));
         const canonical=path.join(dir,"original.aep"),h=hostDouble(canonical);
         h.props[0].setValue(42);
+        if(mode==="save_revision"){const save=h.project.save.bind(h.project);h.project.save=file=>{save(file);h.project.revision++;};}
         const transaction={id:"restore",sessionID:"session",bindingID:"binding"};
         const saved=h.call("execute",{phase:"restore_prepare",transaction,recoveryId:"restore",
             expected:h.call("inspect").result,path:path.join(dir,"emergency.aep")});
@@ -529,7 +530,7 @@ test("manual restore host close requires exact owner, saved snapshot, clean stat
             h.app.open=file=>{const result=open(file);h.props[0].setValue(19);return result;};
         }
         const result=h.call("execute",finish);
-        if(mode==="success"){
+        if(mode==="success" || mode==="save_revision"){
             assert.equal(result.result.status,"recovered");
             assert.equal(h.closes,1);
             assert.equal(h.project.file.fsName,canonical);

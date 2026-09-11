@@ -5,7 +5,8 @@
         function el(id) { return document.getElementById(id); }
         var state=client.state, projectKey="", generation=0, polling=false, sending=false, timer,
             messagesKey="", approvalsKey="", compKey="", snapshot=null, takeover=false, serverError="", attachments=[], deliveryUnknown=false, refreshError="",
-            catalog=[], catalogKey="", catalogAt=0, catalogLoading=false, modelSaving=false, modelError="", modelRevision=0;
+            catalog=[], catalogKey="", catalogAt=0, catalogLoading=false, modelSaving=false, modelError="", modelRevision=0,
+            checkpointList=[], checkpointButtons=[], checkpointAt=0, checkpointLoading=false, restoreWorking=false, restoreReview=null;
         function projectIdentity(s) { return s.project ? JSON.stringify(s.project) : ""; }
         function pins() { if(!store.state.chatPins)store.state.chatPins={};return store.state.chatPins; }
         function pinKey() { return "project:"+(state.project && state.project.id); }
@@ -17,15 +18,21 @@
         }
         function error(e) { el("chat-error").textContent=(e.code ? e.code+": " : "")+(e.message || String(e)); }
         function controls() {
-            var connected=state.connection==="connected", busy=sending || modelSaving || snapshot && snapshot.status!=="idle";
+            var connected=state.connection==="connected", busy=sending || modelSaving || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
+            var restoring=snapshot && snapshot.restore && ["pending","unconfirmed"].indexOf(snapshot.restore.status)>=0;
+            checkpointButtons.forEach(function(item){
+                var available=checkpointList.some(function(c){return c.id===item.id;});
+                item.button.disabled=!available || !connected || !!busy || !!restoring || !!client.panelPending || state.busy || state.uncertain || !!state.lock || !!(snapshot && snapshot.owned) || !!(state.binding && state.binding.sessionID!==(snapshot && snapshot.sessionID));
+                item.status.textContent=available ? "Saved state before this edit. Verified again when you review Restore." : "Checkpoint unavailable or not loaded for this project.";
+            });
             el("chat-model").disabled=!connected || !!busy || deliveryUnknown || !catalog.length;
             el("chat-reasoning").disabled=el("chat-model").disabled || !el("chat-model").value || el("chat-reasoning").children.length<=1;
             el("chat-model-status").textContent=!connected ? "Connect to CookieMonster to choose a model" : modelSaving ? "Saving model…" : modelError;
-            el("chat-send").disabled=!connected || !!busy || state.uncertain || deliveryUnknown || attachments.some(function(a){return !a.url;}) || !el("chat-input").value.trim();
+            el("chat-send").disabled=!connected || !!busy || !!restoring || state.uncertain || deliveryUnknown || attachments.some(function(a){return !a.url;}) || !el("chat-input").value.trim();
             el("chat-attach").disabled=!!busy || deliveryUnknown;
             el("chat-input").disabled=!!sending || deliveryUnknown;
-            el("chat-stop").disabled=!connected || !busy;
-            el("chat-new").disabled=!connected || sending || modelSaving;
+            el("chat-stop").disabled=!connected || restoreWorking || !!restoreReview || !busy;
+            el("chat-new").disabled=!connected || sending || modelSaving || restoreWorking || !!restoreReview;
             el("chat-takeover").hidden=!(snapshot && snapshot.owned);
             el("chat-takeover").textContent=takeover ? "Take control on next message ✓" : "Take control for this chat";
             el("chat-target").textContent=(el("chat-comp").value==="follow" ? "Following: " : "Pinned: ")+label();
@@ -41,6 +48,34 @@
         function node(tag, text, className) {
             var e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(className)e.className=className;return e;
         }
+        function restoreNotice(text) { el("chat-restore-status").textContent=text;el("chat-restore-status").hidden=!text; }
+        function cancelRestore() { restoreReview=null;client.restoreApproval=null;el("chat-restore-review").hidden=true;controls(); }
+        function reviewRestore(id) {
+            var g=generation;restoreWorking=true;controls();
+            request("bind").then(function(){return client.heartbeat();}).then(function(){
+                if(g!==generation)throw {message:"Project changed; review the restore again"};
+                return client.panel("checkpoint.restore.propose",{id:id});
+            }).then(function(result){
+                if(g!==generation || !client.restoreApproval)return;
+                restoreReview=client.restoreApproval;el("chat-restore-operation").textContent=result.operation;
+                el("chat-restore-review").hidden=false;el("chat-restore-cancel").focus();
+            },function(e){if(g===generation)error(e.code==="response_too_large" || e.code==="payload_too_large" ? {message:"This project is too large for verified chat restore. Nothing was changed. Your checkpoint is still available; use After Effects to open a copy manually."} : e);}).then(function(){restoreWorking=false;controls();});
+        }
+        function refreshCheckpoints() {
+            if(checkpointLoading || restoreWorking || restoreReview || !snapshot || !snapshot.sessionID)return Promise.resolve();
+            var g=generation;checkpointLoading=true;
+            return request("checkpoints").then(function(data){if(g===generation){checkpointList=data.checkpoints || [];checkpointAt=Date.now();}},function(){if(g===generation){checkpointList=[];checkpointAt=Date.now();}}).then(function(){checkpointLoading=false;controls();});
+        }
+        el("chat-restore-cancel").addEventListener("click",cancelRestore);
+        el("chat-restore-confirm").addEventListener("click",function(){
+            if(restoreWorking || !restoreReview || restoreReview!==client.restoreApproval)return;
+            restoreWorking=true;restoreReview=null;el("chat-restore-review").hidden=true;
+            restoreNotice("Saving your current work and restoring the project…");controls();client.start();
+            client.confirmRestore().then(function(r){
+                restoreNotice((r.recoveryCopy ? "A recovery copy was opened. Review it in AE and save it to the intended location before continuing. " : "Project restored. Earlier chat messages describe historical states. ")+
+                    "Your previous work is preserved in checkpoint "+r.currentCheckpointId+". Backup: "+r.emergencyPath+". "+r.warning);
+            },function(e){restoreNotice("Restore was not confirmed. Check After Effects and retain the backup files. It will not retry automatically. "+(e.message || ""));}).then(function(){restoreWorking=false;checkpointAt=0;controls();refresh();});
+        });
         function modelKey(m) { return JSON.stringify([m.providerID,m.id]); }
         function drawModels() {
             if(modelSaving)return;
@@ -115,6 +150,11 @@
         });
         function draw(data) {
             snapshot=data;
+            if(!restoreWorking && data.restore)restoreNotice(data.restore.status==="completed" ?
+                (data.restore.recoveryCopy ? "Recovery copy opened. " : "Project restored. ")+"Earlier messages are history. Your previous work is preserved in checkpoint "+data.restore.currentCheckpointId+". "+(data.restore.warning || "") :
+                data.restore.status==="reconciled" ? "Recovery was reviewed. A restore was not confirmed; earlier messages remain history. You can continue from the inspected project state." :
+                data.restore.status==="pending" ? "Restore is in progress or was interrupted. Wait for After Effects; it will not retry automatically." :
+                "The last restore was not confirmed. Inspect AE and retain its backups before starting a new chat. No edits will replay automatically."+(data.restore.emergencyPath ? " Backup: "+data.restore.emergencyPath : ""));
             if(!sending && (data.delivery==="unknown" || data.delivery==="sending"))deliveryUnknown=true;
             el("chat-progress").textContent=data.status==="idle" ? "Ready" : "CookieMonster is working…";
             if(data.error || el("chat-error").textContent===serverError)el("chat-error").textContent=data.error || "";
@@ -122,13 +162,18 @@
             var key=JSON.stringify(data.messages || []);
             if(key!==messagesKey) {
                 messagesKey=key;var box=el("chat-messages"),nearBottom=box.scrollHeight-box.scrollTop-box.clientHeight<80;
-                box.textContent="";
+                box.textContent="";checkpointButtons=[];
                 (data.messages || []).forEach(function(message){
                     var row=node("article",undefined,"chat-message "+(message.role==="user" ? "from-user" : "from-assistant"));
                     row.appendChild(node("h3",message.role==="user" ? "You" : "CookieMonster"));
                     (message.parts || []).forEach(function(part){
                         if(part.type==="image" && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(part.url)) {
                             var img=node("img");img.src=part.url;img.alt=part.filename || "Composition frame";row.appendChild(img);
+                        } else if(part.type==="checkpoint") {
+                            var card=node("section",undefined,"chat-checkpoint");card.appendChild(node("strong",part.label));
+                            var status=node("p"),button=node("button","Restore…");button.type="button";
+                            button.addEventListener("click",function(){if(!button.disabled)reviewRestore(part.id);});
+                            checkpointButtons.push({id:part.id,status:status,button:button});card.appendChild(status);card.appendChild(button);row.appendChild(card);
                         } else if(part.type==="text" || part.type==="tool")row.appendChild(node("div",part.text,part.type==="tool" ? "chat-tool" : "chat-text"));
                     });
                     if(message.error)row.appendChild(node("p",message.error,"chat-failure"));
@@ -167,7 +212,7 @@
         function refresh() {
             if(polling || modelSaving || state.connection!=="connected" || !state.project)return Promise.resolve();
             polling=true;var g=generation, revision=modelRevision;
-            return request("state").then(function(data){if(g===generation && revision===modelRevision){if(el("chat-error").textContent===refreshError)el("chat-error").textContent="";refreshError="";draw(data);if(Date.now()-catalogAt>15000)return refreshModels();}},function(e){if(g===generation){error(e);refreshError=el("chat-error").textContent;}}).then(function(){polling=false;});
+            return request("state").then(function(data){if(g===generation && revision===modelRevision){if(el("chat-error").textContent===refreshError)el("chat-error").textContent="";refreshError="";draw(data);return Promise.all([Date.now()-catalogAt>15000 ? refreshModels() : null,Date.now()-checkpointAt>10000 ? refreshCheckpoints() : null]);}},function(e){if(g===generation){error(e);refreshError=el("chat-error").textContent;}}).then(function(){polling=false;});
         }
         el("chat-form").addEventListener("submit",function(e){
             e.preventDefault();if(el("chat-send").disabled)return;
@@ -195,10 +240,12 @@
         });
         function update(s) {
             state=s;var key=projectIdentity(s);
+            if(restoreReview && restoreReview!==client.restoreApproval)cancelRestore();
             if(s.connection!=="connected")el("chat-progress").textContent="Connecting to CookieMonster…";
             if(key!==projectKey) {
                 projectKey=key;generation++;attachments=[];deliveryUnknown=false;drawAttachments();snapshot=null;takeover=false;messagesKey="";approvalsKey="";compKey="";serverError="";
                 catalog=[];catalogKey="";catalogAt=0;modelError="";drawModels();
+                checkpointList=[];checkpointButtons=[];checkpointAt=0;cancelRestore();if(!restoreWorking)restoreNotice("");
                 el("chat-messages").textContent="";el("chat-approvals").textContent="";el("chat-error").textContent="";el("chat-input").value="";
                 el("chat-project-name").textContent=s.project && s.project.path ? s.project.path.split(/[\\/]/).pop() : "Unsaved project";
             }

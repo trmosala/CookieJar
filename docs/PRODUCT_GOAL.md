@@ -10,6 +10,8 @@ Project changes switch project conversations and pause outstanding work. They mu
 
 ## Current implementation — 0.2.2
 
+Completed edits show a **Before this edit** checkpoint card. Restore reviews the exact saved project state, preserves current unsaved work first, and records the outcome in the conversation. Earlier messages remain history and cannot replay edits automatically. The panel reconnects the existing conversation when reviewing a checkpoint.
+
 Model and reasoning controls sit above the composer. The plugin reads CM's connected provider catalog and persists changes through CM's existing session model endpoint. Reopening AE restores the session selection; new messages explicitly carry that choice. Busy conversations and uncertain delivery block changes, and unavailable models or reasoning levels are rejected before dispatch. Providers that encode reasoning in separate model presets retain those names; separate reasoning options appear only when CM advertises variants.
 
 The CEP panel now contains project chat backed by the CM plugin's authenticated SDK client. It creates and resumes CM conversations per project, displays incremental replies and captured frames, and offers inline approve-once/reject controls. A composition picker follows the active viewer by default; selecting an explicit composition pins it. The mention button inserts its name and persistent ID. Duplicate names remain distinguishable by ID. Each submitted message carries a fixed target that is validated against AE before submission.

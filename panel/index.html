@@ -48,6 +48,15 @@
 
 <p id="chat-error" role="alert"></p>
 
+<p id="chat-restore-status" class="notice" role="status" hidden></p>
+<section id="chat-restore-review" class="chat-approval" hidden aria-label="Review project restore">
+<h3>Restore the project to before this edit?</h3>
+<p>Your current work will be saved and backed up first. This restores the whole project, not just this composition. Chat history stays visible as history; previous edits will not run again.</p>
+<pre id="chat-restore-operation"></pre>
+<button id="chat-restore-confirm" type="button">Save current work and restore</button>
+<button id="chat-restore-cancel" type="button">Cancel</button>
+</section>
+
 <form id="chat-form">
 
 <div class="chat-model-controls"><label>Model<select id="chat-model"><option value="">CookieMonster default</option></select></label><label>Reasoning<select id="chat-reasoning"><option value="default">Default</option></select></label></div>

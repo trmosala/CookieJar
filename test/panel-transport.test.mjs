@@ -56,8 +56,8 @@ test("a binding established between heartbeat and poll is refreshed before host 
 test("panel management sends exact authenticated schemas and requires an explicit single-use restore token",async()=>{
     const f=fixture();f.client.state.lock=null;
     const rows=[{id:"cp",createdAt:1000,pinned:false,storageMode:"project",size:123,projectPath:"not returned"}];
-    f.client.request=async(d,credential,endpoint,body)=>{
-        assert.equal(endpoint,"/panel");assert.equal(credential,f.store.state.credential);f.events.push([endpoint,structuredClone(body)]);
+    f.client.request=async(d,credential,endpoint,body,timeout)=>{
+        assert.equal(timeout,body.action.startsWith("checkpoint.restore.") ? 300000 : 15000);assert.equal(endpoint,"/panel");assert.equal(credential,f.store.state.credential);f.events.push([endpoint,structuredClone(body)]);
         if(body.action==="checkpoints")return {result:rows};
         if(body.action==="checkpoint.restore.propose")return {result:{token:"opaque-token",sourceTimestamp:1000,destinationTimestamp:2000,operation:"Save edits and restore checkpoint."}};
         if(body.action==="diagnostics")return {result:{version:"0.2.2",counts:{jobs:0}}};
@@ -779,4 +779,10 @@ test("native PNG timeout keeps the panel uncertainty latch and prevents another 
     assert.equal(f.events.find(e=>e[0]==="/reply")[1].error.code,"capture_timeout");
     const calls=f.events.filter(e=>e[0]==="host").length;
     await f.client.tick();assert.equal(f.events.filter(e=>e[0]==="host").length,calls);
+});
+
+test("native restore gets its own bounded timeout without extending ordinary calls", async()=>{
+    const host=new HostRPC({evalScript(code,callback){setTimeout(()=>callback('{"result":{"ok":true}}'),30);}},10,undefined,100);
+    assert.deepEqual(await host.call("execute",{phase:"restore_prepare"}),{ok:true});
+    await assert.rejects(host.call("inspect",{}),{code:"outcome_uncertain"});
 });

@@ -273,6 +273,24 @@ test("manual canonical restore saves dirty state and verifies current backup bef
     ["restore_prepare", "restore_finish"])
 })
 
+test("manual restore accepts only the native Save As revision increment", async t => {
+  for (const delta of [1, 2]) {
+    const f = await manualFixture(t)
+    const save = f.actual.project.save.bind(f.actual.project)
+    f.actual.project.save = file => { save(file); f.actual.project.revision += delta }
+    if (delta === 1) {
+      const result = await f.workflow.restore("session", f.checkpoint.id, async () => {})
+      assert.equal(result.canonicalReplaced, true)
+      const backup = await f.checkpoints.verify(result.currentCheckpointId)
+      assert.equal(JSON.parse(await readFile(backup.path)).props[0].value, 42)
+    } else {
+      await assert.rejects(f.workflow.restore("session", f.checkpoint.id, async () => {}), { code: "outcome_uncertain" })
+      assert.equal(f.actual.closes, 0)
+      assert.equal(f.bridge.state.lock.state, "uncertain")
+    }
+  }
+})
+
 test("manual canonical failure opens recovery copy with original unchanged and current backup protected", async t => {
   const f = await manualFixture(t, true)
   const before = await readFile(f.canonical)

@@ -180,3 +180,20 @@ The end-to-end smoke prompt completed on CM_GPT-5.6 Sol - Low: one bounded `ae_i
 Final native check: keyboard selection in the installed AE model picker changed High to Low, and CM state confirmed the new preset. High was restored afterward. A delayed state-poll regression test verifies that an old response cannot overwrite a newer confirmed selection.
 
 Final complete suite: 315 tests passed with zero failures after the stale-poll fix. The final installed panel reconnected to the saved project and retained its CM model selection.
+
+
+## Chat checkpoint restore (issue #20)
+
+Completed `ae_execute` results with checkpoint IDs show **Before this edit**. These checkpoints preserve the project before the edit, not its finished result. Choose **Restore**, review the exact checkpoint and destination, then **Save current work and restore**. Cancel changes nothing. Missing checkpoints, foreign ownership, active work and unresolved restores disable the action.
+
+The existing guarded workflow saves current unsaved work to an emergency project, verifies a protected checkpoint, and only then replaces/reopens the target. The conversation records completed, pending or unconfirmed restores durably. Subsequent prompts carry the restore context and prohibit replaying historical edits. Unconfirmed restores never retry; inspect AE and retain recovery files before continuing. Successful explicit reconciliation clears the chat hold without claiming that a restore succeeded. A recovery-copy fallback requires deliberate Save As and recovery review.
+
+Native AE 26.3 testing exposed and fixed two existing bugs: review could exceed the panel's 15-second timeout, and Save As increments the native project revision even when scene values are unchanged. Review now has a bounded five-minute request window; native save/open phases get two minutes each. Save verification permits only an unchanged revision or the single expected increment, while comparing every scene value and refreshing only the saved snapshot's locator revisions. Extra increments and scene changes still fail closed.
+
+The inherited complete-snapshot size limit remains: the 96-layer Teams recreation exceeds it, so verified restore is refused before changing the project. The chat explains that the project is too large instead of omitting metadata. This remains a development limitation.
+
+Native evidence: a disposable two-composition project received an unsaved name marker, was saved through the production host's restore preparation, backed up and SHA-256 verified, then restored through its exact-owner/expected-snapshot close/reopen phase. The restored project contained the original names; the emergency backup retained the marker. This smoke used an isolated host via `AfterFX.com -r`; checkpoint cards and automatic reconnect were separately exercised in CEP. An earlier failed verification preserved the emergency project and original canonical bytes, latched recovery and did not retry. The original full recreation was reopened unchanged.
+
+The final CM recovery conversation encountered an expired WPP login. The login window was opened; model-mediated reconciliation and the final installed CEP smoke still require completion after sign-in. Issue #20 remains open pending that check.
+
+Validation: the full suite passed 321 tests. The final reconciliation changes passed 23 focused chat/panel tests, followed by 10 panel tests including the large-project error message. Syntax checks passed for 40 scripts; the build verified 12 artifact hashes. The final development panel is installed and requires an AE restart; the rebuilt plugin requires a CM restart.

@@ -83,3 +83,7 @@ a { color:#b5c6df; overflow-wrap:anywhere; }
 .chat-model-controls label:first-child { flex:1; }
 .chat-model-controls select { max-width:100%; margin:0; }
 #chat-model-status { margin:4px 0; color:var(--text-muted, #999); font-size:11px; }
+.chat-checkpoint { border:1px solid var(--border); border-radius:6px; padding:10px; margin:8px 0; }
+.chat-checkpoint p { font-size:11px; }
+#chat-restore-review { max-height:45vh; overflow:auto; flex-shrink:0; }
+#chat-restore-status { max-height:100px; overflow:auto; flex-shrink:0; }

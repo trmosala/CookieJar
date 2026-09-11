@@ -121,7 +121,7 @@
                 try { api.cleanupCapture(value.result); } catch (e) { problem(e); }
             }
             render(client.state);
-        });
+        },120000);
         client = new api.Client({store:store,host:host,changed:render,normalize:function (r) { return api.normalizeCapture(r,document,Image); },beforeCapture:function(){
             return new Promise(function(resolve,reject){
                 if(document.hidden){reject({code:"unsafe_state",message:"Show the CookieMonster panel before capture"});return;}

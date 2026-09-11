@@ -257,7 +257,7 @@ function request(descriptor, credential, endpoint, body, timeout) {
         if (data) req.write(data); req.end();
     });
 }
-function HostRPC(cep, timeout, onLate) { this.cep = cep; this.timeout = timeout || 25000; this.pending = false; this.uncertain = false; this.onLate = onLate || function () {}; }
+function HostRPC(cep, timeout, onLate, restoreTimeout) { this.cep = cep; this.timeout = timeout || 25000; this.restoreTimeout = restoreTimeout || this.timeout; this.pending = false; this.uncertain = false; this.onLate = onLate || function () {}; }
 HostRPC.prototype.call = function (method, params, expectedProject) {
     var self = this;
     if (self.pending || self.uncertain) return Promise.reject(error("outcome_uncertain", "Host is locked pending explicit reconciliation"));
@@ -271,7 +271,7 @@ HostRPC.prototype.call = function (method, params, expectedProject) {
             if(method==="status") { reject(error("host_busy", "Close the AE dialog to reconnect")); return; }
             self.uncertain = true;
             reject(error("outcome_uncertain", "evalScript timed out; it was not cancelled and must not be retried"));
-        }, self.timeout);
+        }, method==="execute" && params && (params.phase==="restore_prepare" || params.phase==="restore_finish") ? self.restoreTimeout : self.timeout);
         var envelope={method:method,params:params};
         if(expectedProject)envelope.expectedProject=expectedProject;
         var payload = JSON.stringify(JSON.stringify(envelope)).replace(/\u2028/g,"\\u2028").replace(/\u2029/g,"\\u2029");
@@ -442,7 +442,7 @@ Client.prototype.panel=function(action,args){
     return Promise.resolve().then(function(){
         if(guard.stale || guard.scope!==self.scope() || guard.credential!==self.store.state.credential || context!==self.context())
             throw error("stale_binding","Panel scope changed before dispatch");
-        return self.request(descriptor,guard.credential,"/panel",payload,confirming ? 300000 : 15000);
+        return self.request(descriptor,guard.credential,"/panel",payload,(confirming || proposing) ? 300000 : 15000);
     }).then(function(response){
         if(!record(response) || Object.keys(response).length!==1 || !Object.prototype.hasOwnProperty.call(response,"result"))throw error("invalid_response","Panel service must return {result}");
         if(guard.stale || guard.scope!==self.scope() || guard.credential!==self.store.state.credential)throw error("stale_binding","Connection or binding changed during panel request");
