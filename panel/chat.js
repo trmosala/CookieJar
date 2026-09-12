@@ -10,6 +10,92 @@
             collapseState={}, collapseSession="", historyMessages=[], historyCursor=null, historyLoaded=false, historyLoading=false;
         var skills=[], skillChoice=null, skillContext=null, skillLoading=false, skillEpoch=0,
             technique=null, techniqueReview=null, techniqueBusy=false;
+        var conversationLoading=false, conversationSwitching=false, conversationEpoch=0, conversationOffset=0,
+            conversationNext=null, conversationRows=[], renameConversation=null;
+        function switchBlocked() {
+            return state.connection!=="connected" || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview ||
+                conversationSwitching || deliveryUnknown || !!client.panelPending || state.busy || state.uncertain || !!state.lock ||
+                !!(snapshot && (snapshot.status!=="idle" || snapshot.owned || snapshot.restore && ["pending","unconfirmed"].indexOf(snapshot.restore.status)>=0));
+        }
+        function conversationControls() {
+            var blocked=switchBlocked();
+            conversationRows.forEach(function(row){row.open.disabled=blocked || conversationLoading || row.unavailable;row.rename.disabled=row.open.disabled;});
+            el("chat-conversations-prev").disabled=conversationLoading || conversationSwitching || conversationOffset===0 || state.connection!=="connected";
+            el("chat-conversations-next").disabled=conversationLoading || conversationSwitching || conversationNext===null || state.connection!=="connected";
+            el("chat-conversation-save").disabled=blocked || conversationLoading;
+            el("chat-conversations-search-button").disabled=conversationSwitching || state.connection!=="connected";
+            el("chat-conversations-close").disabled=conversationSwitching;
+            if(state.connection!=="connected" && !el("chat-conversations").hidden)el("chat-conversations-status").textContent="Connect to CookieMonster to browse conversations.";
+        }
+        function loadConversations(offset) {
+            var epoch=++conversationEpoch,g=generation;
+            conversationOffset=offset;conversationLoading=true;renameConversation=null;el("chat-conversation-rename").hidden=true;
+            el("chat-conversations-status").textContent="Loading conversations...";conversationControls();
+            request("conversations",{search:el("chat-conversations-search").value,offset:offset}).then(function(data){
+                if(g!==generation || epoch!==conversationEpoch)return;
+                if(data.total && offset>=data.total){loadConversations(Math.floor((data.total-1)/10)*10);return;}
+                conversationNext=data.nextOffset===undefined ? null : data.nextOffset;conversationRows=[];
+                var list=el("chat-conversations-list");list.textContent="";
+                (data.conversations || []).forEach(function(item){
+                    var row=node("div",undefined,"chat-conversation-row"),buttons=node("div",undefined,"buttons"),open=node("button","Open"),rename=node("button","Rename");
+                    open.type=rename.type="button";row.appendChild(node("strong",item.title));
+                    row.appendChild(node("p",item.missing ? "Deleted in CookieMonster" : item.unavailable ? item.unavailableReason || "Open this workspace in CookieMonster" : "Last activity: "+new Date(item.updatedAt).toLocaleString()));
+                    row.appendChild(node("p",item.directory));
+                    if(snapshot && snapshot.sessionID===item.sessionID)row.appendChild(node("p","Current conversation"));
+                    open.addEventListener("click",function(){if(!open.disabled)changeConversation("reopen",item);});
+                    rename.addEventListener("click",function(){if(rename.disabled)return;renameConversation=item;el("chat-conversation-title").value=item.title;el("chat-conversation-rename").hidden=false;el("chat-conversation-title").focus();});
+                    buttons.appendChild(open);buttons.appendChild(rename);row.appendChild(buttons);list.appendChild(row);
+                    conversationRows.push({open:open,rename:rename,unavailable:item.missing || item.unavailable});
+                });
+                el("chat-conversations-status").textContent=data.total ? (offset+1)+"–"+Math.min(offset+10,data.total)+" of "+data.total+(switchBlocked() ? ". Finish work or recovery before switching." : "") : "No conversations found for this project.";
+            },function(e){if(g===generation && epoch===conversationEpoch){el("chat-conversations-list").textContent="";conversationRows=[];conversationNext=null;el("chat-conversations-status").textContent=e.message || "Conversations unavailable";}}).then(function(){if(epoch===conversationEpoch){conversationLoading=false;conversationControls();}});
+        }
+        function closeConversations() { if(conversationSwitching)return;conversationEpoch++;conversationLoading=false;el("chat-conversations").hidden=true;el("chat-conversations-open").focus(); }
+        function applyTarget(id) {
+            var picker=el("chat-comp"),value=id===null ? "follow" : String(id);
+            if(value!=="follow" && !(state.compositions || []).some(function(c){return String(c.id)===value;})){
+                var option=node("option","Missing composition #"+value);option.value=value;picker.appendChild(option);
+            }
+            picker.value=value;pins()[pinKey()]=value;store.save();
+        }
+        function changeConversation(action,item) {
+            if(switchBlocked())return;
+            conversationSwitching=true;generation++;conversationEpoch++;polling=false;controls();
+            var g=generation;
+            request(action,item ? {sessionID:item.sessionID,directory:item.directory} : {directory:el("chat-workspace").value || undefined}).then(function(data){
+                if(g!==generation)return;
+                clearSkills();snapshot={sessionID:data.sessionID,status:"loading"};messagesKey="";approvalsKey="";collapseSession="";historyMessages=[];historyLoaded=false;historyCursor=null;
+                historyLoading=false;catalogLoading=false;checkpointLoading=false;checkpointAt=0;catalogAt=0;checkpointList=[];
+                deliveryUnknown=false;attachments=[];drawAttachments();el("chat-input").value="";el("chat-messages").textContent="";el("chat-approvals").textContent="";
+                el("chat-error").textContent="";el("chat-conversations").hidden=true;applyTarget(data.targetCompId===undefined ? null : data.targetCompId);
+            },function(e){if(g===generation){error(e);el("chat-conversations-status").textContent=e.message || "Could not open conversation";}}).then(function(){
+                if(g!==generation)return;conversationSwitching=false;controls();refresh();
+            });
+        }
+        el("chat-conversations-open").addEventListener("click",function(){el("chat-conversations").hidden=false;el("chat-conversations-search").focus();loadConversations(0);});
+        el("chat-conversations-close").addEventListener("click",closeConversations);
+        el("chat-conversations-search-button").addEventListener("click",function(){loadConversations(0);});
+        el("chat-conversations-search").addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();loadConversations(0);}});
+        el("chat-conversations-prev").addEventListener("click",function(){loadConversations(Math.max(0,conversationOffset-10));});
+        el("chat-conversations-next").addEventListener("click",function(){if(conversationNext!==null)loadConversations(conversationNext);});
+        el("chat-conversation-cancel").addEventListener("click",function(){renameConversation=null;el("chat-conversation-rename").hidden=true;el("chat-conversations-search").focus();});
+        el("chat-conversation-rename").addEventListener("submit",function(e){
+            e.preventDefault();if(!renameConversation || switchBlocked() || conversationLoading)return;
+            var item=renameConversation,g=generation;conversationSwitching=true;controls();
+            request("rename",{sessionID:item.sessionID,directory:item.directory,title:el("chat-conversation-title").value}).then(function(){
+                if(g===generation){renameConversation=null;el("chat-conversation-rename").hidden=true;el("chat-conversations-search").focus();}
+            },function(e){if(g===generation)el("chat-conversations-status").textContent=(e.message || "Rename not confirmed")+". Refresh the list before trying again.";}).then(function(){
+                if(g===generation){conversationSwitching=false;controls();if(!renameConversation)loadConversations(conversationOffset);refresh();}
+            });
+        });
+        el("chat-conversations").addEventListener("keydown",function(e){
+            if(e.key==="Escape"){e.preventDefault();closeConversations();return;}
+            if(e.key!=="Tab")return;
+            var fields=Array.prototype.filter.call(el("chat-conversations").querySelectorAll("button,input"),function(field){return !field.disabled && field.offsetParent!==null;});
+            if(!fields.length){e.preventDefault();return;}
+            if(e.shiftKey && document.activeElement===fields[0]){e.preventDefault();fields[fields.length-1].focus();}
+            else if(!e.shiftKey && document.activeElement===fields[fields.length-1]){e.preventDefault();fields[0].focus();}
+        });
         function clearSkills() {
             skillEpoch++;skills=[];skillChoice=null;skillContext=null;skillLoading=false;
             technique=null;techniqueReview=null;el("chat-technique").hidden=true;
@@ -105,7 +191,7 @@
         }
         function error(e) { el("chat-error").textContent=(e.code ? e.code+": " : "")+(e.message || String(e)); }
         function controls() {
-            var connected=state.connection==="connected", busy=sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
+            var connected=state.connection==="connected", busy=conversationSwitching || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
             var restoring=snapshot && snapshot.restore && ["pending","unconfirmed"].indexOf(snapshot.restore.status)>=0;
             var restoreBlocked=!connected || !!busy || !!restoring || !!client.panelPending || state.busy || state.uncertain || !!state.lock || deliveryUnknown || !!(snapshot && snapshot.owned) || !!(state.binding && state.binding.sessionID!==(snapshot && snapshot.sessionID));
             el("chat-skill-picker").disabled=!connected || !!busy || skillLoading;
@@ -127,18 +213,21 @@
             el("chat-model").disabled=!connected || !!busy || deliveryUnknown || !catalog.length;
             el("chat-reasoning").disabled=el("chat-model").disabled || !el("chat-model").value || el("chat-reasoning").children.length<=1;
             el("chat-model-status").textContent=!connected ? "Connect to CookieMonster to choose a model" : modelSaving ? "Saving model…" : modelError;
-            el("chat-send").disabled=!connected || !!busy || !!restoring || state.uncertain || deliveryUnknown || attachments.some(function(a){return !a.url;}) || !el("chat-input").value.trim();
+            el("chat-send").disabled=!connected || !!busy || !!restoring || !!(snapshot && snapshot.missing) || state.uncertain || deliveryUnknown || attachments.some(function(a){return !a.url;}) || !el("chat-input").value.trim();
             el("chat-attach").disabled=!!busy || deliveryUnknown;
             el("chat-input").disabled=!!sending || deliveryUnknown;
             el("chat-stop").disabled=!connected || restoreWorking || !!restoreReview || !busy;
-            el("chat-new").disabled=!connected || sending || modelSaving || techniqueBusy || restoreWorking || !!restoreReview;
+            el("chat-new").disabled=!!switchBlocked();
+            el("chat-conversations-open").disabled=conversationSwitching || !!technique || restoreWorking || !!restoreReview;
+            conversationControls();
             el("chat-takeover").hidden=!(snapshot && snapshot.owned);
             el("chat-takeover").textContent=takeover ? "Take control on next message ✓" : "Take control for this chat";
             el("chat-target").textContent=(el("chat-comp").value==="follow" ? "Following: " : "Pinned: ")+label();
         }
         function request(action, extra) {
             var g=generation, project=JSON.parse(projectIdentity(state)),descriptor=client.descriptor, credential=store.state.credential;
-            return api.request(descriptor,credential,"/chat",Object.assign({action:action,project:project},extra || {}),30000).then(function(r){
+            var expected=["send","new","reopen","rename","model","bind","history","stop","permission"].indexOf(action)>=0 ? {expectedSessionID:snapshot && snapshot.sessionID || null} : {};
+            return api.request(descriptor,credential,"/chat",Object.assign({action:action,project:project},expected,extra || {}),30000).then(function(r){
                 if(g!==generation || descriptor!==client.descriptor || credential!==store.state.credential)throw {code:"stale_project",message:"Project changed; response belongs to the previous conversation"};
                 if(!r || !r.result || typeof r.result!=="object")throw {code:"invalid_response",message:"Invalid chat response"};
                 return r.result;
@@ -316,6 +405,8 @@
         function draw(data) {
             if(snapshot && (snapshot.sessionID!==data.sessionID || snapshot.directory!==data.directory))clearSkills();
             snapshot=data;
+            el("chat-title").textContent=data.title || "";
+            if(collapseSession!==data.sessionID && data.targetCompId!==undefined)applyTarget(data.targetCompId);
             if(collapseSession!==data.sessionID){collapseSession=data.sessionID;loadCollapse();messagesKey="";historyMessages=[];historyLoaded=false;historyCursor=null;}
             if(!historyLoaded)historyCursor=data.nextCursor || null;
             var combined=historyMessages.concat(data.messages || []),seen={},merged=[];
@@ -430,7 +521,7 @@
             controls();
         }
         function refresh() {
-            if(polling || modelSaving || restoreWorking || state.connection!=="connected" || !state.project)return Promise.resolve();
+            if(polling || conversationSwitching || modelSaving || restoreWorking || state.connection!=="connected" || !state.project)return Promise.resolve();
             polling=true;var g=generation, revision=modelRevision;
             return request("state").then(function(data){if(g===generation && revision===modelRevision){if(el("chat-error").textContent===refreshError)el("chat-error").textContent="";refreshError="";draw(data);return Promise.all([Date.now()-catalogAt>15000 ? refreshModels() : null,Date.now()-checkpointAt>10000 ? refreshCheckpoints() : null]);}},function(e){if(g===generation){error(e);refreshError=el("chat-error").textContent;}}).then(function(){polling=false;});
         }
@@ -456,13 +547,14 @@
         el("chat-takeover").addEventListener("click",function(){takeover=!takeover;controls();});
         el("chat-stop").addEventListener("click",function(){request("stop").then(refresh,error);});
         el("chat-new").addEventListener("click",function(){
-            clearSkills();request("new",{directory:el("chat-workspace").value || undefined}).then(function(){messagesKey="";approvalsKey="";deliveryUnknown=false;attachments=[];drawAttachments();el("chat-input").value="";return refresh();},error);
+            changeConversation("new");
         });
         function update(s) {
             state=s;var key=projectIdentity(s);
             if(restoreReview && restoreReview!==client.restoreApproval)cancelRestore();
             if(s.connection!=="connected")el("chat-progress").textContent="Connecting to CookieMonster…";
             if(key!==projectKey) {
+                conversationEpoch++;conversationLoading=false;conversationSwitching=false;conversationRows=[];el("chat-conversations").hidden=true;el("chat-conversations-list").textContent="";el("chat-title").textContent="";
                 clearSkills();el("chat-workspace").value="";el("chat-workspace").workspaceKey="";projectKey=key;generation++;attachments=[];deliveryUnknown=false;drawAttachments();snapshot=null;takeover=false;messagesKey="";approvalsKey="";compKey="";serverError="";collapseState={};collapseSession="";
                 catalog=[];catalogKey="";catalogAt=0;modelError="";drawModels();
                 checkpointList=[];checkpointButtons=[];checkpointAt=0;cancelRestore();if(!restoreWorking)restoreNotice("");

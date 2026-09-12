@@ -209,7 +209,20 @@
 
 <section class="chat" aria-label="Project chat">
 
-<div class="chat-heading"><button id="chat-new" type="button">New chat</button></div>
+<div class="chat-heading"><span id="chat-title"></span><button id="chat-conversations-open" type="button">Conversations</button><button id="chat-new" type="button">New chat</button></div>
+<section id="chat-conversations" role="dialog" aria-modal="true" aria-label="Project conversations" hidden>
+<div class="chat-heading"><h2>Project conversations</h2><button id="chat-conversations-close" type="button" aria-label="Close conversations">×</button></div>
+<label for="chat-conversations-search">Search conversations</label>
+<input id="chat-conversations-search" type="search" maxlength="256" placeholder="Search by title">
+<button id="chat-conversations-search-button" type="button">Search</button>
+<p id="chat-conversations-status" role="status"></p>
+<div id="chat-conversations-list"></div>
+<div class="buttons"><button id="chat-conversations-prev" type="button">Previous</button><button id="chat-conversations-next" type="button">Next</button></div>
+<form id="chat-conversation-rename" hidden>
+<label for="chat-conversation-title">Conversation title</label><input id="chat-conversation-title" maxlength="200" required>
+<div class="buttons"><button id="chat-conversation-save" type="submit">Save title</button><button id="chat-conversation-cancel" type="button">Cancel rename</button></div>
+</form>
+</section>
 
 
 

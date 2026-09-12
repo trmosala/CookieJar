@@ -6,15 +6,16 @@ import { panelFixture } from "./bridge-panel.mjs"
 async function fixture(t) {
   const p = await panelFixture(t)
   await p.bridge.release("session")
-  const calls = [], statuses = {}, messages = [], inputs = []
+  const calls = [], statuses = {}, messages = [], inputs = [], sessions = new Map()
   let counter = 0, admitted
   const selections = {}, catalog = { all: [{ id: "test", name: "Test", models: { sol: { id: "sol", name: "Sol", variants: { high: {}, low: {} } }, fast: { id: "fast", name: "Fast" } } }], connected: ["test"] }
   const client = {
     provider: { async list() { return { data: catalog } } },
     _client: { async post(options) { calls.push(["model", options]); selections[options.path.sessionID] = options.body.model; return {} } },
     session: {
-      async get(options) { return { data: { model: selections[options.path.id] } } },
-      async create(options) { calls.push(["create", options]); return { data: { id: "ses_chat" + (++counter) } } },
+      async get(options) { const session = sessions.get(options.path.id); return session ? { data: { ...session, model: selections[options.path.id] } } : { response: { status: 404 } } },
+      async create(options) { calls.push(["create", options]); const session = { id: "ses_chat" + (++counter), title: options.body.title, directory: options.query.directory, time: { updated: counter } }; sessions.set(session.id, session); return { data: session } },
+      async update(options) { calls.push(["rename", options]); Object.assign(sessions.get(options.path.id), options.body); return { data: sessions.get(options.path.id) } },
       async status() { return { data: statuses } },
       async messages() { return { data: messages } },
       async abort(options) { calls.push(["abort", options]); return { data: true } },
@@ -34,8 +35,92 @@ async function fixture(t) {
     if (response.status !== 200) throw Object.assign(new Error(response.body.error.message), response.body.error)
     return response.body.result
   }
-  return { p, chat, runtime, client, catalog, selections, calls, inputs, messages, statuses, send, set admitted(fn) { admitted = fn } }
+  return { p, chat, runtime, client, catalog, selections, calls, inputs, messages, statuses, sessions, send, set admitted(fn) { admitted = fn } }
 }
+test("project conversations reopen and rename through CM after reload without replay or target loss", async t => {
+  const f = await fixture(t), first = await f.send(message({ compId: 3 }))
+  const second = await f.send({ action: "new" })
+  await f.send(message({ compId: 7, requestId: "b".repeat(40) }))
+  const reloaded = await createChat(f.runtime)
+  reloaded.register({ client: f.client, directory: f.p.dataDir })
+  f.p.bridge.setChatHandler(reloaded.handle)
+  for (const [session, title, target] of [[first, "Logo timing", 3], [second, "Title motion", 7]]) {
+    await f.send({ action: "rename", sessionID: session.sessionID, directory: f.p.dataDir, title })
+    const opened = await f.send({ action: "reopen", sessionID: session.sessionID, directory: f.p.dataDir })
+    assert.equal(opened.targetCompId, target)
+    assert.equal((await f.send()).title, title)
+    assert.equal((await f.send()).targetCompId, target)
+  }
+  assert.equal(f.inputs.length, 2)
+  assert.equal(f.calls.filter(c => c[0] === "rename").length, 2)
+  f.client.session.update = async () => ({ data: {} })
+  await assert.rejects(f.send({ action: "rename", sessionID: first.sessionID, directory: f.p.dataDir, title: "Ignored update" }), { code: "chat_backend" })
+  assert.throws(() => reloaded.checkSession(first.sessionID), { code: "chat_closed" })
+  // Messages and titles are obtained from CM, never copied into the ownership file.
+  const { readFile } = await import("node:fs/promises")
+  const stateFile = await readFile(new URL("file:///" + f.p.dataDir.replaceAll("\\", "/") + "/chat-projects.json"), "utf8")
+  assert.doesNotMatch(stateFile, /Logo timing|Title motion/)
+})
+
+test("conversation search and pages exclude other projects and workspaces and expose missing sessions", async t => {
+  const f = await fixture(t)
+  for (let i = 0; i < 12; i++) {
+    const session = await f.send({ action: "new" })
+    f.sessions.get(session.sessionID).title = "Motion " + i
+  }
+  const page = await f.send({ action: "conversations" })
+  assert.equal(page.conversations.length, 10)
+  assert.equal(page.nextOffset, 10)
+  assert.equal((await f.send({ action: "conversations", offset: 10 })).conversations.length, 2)
+  assert.equal((await f.send({ action: "conversations", search: "Motion 11" })).total, 1)
+  const old = page.conversations[1]
+  f.sessions.delete(old.sessionID)
+  assert.equal((await f.send({ action: "conversations", offset: 10 })).conversations.find(c => c.sessionID === old.sessionID)?.missing, true)
+  await assert.rejects(f.send({ action: "reopen", sessionID: old.sessionID, directory: old.directory }), { code: "chat_missing" })
+  await assert.rejects(f.send({ action: "rename", sessionID: "foreign", directory: f.p.dataDir, title: "No" }), { code: "chat_ownership" })
+  await assert.rejects(f.send({ action: "reopen", sessionID: page.conversations[0].sessionID, directory: "D:\\other" }), { code: "chat_ownership" })
+  f.p.state.project = { ...f.p.state.project, id: "another", path: f.p.state.project.path + ".other" }
+  await f.p.heartbeat()
+  assert.equal((await f.send({ action: "conversations" })).total, 0)
+  await assert.rejects(f.send({ action: "reopen", sessionID: page.conversations[0].sessionID, directory: f.p.dataDir }), { code: "chat_ownership" })
+})
+
+test("conversation switching rejects busy, unresolved and stale actions without aborting or creating", async t => {
+  const f = await fixture(t), first = await f.send(message())
+  f.statuses[first.sessionID] = { type: "busy" }
+  await assert.rejects(f.send({ action: "new" }), { code: "chat_busy" })
+  assert.equal(f.calls.filter(c => c[0] === "create").length, 1)
+  assert.equal(f.calls.filter(c => c[0] === "abort").length, 0)
+  f.statuses[first.sessionID] = { type: "idle" }
+  await f.chat.recordRestore(first.sessionID, { status: "unconfirmed" })
+  await assert.rejects(f.send({ action: "new" }), { code: "chat_busy" })
+  await f.chat.recordReconciliation(first.sessionID)
+  const second = await f.send({ action: "new", expectedSessionID: first.sessionID })
+  f.statuses[first.sessionID] = { type: "busy" }
+  await assert.rejects(f.send({ action: "reopen", sessionID: first.sessionID, directory: f.p.dataDir }), { code: "chat_busy" })
+  f.statuses[first.sessionID] = { type: "idle" }
+  await assert.rejects(f.send({ action: "new", expectedSessionID: first.sessionID }), { code: "stale_session" })
+  f.admitted = () => { throw new Error("Connection lost") }
+  await f.send(message({ requestId: "b".repeat(40) }))
+  await assert.rejects(f.send({ action: "reopen", sessionID: first.sessionID, directory: f.p.dataDir }), { code: "chat_busy" })
+  await assert.rejects(f.send({ action: "new" }), { code: "chat_busy" })
+  assert.equal((await f.send()).sessionID, second.sessionID)
+})
+
+test("late history and state responses cannot be admitted after reopening another conversation", async t => {
+  const f = await fixture(t), first = await f.send({ action: "new" })
+  await f.send({ action: "new" })
+  let release, entered
+  const ready = new Promise(resolve => { entered = resolve })
+  f.client.session.messages = async () => { entered(); await new Promise(resolve => { release = resolve }); return { data: [] } }
+  const pending = f.send({ action: "history", before: "cursor" })
+  const rejected = assert.rejects(pending, { code: "stale_session" })
+  await ready
+  await f.send({ action: "reopen", sessionID: first.sessionID, directory: f.p.dataDir })
+  release()
+  await rejected
+})
+
 test("selected skills retain native prompt context, dedup identity, errors and truthful load metadata", async t => {
   const f = await fixture(t)
   const metadata = { name: "brand-motion", source: "b".repeat(64), revision: "c".repeat(64) }
@@ -210,8 +295,9 @@ test("new chat retires the old tool scope, and deleted CM sessions can be recrea
   assert.notEqual(first.sessionID, fresh.sessionID)
   assert.throws(() => f.chat.checkSession(first.sessionID), { code: "chat_closed" })
   await f.chat.event({ type: "session.deleted", properties: { info: { id: fresh.sessionID } } })
-  assert.equal((await f.send()).sessionID, null)
-  const next = await f.send(message({ requestId: "c".repeat(40) }))
+  assert.equal((await f.send()).missing, true)
+  await assert.rejects(f.send(message({ requestId: "c".repeat(40) })), { code: "chat_missing" })
+  const next = await f.send({ action: "new" })
   assert.notEqual(next.sessionID, fresh.sessionID)
 })
 
