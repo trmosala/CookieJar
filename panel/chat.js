@@ -56,7 +56,15 @@
         ["technique-name","technique-description","technique-instructions","technique-scope"].forEach(function(id){
             el(id).addEventListener(id==="technique-scope" ? "change" : "input",function(){techniqueReview=null;el("technique-confirm").hidden=true;el("technique-review").textContent="";});
         });
-        el("technique-cancel").addEventListener("click",function(){if(techniqueBusy)return;technique=null;techniqueReview=null;el("chat-technique").hidden=true;controls();});
+        el("technique-cancel").addEventListener("click",function(){if(techniqueBusy)return;technique=null;techniqueReview=null;el("chat-technique").hidden=true;controls();el("chat-input").focus();});
+        el("chat-technique").addEventListener("keydown",function(e){
+            if(e.key==="Escape"){e.preventDefault();if(!techniqueBusy)el("technique-cancel").click();return;}
+            if(e.key!=="Tab")return;
+            var fields=["technique-name","technique-description","technique-instructions","technique-scope","technique-review-button","technique-confirm","technique-cancel"].map(el).filter(function(field){return !field.disabled && !field.hidden;});
+            if(!fields.length){e.preventDefault();return;}
+            if(e.shiftKey && document.activeElement===fields[0]){e.preventDefault();fields[fields.length-1].focus();}
+            else if(!e.shiftKey && document.activeElement===fields[fields.length-1]){e.preventDefault();fields[0].focus();}
+        });
         el("technique-review-button").addEventListener("click",function(){
             if(!technique || techniqueBusy)return;
             var current=technique,draft=techniqueDraft(),g=generation;techniqueBusy=true;controls();
@@ -76,7 +84,7 @@
             request("skillSave",{draft:review.draft,token:review.token,sessionID:current.sessionID,directory:review.directory}).then(function(receipt){
                 if(g!==generation || technique!==current)return;
                 el("technique-status").textContent="Saved: "+receipt.destination;technique=null;
-                el("chat-technique").hidden=true;el("chat-skill-status").textContent="Saved: "+receipt.name;refreshSkills();
+                el("chat-technique").hidden=true;el("chat-skill-status").textContent="Saved: "+receipt.name;refreshSkills();el("chat-input").focus();
             },function(e){if(g===generation)el("technique-status").textContent=(e.message || "Save not confirmed")+". No automatic retry.";}).then(function(){techniqueBusy=false;controls();});
         });
         el("chat-skill-search").addEventListener("input",drawSkills);

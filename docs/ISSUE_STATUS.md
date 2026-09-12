@@ -11,6 +11,8 @@ Implementation order:
 
 Image generation/import is excluded because its current limitation belongs in CookieMonster. Current live-test evidence is in [FIRST_TEST.md](FIRST_TEST.md).
 
+Issue #21 implementation and automated verification are documented in [SKILLS.md](SKILLS.md), including the separate compaction timing failure and the boundary between real API testing and simulated model/AE execution.
+
 ## Historical issue ledger (statuses below are from the earlier milestone)
 
 # Issue Acceptance Status

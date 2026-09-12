@@ -241,7 +241,7 @@
 <button id="chat-restore-cancel" type="button">Cancel</button>
 </section>
 
-<section id="chat-technique" class="chat-approval" hidden aria-label="Save technique">
+<section id="chat-technique" class="chat-approval" role="dialog" aria-modal="true" hidden aria-label="Save technique">
 <h3>Save technique</h3>
 <p>Edit the completed reply into reusable instructions. Remove project-specific details and secrets. Only these reviewed fields will be saved.</p>
 <label for="technique-name">Name</label><input id="technique-name" maxlength="64" placeholder="brand-title-motion">
@@ -253,7 +253,7 @@
 <pre id="technique-review"></pre>
 <p id="technique-status" role="status"></p>
 <button id="technique-review-button" type="button">Review save</button>
-<button id="technique-confirm" type="button" hidden>Confirm create-only save</button>
+<button id="technique-confirm" type="button" hidden>Save skill</button>
 <button id="technique-cancel" type="button">Cancel</button>
 </section>
 

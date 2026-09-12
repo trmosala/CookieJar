@@ -69,7 +69,7 @@ select,input { width:100%; background:var(--surface); border:1px solid var(--bor
 .chat-disclosure h4 { font-size:11px; font-weight:500; color:var(--muted); margin:8px 0 4px; }
 .chat-message img { display:block; max-width:100%; height:auto; background:#181818; border:1px solid #282828; border-radius:7px; margin:10px 0; }
 .chat-empty { color:var(--muted); padding:28px 12px; text-align:center; }
-#chat-form { background:#171717; border:1px solid #303030; border-radius:12px; padding:12px 10px 8px; flex-shrink:0; margin-top:8px; box-shadow:0 2px 4px #0003; }
+#chat-form { background:#171717; border:1px solid #303030; border-radius:12px; padding:12px 10px 8px; flex:0 1 auto; min-height:110px; overflow:auto; margin-top:8px; box-shadow:0 2px 4px #0003; }
 #chat-form:focus-within { border-color:#505050; }
 #chat-input { display:block; width:100%; resize:none; background:transparent; border:0; outline:none; padding:2px 4px 10px; min-height:54px; max-height:120px; font-size:12px; }
 #chat-input::placeholder { color:#858585; }
@@ -187,7 +187,7 @@ a { color:#b5c6df; overflow-wrap:anywhere; }
 .chat-checkpoint p { font-size:11px; }
 #chat-restore-review { max-height:45vh; overflow:auto; flex-shrink:0; }
 #chat-restore-status { max-height:100px; overflow:auto; flex-shrink:0; }
-#chat-technique { flex-shrink:0; max-height:65vh; overflow:auto; }
+#chat-technique { position:absolute; top:8px; right:8px; bottom:8px; left:8px; z-index:4; margin:0; max-height:none; overflow:auto; background:var(--surface); }
 #technique-instructions { width:100%; resize:vertical; background:var(--surface); border:1px solid var(--border); padding:8px; }
 #chat-skills { max-height:30vh; overflow:auto; }
 #chat-skills select { margin:6px 0; }
