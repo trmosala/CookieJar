@@ -18,6 +18,7 @@ const panelActions = {
   checkpoints: [], "checkpoint.pin": ["id", "pinned"], "checkpoint.delete": ["id"],
   "checkpoint.restore.propose": ["id"], "checkpoint.restore.confirm": ["token"],
   renders: [], diagnostics: [], "frame.capture": ["compId", "time"],
+  "render.start": ["tool", "args"], "render.poll": ["token"], "render.reply": ["token", "approvalID", "allow"],
 }
 
 function schema(value, required, optional = []) {

@@ -2,7 +2,7 @@
 (function () {
     "use strict";
     function el(id) { return document.getElementById(id); }
-    var client, host, store, api, chat, working = false, checkpoints = [], serviceContext = "", diagnosticURL = null, serviceTimer, restoreOperation = null, restoreResult = "";
+    var client, host, store, api, chat, dashboard, working = false, checkpoints = [], serviceContext = "", diagnosticURL = null, serviceTimer, restoreOperation = null, restoreResult = "";
     var settingsPages=[
         ["general","settings-general"],
         ["connection","settings-connection"],
@@ -85,6 +85,7 @@
     }
     function problem(e) { el("error").textContent = (e.code || "panel_error") + ": " + (e.message || "Panel failed");el("connection-notice").hidden=false;el("connection-notice").textContent=e.message || "Connection needs attention. Open Settings & troubleshooting."; }
     function render(s) {
+        if(dashboard)dashboard.update(s);
         if(chat)chat.update(s);
         var recovery=!!(s.uncertain || s.lock);
         el("connection-status").className=s.connection==="connected" ? "is-connected" : "is-disconnected";
@@ -161,6 +162,7 @@
         }});
         render(client.state);
         if(window.CookieMonsterChat)chat=window.CookieMonsterChat(client,store,api);
+        if(window.CookieJarRender)dashboard=window.CookieJarRender(client,api,function(){return chat.bindForPanel();});
         el("pair-form").addEventListener("submit",function(e){
             e.preventDefault();var code=el("code").value.trim();el("code").value="";
             action(function(){client.stop();return client.pair(code).then(function(){client.start();});});

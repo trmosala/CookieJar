@@ -415,11 +415,13 @@ Client.prototype.emit=function(){
 Client.prototype.panel=function(action,args){
     var self=this,allowed={
         "checkpoints":[],"checkpoint.pin":["id","pinned"],"checkpoint.delete":["id"],
-        "checkpoint.restore.propose":["id"],"checkpoint.restore.confirm":["token"],"diagnostics":[],"renders":[],"frame.capture":["compId","time"]
+        "checkpoint.restore.propose":["id"],"checkpoint.restore.confirm":["token"],"diagnostics":[],"renders":[],"frame.capture":["compId","time"],
+        "render.start":["tool","args"],"render.poll":["token"],"render.reply":["token","approvalID","allow"]
     },payload={action:action},context=self.context(),mutating=typeof action==="string" && (action.indexOf("checkpoint.")===0 || action==="frame.capture");
     args=args || {};
     if(!Object.prototype.hasOwnProperty.call(allowed,action) || !record(args) || Object.keys(args).sort().join(",")!==allowed[action].slice().sort().join(","))return Promise.reject(error("invalid_payload","Unknown panel action or fields"));
     if(self.panelPending)return Promise.reject(error("panel_busy","Panel request already outstanding"));
+    if(action==="render.start" && (self.state.busy || self.state.uncertain || self.state.lock))return Promise.reject(error("target_locked","Wait for AE or resolve recovery before rendering"));
     if(self.state.connection!=="connected" || !self.store.state.credential)return Promise.reject(error("disconnected","Connect before requesting bridge services"));
     if(mutating && (self.state.busy || self.state.uncertain || self.state.lock || !self.state.binding || self.state.binding.state!=="active"))return Promise.reject(error("target_locked","Checkpoint changes require an active unlocked binding"));
     if(Object.prototype.hasOwnProperty.call(args,"id") && !text(args.id,256))return Promise.reject(error("invalid_payload","Invalid checkpoint ID"));
@@ -778,4 +780,17 @@ Client.prototype.reconcile=function(){
     self.host.uncertain=false;
     return self.host.call("reconcile",{}).then(function(){self.mark(false);self.state.busy=false;self.state.capture=null;self.state.binding=null;self.state.connection="paired";self.emit();self.start();},function(e){self.host.uncertain=true;throw e;});
 };
-module.exports={Store:Store,automaticStore:automaticStore,Client:Client,HostRPC:HostRPC,request:request,requestId:function(){return crypto.randomBytes(20).toString("hex");},compatibilityMetadata:compatibilityMetadata,normalizeCapture:normalizeCapture,cleanupCapture:cleanupCapture,secure:secure,VERSION:VERSION,PROTOCOL:PROTOCOL};
+function renderDirectory(value){
+    if(!text(value,32767) || !path.isAbsolute(value) || /[\0\r\n]/.test(value) || value.split(/[\\/]/).indexOf("..")>=0)throw error("invalid_path","Choose an absolute output path");
+    return path.dirname(value);
+}
+function revealRenderOutput(file){
+    return Promise.resolve().then(function(){
+        renderDirectory(file.path);
+        if(!/^[a-f0-9]{64}$/.test(file.hash) || !Number.isSafeInteger(file.size) || file.size<1)throw error("invalid_output","Output verification is missing");
+        var info=fs.lstatSync(file.path);
+        if(!info.isFile() || info.isSymbolicLink() || info.size!==file.size)throw error("output_changed","Output changed since verification");
+        return new Promise(function(resolve,reject){var sum=crypto.createHash("sha256"),stream=fs.createReadStream(file.path);stream.on("data",function(data){sum.update(data);});stream.on("error",reject);stream.on("end",function(){if(sum.digest("hex")!==file.hash){reject(error("output_changed","Output hash changed"));return;}child.execFile(process.platform==="win32" ? "explorer.exe" : "open",process.platform==="win32" ? ["/select,",file.path] : ["-R",file.path],function(e){if(e)reject(e);else resolve();});});});
+    });
+}
+module.exports={renderDirectory:renderDirectory,revealRenderOutput:revealRenderOutput,Store:Store,automaticStore:automaticStore,Client:Client,HostRPC:HostRPC,request:request,requestId:function(){return crypto.randomBytes(20).toString("hex");},compatibilityMetadata:compatibilityMetadata,normalizeCapture:normalizeCapture,cleanupCapture:cleanupCapture,secure:secure,VERSION:VERSION,PROTOCOL:PROTOCOL};

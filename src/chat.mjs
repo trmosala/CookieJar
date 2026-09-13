@@ -102,6 +102,7 @@ export async function createChat(runtime) {
     return info
   }
   async function assertSwitchable(r, connectionId) {
+    if (r && runtime.panelRender?.busy(r.sessionID)) fail("chat_busy", "Finish the render operation or review first")
     const c = (await runtime.bridge.connections()).find(c => c.id === connectionId)
     if (!c?.connected || c.busy || c.lock || c.binding && c.binding.sessionID !== r?.sessionID)
       fail("chat_busy", "Finish AE work or recovery before switching conversations")
@@ -332,6 +333,7 @@ export async function createChat(runtime) {
       return { replied: true }
     }
     if (body.action === "send") {
+      if (r && runtime.panelRender?.busy(r.sessionID)) fail("chat_busy", "Finish the render operation or review first")
       if (r?.deleted) fail("chat_missing", "Choose another conversation or start a new one")
       if (r?.restore?.status === "pending" || r?.restore?.status === "unconfirmed")
         fail("restore_unconfirmed", "Check After Effects before continuing: the last restore was not confirmed")
@@ -452,7 +454,14 @@ export async function createChat(runtime) {
     return { sessionID: r.sessionID, delivery: request.status }
   }
   return {
+    permissionPolicy(sessionID, name) {
+      const record = Object.values(records).find(r => r.sessionID === sessionID)
+      const input = record && [...(clients.get(record.directory) || [])].at(-1)
+      if (!input?.permissionPolicy) fail("permission_policy_required", "Reconnect the CookieMonster workspace before rendering")
+      return input.permissionPolicy(name)
+    },
     async assertRestorable(sessionID) {
+      if (runtime.panelRender?.busy(sessionID)) fail("chat_busy", "Finish the render operation or review first")
       const r = Object.values(records).find(r => r.sessionID === sessionID)
       if (!r) return
       const statuses = await result(clientFor(r).session.status({ query: { directory: r.directory }, signal: AbortSignal.timeout(20000) }))

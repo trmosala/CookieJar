@@ -175,6 +175,20 @@
 </div>
 
 <h3>Render Jobs</h3>
+<section id="render-dashboard" aria-label="Render dashboard">
+<p>Render a saved checkpoint separately. Each operation is reviewed before it proceeds.</p>
+<label for="render-comp">Composition</label><select id="render-comp"></select>
+<button id="render-templates" type="button">Discover templates…</button>
+<label for="render-settings">Render settings</label><select id="render-settings"></select>
+<label for="render-output">Output module</label><select id="render-output"></select>
+<label for="render-start">First frame (inclusive)</label><input id="render-start" type="number" min="0" step="1" value="0">
+<label for="render-end">Last frame (inclusive)</label><input id="render-end" type="number" min="0" step="1" value="0">
+<label for="render-path">Output file (absolute path)</label><input id="render-path" type="text" placeholder="D:\Renders\title.mov">
+<button id="render-submit" type="button">Review render…</button><button id="render-refresh" type="button">Refresh jobs</button>
+<p id="render-status" role="status" aria-live="polite"></p>
+<section id="render-review" aria-label="Render operation review" hidden><pre id="render-review-text"></pre><button id="render-approve" type="button">Approve once</button><button id="render-deny" type="button">Cancel operation</button></section>
+<div id="render-job-list"></div>
+</section>
 
 <ul id="renders"><li>Not requested</li></ul>
 
@@ -305,6 +319,7 @@
 </main>
 
 <script src="chat.js"></script>
+<script src="render.js"></script>
 
 <script src="ui.js"></script>
 

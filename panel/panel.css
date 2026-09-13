@@ -201,3 +201,8 @@ a { color:#b5c6df; overflow-wrap:anywhere; }
 #chat-skill-status,#chat-skill-workspace { font-size:11px; }
 #chat-skill-status:empty { display:none; }
 .chat-skill-loaded { color:#cae8d5; font-size:11px; }
+#render-dashboard input,#render-dashboard select { width:100%; min-width:0; margin:4px 0 10px; }
+#render-dashboard button { margin:4px; max-width:100%; white-space:normal; overflow-wrap:anywhere; }
+#render-review { border:1px solid var(--border); padding:10px; }
+#render-review-text { white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; }
+#render-job-list section { border-top:1px solid var(--border); padding:8px 0; overflow-wrap:anywhere; }

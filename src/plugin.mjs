@@ -9,6 +9,7 @@ import { createWorkflow } from "./workflow.mjs"
 import { createRenderer } from "./render.mjs"
 import { createDiagnostics } from "./diagnostics.mjs"
 import { createChat } from "./chat.mjs"
+import { createPanelRender } from "./panel-render.mjs"
 import { capture, captureArgs, safeRefusals } from "./capture.mjs"
 import { AE_PERMISSIONS } from "./config.mjs"
 import { fail, hash, PROPOSAL_TTL, releaseMetadata } from "./protocol.mjs"
@@ -571,7 +572,11 @@ export async function createRuntime(options = {}) {
         return closePromise
       },
     }
+    r.panelRender = createPanelRender({ now: r.now, execute(tool, args, context) {
+      return createTools({ ...r, permissionPolicy: name => r.chat.permissionPolicy(context.sessionID, name) })[tool].execute(args, context)
+    } })
     function cleanup(sessionID) {
+      r.panelRender.release(sessionID)
       diagnostics.release(sessionID); tokens.delete(sessionID)
       for (const [jobId, owner] of jobs) if (owner.sessionID === sessionID) {
         recovered.add(jobId)
@@ -600,10 +605,18 @@ async function panel(r, input) {
     checkpoints: {}, "checkpoint.pin": { id: text, pinned: z.boolean() }, "checkpoint.delete": { id: text },
     "checkpoint.restore.propose": { id: text }, "checkpoint.restore.confirm": { token: text },
     renders: {}, diagnostics: {}, "frame.capture": { compId: captureArgs.compId, time: captureArgs.time },
+    "render.start": { tool: text, args: z.record(z.string(), z.unknown()) },
+    "render.poll": { token: text }, "render.reply": { token: text, approvalID: text, allow: z.boolean() },
   }
   if (!Object.hasOwn(schemas, body?.action)) fail("invalid_payload", "Unknown panel action")
   const a = z.object({ action: z.literal(body.action), ...schemas[body.action] }).strict().parse(body)
   const consent = async () => { current(r, c, b); return true }
+  if (a.action === "render.start") {
+    await r.chat?.assertRestorable(sessionID)
+    return r.panelRender.start(sessionID, b.id, a.tool, a.args, () => current(r, c, b, { allowLocked: true }))
+  }
+  if (a.action === "render.poll") return r.panelRender.poll(sessionID, b.id, a.token)
+  if (a.action === "render.reply") return r.panelRender.reply(sessionID, b.id, a.token, a.approvalID, a.allow)
   if (a.action === "frame.capture") {
     await r.chat?.assertRestorable(sessionID)
     current(r, c, b, { write: true })
@@ -714,7 +727,7 @@ export async function server(_input, options = {}) {
   if (!entry.chat) entry.chat = createChat(runtime)
   const chat = await entry.chat
   runtime.chat = chat
-  const unregisterChat = chat.register(_input)
+  const unregisterChat = chat.register({ ..._input, permissionPolicy: name => checkPermissionConfig(config, name) })
   runtime.bridge.setChatHandler(chat.handle)
   const owned = new Set(), owner = Symbol("plugin-instance")
   let disposed = false, disposePromise, config

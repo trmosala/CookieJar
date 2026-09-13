@@ -14,7 +14,7 @@
             conversationNext=null, conversationRows=[], renameConversation=null;
         var capturing=false;
         function switchBlocked() {
-            return state.connection!=="connected" || capturing || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview ||
+            return state.connection!=="connected" || client.renderWorking || capturing || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview ||
                 conversationSwitching || deliveryUnknown || !!client.panelPending || state.busy || state.uncertain || !!state.lock ||
                 !!(snapshot && (snapshot.status!=="idle" || snapshot.owned || snapshot.restore && ["pending","unconfirmed"].indexOf(snapshot.restore.status)>=0));
         }
@@ -192,7 +192,7 @@
         }
         function error(e) { el("chat-error").textContent=(e.code ? e.code+": " : "")+(e.message || String(e)); }
         function controls() {
-            var connected=state.connection==="connected", busy=capturing || conversationSwitching || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
+            var connected=state.connection==="connected", busy=client.renderWorking || capturing || conversationSwitching || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
             var frame=(state.compositions || []).filter(function(c){return c.id===selected();})[0];
             el("chat-capture").disabled=!!switchBlocked() || attachments.length>=4 || attachments.some(function(a){return !a.url;}) || !state.project || !state.project.saved || !frame || typeof frame.time!=="number" || !isFinite(frame.time) || frame.time<0;
             el("chat-capture").title=capturing ? "Capturing. Keep this panel visible; no automatic retry." : frame && typeof frame.time==="number" ? "Attach "+frame.name+" (#"+frame.id+") at "+frame.time.toFixed(3)+"s with alpha" : "Waiting for an explicit composition time from After Effects";
@@ -609,6 +609,11 @@
         }
         timer=setInterval(refresh,1000);
         window.addEventListener("beforeunload",function(){clearInterval(timer);});
-        update(state);refresh();return {update:update};
+        update(state);refresh();return {update:update,bindForPanel:function(){
+            if(switchBlocked())return Promise.reject({code:"chat_busy",message:"Finish the current reply or recovery first"});
+            return request("captureBind",{directory:el("chat-workspace").value || undefined}).then(function(data){
+                if(!snapshot)snapshot={status:"idle"};snapshot.sessionID=data.sessionID;return client.heartbeat();
+            });
+        }};
     };
 }());
