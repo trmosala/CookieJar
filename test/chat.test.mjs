@@ -426,7 +426,7 @@ test("invalid references are rejected before creating or submitting a conversati
     [{...file,filename:"../brief.txt"}], [{...file,url:"data:text/plain;base64,????"}]]) {
     await assert.rejects(f.send(message({attachments})), {code:"invalid_payload"})
   }
-  const large={...file,url:"data:text/plain;base64,"+Buffer.alloc(1100000).toString("base64")}
+  const large={...file,url:"data:text/plain;base64,"+Buffer.alloc(5500000).toString("base64")}
   await assert.rejects(f.send(message({attachments:[large,large]})), {code:"payload_too_large"})
   assert.equal(f.calls.length,0)
 })
@@ -517,4 +517,35 @@ test("retry drafts use complete CM messages and send a reviewed new attempt once
   const uncertain=await f.send({...retry,requestId:"c".repeat(40)})
   assert.equal(uncertain.delivery,"unknown")
   await assert.rejects(f.send({action:"retryDraft",messageID:source.info.id,expectedSessionID:opened.sessionID}),{code:"chat_busy"})
+})
+
+
+test("skill management pins exact reviews and never reapplies an uncertain change",async t=>{
+ const f=await fixture(t);const opened=await f.send(message())
+ const selected={name:"brand",source:"a".repeat(64),revision:"b".repeat(64)}
+ const draft={name:"brand",description:"Brand",instructions:"New instructions",scope:"workspace"}
+ let applies=0,uncertain=false
+ f.client._client.post=async o=>{
+   assert.equal(o.url,"/skill/manage")
+   if(o.body.action==="apply"){applies++;if(uncertain)throw new Error("Disconnected")}
+   return {data:{...selected,content:"Original instructions",location:"skill.md",editable:true,scope:"workspace",token:"c".repeat(64),digest:"d".repeat(64),backup:"backup.bak",deleted:false}}
+ }
+ f.client._client.get=async()=>({data:[]})
+ const call=management=>f.send({action:"skillManage",sessionID:opened.sessionID,management})
+ await call({action:"read",selected})
+ const review=await call({action:"review",selected,operation:"edit",draft})
+ await assert.rejects(call({action:"apply",selected,operation:"edit",draft:{...draft,instructions:"Other"},token:review.token}),{code:"stale_review"})
+ await call({action:"apply",selected,operation:"edit",draft,token:review.token})
+ await assert.rejects(call({action:"apply",selected,operation:"edit",draft,token:review.token}),{code:"stale_review"})
+ await call({action:"review",selected,operation:"edit",draft});uncertain=true
+ await assert.rejects(call({action:"apply",selected,operation:"edit",draft,token:review.token}),{code:"skill_save_unknown"})
+ await assert.rejects(call({action:"apply",selected,operation:"edit",draft,token:review.token}),{code:"stale_review"})
+ assert.equal(applies,2)
+})
+
+test("chat admits larger supported attachments without increasing host command limits",async t=>{
+ const f=await fixture(t)
+ const file={filename:"reference.gif",mime:"image/gif",url:"data:image/gif;base64,"+Buffer.alloc(3*1024*1024,65).toString("base64")}
+ assert.equal((await f.send(message({attachments:[file]}))).delivery,"accepted")
+ assert.equal(f.inputs[0].body.parts[1].mime,"image/gif")
 })

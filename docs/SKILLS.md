@@ -6,6 +6,14 @@ Open **Skills** in the prompt box to search CookieMonster's catalog and select a
 
 Workspace skills belong to the selected CookieMonster directory, not an individual `.aep` file. Other conversations using that directory can reuse them; unrelated workspaces cannot. Global skills use CookieMonster's global storage. The AE extension does not maintain a second skill store.
 
+## Manage existing skills
+
+Select a skill in the composer picker and choose **Manage selected skill**. Copy skill copies the complete saved definition, including additional frontmatter. Managed workspace and global skills can be renamed or edited. Review changes and confirm to save. Review deletion and confirm to remove the definition. Built-in and externally discovered skills are read-only.
+
+Each change pins the selected file identity and revision and uses a single-use review. Changes from another editor invalidate the review. The previous definition is synced and verified in a sibling `.SKILL.md.<id>.bak` file before modification. Bundled scripts and other files stay in place. Renaming changes the skill name, not its containing folder. Deletion leaves backups and bundled files in that folder; creating another skill in the same folder remains deliberately blocked by the exclusive creation flow.
+
+The manager requires the matching CookieMonster `/skill/manage` backend. An uncertain save/delete must be inspected and refreshed, never automatically retried.
+
 ## Issue #21 verification — 12 September 2026
 
 - Real integration: AE chat and authenticated bridge, CookieMonster SDK, production skill/session HTTP handlers and on-disk skill storage. Saved reviewed instructions, reloaded chat, selected the same revision in a later conversation, checked prompt metadata, rejected the old selection in another workspace, and detected deletion. Passed 1 test / 12 assertions.

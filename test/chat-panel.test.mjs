@@ -29,7 +29,7 @@ function fixture(saved = new Map()) {
     FileReader:class {readAsDataURL(file){this.file=file;readers.push(this)}}}
   vm.runInNewContext(readFileSync(new URL('../panel/preferences.js',import.meta.url),'utf8'),context)
   vm.runInNewContext(readFileSync(new URL('../panel/chat.js',import.meta.url),'utf8'),context)
-  const chat=context.window.CookieMonsterChat(client,{state:{credential:'test'},save(){}},{requestId:()=> 'a'.repeat(40),async request(d,c,p,b){calls.push(b);if(b.action==='retryDraft')return {result:{sessionID,messageID:b.messageID,text:'Original request',attachments:[{filename:'ref.txt',mime:'text/plain',url:'data:text/plain;base64,SGVsbG8='}]}};if(b.action==='skills')return {result:{skills,directory:skillDirectory,sessionID}};if(b.action==='skillReview')return {result:{token:'review',directory:skillDirectory,destination:'skills/'+b.draft.name+'/SKILL.md'}};if(b.action==='skillSave'){if(failSkillSave)throw {message:'Save not confirmed'};return {result:{name:b.draft.name,destination:'SKILL.md'}};}if(b.action==='checkpoints')return {result:{checkpoints:checkpointList}};if(b.action==='state' && holdState){const prior=model;await new Promise(resolve=>{releaseState=resolve});return {result:{status:'idle',model:prior,messages:[],workspaces:[]}};}if(b.action==='send' && failSend)throw {code:'disconnected',message:'Disconnected'};if(b.action==='models')return {result:{models:catalog}};if(b.action==='model'){if(failModel)throw {message:'Model unavailable'};model=b.model;return {result:{model}};}return {result:b.action==='send'? {delivery:'accepted'}:{status,model,sessionID,directory:skillDirectory,messages,workspaces:[skillDirectory]}}}})
+  const chat=context.window.CookieMonsterChat(client,{state:{credential:'test'},save(){}},{requestId:()=> 'a'.repeat(40),async request(d,c,p,b){calls.push(b);if(b.action==='skillManage')return {result:{name:b.management.selected.name,source:b.management.selected.source,revision:b.management.selected.revision,scope:'workspace',editable:true,content:'Original skill',description:'Description',location:'skills/test/SKILL.md',token:'review',digest:'digest',backup:'skills/test/backup.bak',deleted:b.management.operation==='delete'}};if(b.action==='retryDraft')return {result:{sessionID,messageID:b.messageID,text:'Original request',attachments:[{filename:'ref.txt',mime:'text/plain',url:'data:text/plain;base64,SGVsbG8='}]}};if(b.action==='skills')return {result:{skills,directory:skillDirectory,sessionID}};if(b.action==='skillReview')return {result:{token:'review',directory:skillDirectory,destination:'skills/'+b.draft.name+'/SKILL.md'}};if(b.action==='skillSave'){if(failSkillSave)throw {message:'Save not confirmed'};return {result:{name:b.draft.name,destination:'SKILL.md'}};}if(b.action==='checkpoints')return {result:{checkpoints:checkpointList}};if(b.action==='state' && holdState){const prior=model;await new Promise(resolve=>{releaseState=resolve});return {result:{status:'idle',model:prior,messages:[],workspaces:[]}};}if(b.action==='send' && failSend)throw {code:'disconnected',message:'Disconnected'};if(b.action==='models')return {result:{models:catalog}};if(b.action==='model'){if(failModel)throw {message:'Model unavailable'};model=b.model;return {result:{model}};}return {result:b.action==='send'? {delivery:'accepted'}:{status,model,sessionID,directory:skillDirectory,messages,workspaces:[skillDirectory]}}}})
   const tick=()=>new Promise(r=>setImmediate(r))
   const drop=(name='ref.png',size=10)=>el('chat-form').events.drop({preventDefault(){},dataTransfer:{files:[{name,size}]}})
   const finish=r=>{r.result='data:image/png;base64,SGVsbG8=';r.onload()}
@@ -82,7 +82,7 @@ test('captured frames share the remaining byte budget with uploaded references',
   const f=fixture();await f.tick()
   const state={...f.client.state,project:{id:'one',path:'one.aep',saved:true},compositions:[{id:1,name:'Main',time:0}]}
   f.client.state=state;f.chat.update(state)
-  f.drop('large.png',2*1024*1024-2);f.finish(f.readers[0])
+  f.drop('large.png',10*1024*1024-2);f.finish(f.readers[0])
   f.client.panel=async()=>({compId:1,time:0,attachment:{mime:'image/png',url:'data:image/png;base64,AAAA'}})
   f.el('chat-capture').click();await f.tick()
   assert.equal(f.el('chat-attachments').children.length,1)
@@ -253,8 +253,8 @@ test('paste and browse work; project change discards pending reads',async()=>{
   f.readers.forEach(f.finish);assert.equal(f.el('chat-attachments').children.length,0);assert.equal(f.el('chat-input').value,'')
 })
 test('unsupported and oversized files are rejected, uncertain delivery cannot resubmit',async()=>{
-  const f=fixture();await f.tick();f.drop('bad.exe');assert.match(f.el('chat-error').textContent,/Use PNG/)
-  f.drop('big.png',3*1024*1024);assert.match(f.el('chat-error').textContent,/2 MB/);assert.equal(f.readers.length,0)
+  const f=fixture();await f.tick();f.drop('bad.exe');assert.match(f.el('chat-error').textContent,/Use images/)
+  f.drop('big.png',11*1024*1024);assert.match(f.el('chat-error').textContent,/10 MB/);assert.equal(f.readers.length,0)
   f.drop();f.finish(f.readers[0]);f.failSend=true
   f.el('chat-form').events.submit({preventDefault(){}});await f.tick()
   assert.equal(f.el('chat-send').disabled,true);assert.equal(f.el('chat-attachments').children.length,1)
@@ -419,4 +419,40 @@ test('a retry draft arriving after a project change is discarded',async()=>{
   assert.equal(f.el('chat-attachments').children.length,0)
   assert.equal(f.el('chat-retry-note').hidden,true)
   assert.equal(f.calls.filter(c=>c.action==='send').length,0)
+})
+
+
+test('skill manager reviews edits and deletion before applying, and resets on project changes',async()=>{
+  const f=fixture();await f.tick()
+  f.skills=[{name:'test',source:'a'.repeat(64),revision:'b'.repeat(64)}]
+  f.el('chat-skills-refresh').click();await f.tick()
+  f.el('chat-skill-picker').value='0';f.el('chat-skill-picker').events.change.call(f.el('chat-skill-picker'))
+  f.el('chat-skill-manage').click();await f.tick()
+  assert.equal(f.el('skill-manager-content').value,'Original skill')
+  assert.equal(f.el('chat-send').disabled,true)
+  f.el('skill-manager-content').value='Changed skill';f.el('skill-manager-content').events.input()
+  f.el('skill-manager-edit').click();await f.tick()
+  assert.equal(f.calls.filter(c=>c.management?.action==='apply').length,0)
+  f.el('skill-manager-content').events.input()
+  assert.equal(f.el('skill-manager-confirm').hidden,true)
+  f.el('skill-manager-edit').click();await f.tick()
+  f.el('skill-manager-confirm').click();await f.tick()
+  assert.equal(f.calls.find(c=>c.management?.action==='apply').management.draft.instructions,'Changed skill')
+  assert.match(f.el('skill-manager-status').textContent,/Backup/)
+  f.el('skill-manager-close').click()
+  f.el('chat-skill-picker').value='0';f.el('chat-skill-picker').events.change.call(f.el('chat-skill-picker'))
+  f.el('chat-skill-manage').click();await f.tick();f.el('skill-manager-delete').click();await f.tick()
+  f.el('skill-manager-confirm').click();await f.tick()
+  assert.equal(f.calls.filter(c=>c.management?.action==='apply').at(-1).management.operation,'delete')
+  f.chat.update({...f.client.state,project:{id:'two',path:'two.aep'}})
+  assert.equal(f.el('skill-manager').hidden,true)
+})
+
+test('expanded attachments accept GIF and code files and allow more than 2 MiB',async()=>{
+ const f=fixture();await f.tick()
+ f.drop('animation.gif',3*1024*1024);f.finish(f.readers[0])
+ f.drop('animation.jsx',20);f.finish(f.readers[1])
+ f.el('chat-form').events.submit({preventDefault(){}});await f.tick()
+ const sent=f.calls.find(c=>c.action==='send')
+ assert.equal(sent.attachments[0].mime,'image/gif');assert.equal(sent.attachments[1].mime,'text/plain')
 })

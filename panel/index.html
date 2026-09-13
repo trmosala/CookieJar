@@ -293,6 +293,19 @@
 <button id="technique-cancel" type="button">Cancel</button>
 </section>
 
+<section id="skill-manager" class="chat-approval" role="dialog" aria-modal="true" aria-label="Manage skill" hidden>
+<h3>Manage skill</h3>
+<p id="skill-manager-location"></p>
+<label for="skill-manager-name">Skill name</label><input id="skill-manager-name" maxlength="64">
+<label for="skill-manager-description">Skill description</label><input id="skill-manager-description" maxlength="1024">
+<label for="skill-manager-content">Skill instructions</label><textarea id="skill-manager-content" rows="6" maxlength="64000"></textarea>
+<p id="skill-manager-status" role="status"></p><pre id="skill-manager-review"></pre>
+<button id="skill-manager-copy" type="button">Copy skill</button>
+<button id="skill-manager-edit" type="button">Review changes</button>
+<button id="skill-manager-delete" type="button">Review deletion</button>
+<button id="skill-manager-confirm" type="button" hidden>Confirm change</button>
+<button id="skill-manager-close" type="button">Close</button>
+</section>
 <form id="chat-form">
 <div id="chat-retry-note" class="notice" role="status" hidden>New attempt from the current AE state. Previous messages and edits remain. Use Restore first to undo earlier edits. Review the target, references and skill before sending. <button id="chat-retry-cancel" type="button">Cancel retry</button></div>
 <section id="chat-target-picker" role="dialog" aria-modal="true" aria-label="Composition and layer references" hidden>
@@ -309,16 +322,17 @@
 <label class="sr-only" for="chat-input">Message CookieMonster</label>
 
 <div id="chat-attachments" aria-live="polite"></div>
-<input id="chat-files" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf,.txt,.md" multiple hidden>
+<input id="chat-files" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,.txt,.md,.csv,.json,.jsx,.js,.ts,.tsx,.xml,.yaml,.yml,.toml,.html,.css,.py,.sql,.log,.ini,.conf,.c,.cc,.cjs,.cpp,.cts,.env,.go,.gql,.graphql,.h,.hh,.hpp,.htm,.java,.jsonld,.mdx,.mjs,.mts,.rb,.rs,.sass,.scss,.sh,.zsh" multiple hidden>
 <textarea id="chat-input" rows="2" maxlength="16000" placeholder="Ask anything about your composition…"></textarea>
 
 <div class="chat-actions"><details id="chat-skills"><summary title="Reusable skills">Skills⌄</summary><div class="skills-popup">
 <label for="chat-skill-search">Search skills</label><input id="chat-skill-search" type="search" maxlength="256" placeholder="Name or description">
 <select id="chat-skill-picker" aria-label="Reusable skill"><option value="">No skill selected</option></select>
 <button id="chat-skills-refresh" type="button">Refresh skills</button>
+<button id="chat-skill-manage" type="button" disabled>Manage selected skill</button>
 <p id="chat-skill-workspace"></p>
 </div></details>
-<button id="chat-attach" class="composer-icon" type="button" aria-label="Attach references" title="Attach references · Up to 4 files, 2 MB total">+</button>
+<button id="chat-attach" class="composer-icon" type="button" aria-label="Attach references" title="Attach references · Up to 4 files, 10 MB total">+</button>
 <button id="chat-capture" class="composer-icon" type="button" aria-label="Attach current frame" title="Attach current composition frame with alpha">▣</button>
 <div class="chat-model-controls"><span class="composer-model-mark" aria-hidden="true">✧</span><label><span class="sr-only">Model</span><select id="chat-model" title="Model"><option value="">CookieMonster default</option></select></label><label class="composer-reasoning"><span class="sr-only">Reasoning</span><select id="chat-reasoning" title="Reasoning effort"><option value="default">Default</option></select></label></div>
 <button id="chat-mention" class="composer-icon" type="button" aria-label="Reference a composition or layer" title="Reference a composition or layer">@</button>

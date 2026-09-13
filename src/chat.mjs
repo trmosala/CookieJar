@@ -89,7 +89,7 @@ export async function createChat(runtime) {
     return found
   }
   function archived(r) {
-    const { conversations, previousSessions, skillReview, ...record } = r
+    const { conversations, previousSessions, skillReview, skillManagement, ...record } = r
     return record
   }
   async function conversationInfo(r) {
@@ -222,7 +222,7 @@ export async function createChat(runtime) {
       }
       return { sessionID: r.sessionID, targetCompId: r.targetCompId ?? null }
     }
-    if (["skills", "skillReview", "skillSave"].includes(body.action)) {
+    if (["skills", "skillReview", "skillSave", "skillManage"].includes(body.action)) {
       const directory = r?.directory || body.directory || workspaces.filter(matchingWorkspace).sort((a, b) => b.length - a.length)[0]
       if (!directory || !clients.has(directory)) fail("chat_workspace", "Choose a CM workspace explicitly to use skills")
       if (r && body.directory && body.directory !== r.directory) fail("stale_workspace", "Start a new conversation to change workspace")
@@ -239,6 +239,45 @@ export async function createChat(runtime) {
         })) }
       }
       if (!r || body.sessionID !== r.sessionID) fail("stale_session", "Conversation changed; review the technique again")
+      if (body.action === "skillManage") {
+        await assertSwitchable(r, connectionId)
+        const input = body.management
+        if (!input || !["read", "review", "apply"].includes(input.action) ||
+            Object.keys(input).some(k => !["action", "selected", "operation", "draft", "token"].includes(k)))
+          fail("invalid_payload", "Invalid skill management request")
+        const selected = skillSelection({ ...input.selected, directory, sessionID: r.sessionID })
+        const payload = { action: input.action, selected,
+          ...(input.operation ? { operation: input.operation } : {}),
+          ...(input.draft ? { draft: skillDraft(input.draft) } : {}),
+          ...(input.token ? { token: input.token } : {}) }
+        const digest = hash([selected, payload.operation || null, payload.draft || null, directory, r.sessionID])
+        if (input.action === "apply") {
+          if (!r.skillManagement || r.skillManagement.status !== "reviewed" || r.skillManagement.digest !== digest || r.skillManagement.token !== input.token)
+            fail("stale_review", "Refresh the skill before reviewing this change again")
+          r.skillManagement.status = "sending"
+          await save(); check()
+        }
+        try {
+          const receipt = await skillRequest(r, "manage", payload)
+          check()
+          if (!receipt || typeof receipt.content !== "string" || typeof receipt.location !== "string" || typeof receipt.editable !== "boolean")
+            fail("skills_unavailable", "Update CookieMonster to enable skill management")
+          if (input.action === "review") {
+            if (!/^[a-f0-9]{64}$/.test(receipt.token) || !/^[a-f0-9]{64}$/.test(receipt.digest)) fail("skills_unavailable", "Skill review receipt is missing")
+            r.skillManagement = { status: "reviewed", token: receipt.token, digest, cmDigest: receipt.digest, location: receipt.location }
+            await save()
+          }
+          if (input.action === "apply") {
+            if (receipt.digest !== r.skillManagement.cmDigest || receipt.location !== r.skillManagement.location || typeof receipt.backup !== "string" || receipt.deleted !== (input.operation === "delete"))
+              fail("skill_save_unknown", "Skill change could not be verified")
+            r.skillManagement.status = "saved"; await save()
+          }
+          return receipt
+        } catch (e) {
+          if (input.action === "apply") { r.skillManagement.status = "unknown"; await save(); fail("skill_save_unknown", "Change was not confirmed. Refresh and inspect the skill; no automatic retry. " + e.message) }
+          throw e
+        }
+      }
       const draft = skillDraft(body.draft)
       if (body.action === "skillReview") {
         const review = await skillRequest(r, "review", draft)
@@ -594,7 +633,7 @@ function displayMessages(messages) {
         try { const meta=JSON.parse(part.state.output);if(Number.isSafeInteger(meta.compId)&&meta.compId>0&&Number.isFinite(meta.time)&&meta.time>=0)frame={compId:meta.compId,time:meta.time} } catch {}
       }
       const images = files.flatMap(file => {
-        if (typeof file.url !== "string" || !/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(file.url) || file.url.length > imageBudget) return []
+        if (typeof file.url !== "string" || !/^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(file.url) || file.url.length > imageBudget) return []
         imageBudget -= file.url.length
         return [{ type: "image", id: file.id, url: file.url, filename: file.filename || "Composition frame", ...frame }]
       })
@@ -618,20 +657,20 @@ function displayMessages(messages) {
   })).reverse()
 }
 
-// Keep the encoded request safely below the existing 4 MiB transport ceiling.
+// Chat has its own 16 MiB transport ceiling; AE host commands retain their smaller limit.
 export function validateAttachments(value) {
   if (value === undefined) return []
   if (!Array.isArray(value) || value.length > 4) fail("invalid_payload", "Attach up to four references")
   let total = 0
   return value.map(file => {
     if (!file || typeof file.filename !== "string" || !file.filename.trim() || file.filename.length > 255 ||
-        /[\\/\x00-\x1f]/.test(file.filename) || !["image/png", "image/jpeg", "image/webp", "application/pdf", "text/plain"].includes(file.mime) ||
-        typeof file.url !== "string" || file.url.length > 2800000 || !file.url.startsWith(`data:${file.mime};base64,`))
-      fail("invalid_payload", "Unsupported reference; use PNG, JPEG, WebP, PDF or plain text")
+        /[\\/\x00-\x1f]/.test(file.filename) || !["image/png", "image/jpeg", "image/webp", "image/gif", "application/pdf", "text/plain"].includes(file.mime) ||
+        typeof file.url !== "string" || file.url.length > 14000000 || !file.url.startsWith(`data:${file.mime};base64,`))
+      fail("invalid_payload", "Unsupported reference; use PNG, JPEG, GIF, WebP, PDF or plain text")
     const encoded = file.url.slice(file.url.indexOf(",") + 1), bytes = Buffer.from(encoded, "base64")
     total += bytes.length
     if (!bytes.length || bytes.toString("base64") !== encoded) fail("invalid_payload", "Invalid reference data")
-    if (total > 2 * 1024 * 1024) fail("payload_too_large", "References must total 2 MB or less")
+    if (total > 10 * 1024 * 1024) fail("payload_too_large", "References must total 10 MB or less")
     return { type: "file", mime: file.mime, filename: file.filename, url: file.url }
   })
 }

@@ -2,7 +2,7 @@
 
 Use **Attach current frame** beside the attachment button in the composer. It captures the selected composition at the time reported by AE when clicked. Follow mode uses the active composition; a pinned target uses that composition's own time. The preview records the composition name, ID and time, and can be removed before sending. Later viewer or time changes do not change the attached image.
 
-Capture uses PNG with alpha, up to 1200 pixels wide and 2000 pixels high. Captured frames share the existing four-file, 2 MiB total attachment budget. Nothing is attached if the remaining budget is insufficient. Sending uses the existing CookieMonster file-part path.
+Capture uses PNG with alpha, up to 1200 pixels wide and 2000 pixels high. Captured frames share the existing four-file, 10 MiB total attachment budget. Nothing is attached if the remaining budget is insufficient. Sending uses the existing CookieMonster file-part path.
 
 The panel must remain visible and the project must be saved, idle and owned by the current conversation. The button establishes a conversation binding without sending a model prompt. The authenticated capture engine retains its inspection, revision, capability, lock and PNG checks. Project changes discard stale responses. An ambiguous timeout requires recovery and never retries automatically. Capturing does not move the viewer or change composition time.
 

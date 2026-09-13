@@ -12,6 +12,65 @@
             technique=null, techniqueReview=null, techniqueBusy=false;
         var conversationLoading=false, conversationSwitching=false, conversationEpoch=0, conversationOffset=0,
             conversationNext=null, conversationRows=[], renameConversation=null;
+        var manager=null,managerBusy=false,managerReview=null;
+        function closeManager(){if(managerBusy)return;manager=null;managerReview=null;el("skill-manager").hidden=true;el("chat-skills").open=true;controls();el("chat-skill-manage").focus();}
+        function managerDraft(){return {name:el("skill-manager-name").value,description:el("skill-manager-description").value,instructions:el("skill-manager-content").value,scope:manager.scope};}
+        function manage(input){return request("skillManage",{sessionID:manager.sessionID,directory:manager.directory,management:Object.assign({selected:manager.selected},input)});}
+        el("chat-skill-manage").addEventListener("click",function(){
+            if(switchBlocked() || !skillChoice || !snapshot || !snapshot.sessionID)return;
+            var g=generation;el("chat-skills").open=false;
+            manager={selected:{name:skillChoice.name,source:skillChoice.source,revision:skillChoice.revision},sessionID:snapshot.sessionID,directory:snapshot.directory};
+            managerBusy=true;managerReview=null;el("skill-manager-status").textContent="Loading skill...";el("skill-manager-review").textContent="";
+            el("skill-manager").hidden=false;controls();
+            manage({action:"read"}).then(function(value){
+                if(g!==generation || !manager)return;
+                manager.scope=value.scope;manager.editable=value.editable;manager.location=value.location;manager.content=value.content;manager.document=value.document;
+                el("skill-manager-name").value=value.name;el("skill-manager-description").value=value.description || "";el("skill-manager-content").value=value.content;
+                el("skill-manager-location").textContent=value.location+" ("+value.scope+")";
+                el("skill-manager-status").textContent=value.editable ? "Changes keep a backup. Other conversations using this skill will see the update." : "Read-only skill. You can copy its content.";
+                el("skill-manager-name").focus();
+            }).catch(function(e){if(g===generation)el("skill-manager-status").textContent=e.message;}).then(function(){managerBusy=false;controls();});
+        });
+        function reviewManager(operation){
+            if(!manager || !manager.editable || managerBusy)return;
+            var g=generation,input={action:"review",operation:operation};if(operation==="edit")input.draft=managerDraft();
+            managerBusy=true;managerReview=null;controls();
+            manage(input).then(function(value){
+                if(g!==generation || !manager)return;
+                managerReview={operation:operation,draft:input.draft,token:value.token};
+                el("skill-manager-review").textContent=(operation==="delete" ? "Delete this skill definition. Bundled files remain.\n" : "Save these changes to the existing skill.\n")+value.location+"\nA backup of the previous definition will be retained."+(input.draft ? "\n\n"+input.draft.name+"\n"+input.draft.description+"\n\n"+input.draft.instructions : "");
+                el("skill-manager-status").textContent="Review the operation, then confirm.";
+            }).catch(function(e){if(g===generation)el("skill-manager-status").textContent=e.message;}).then(function(){managerBusy=false;controls();});
+        }
+        el("skill-manager-edit").addEventListener("click",function(){reviewManager("edit");});
+        el("skill-manager-delete").addEventListener("click",function(){reviewManager("delete");});
+        ["skill-manager-name","skill-manager-description","skill-manager-content"].forEach(function(id){el(id).addEventListener("input",function(){managerReview=null;el("skill-manager-review").textContent="";controls();});});
+        el("skill-manager-confirm").addEventListener("click",function(){
+            if(!manager || !managerReview || managerBusy)return;
+            var g=generation,review=managerReview;managerReview=null;managerBusy=true;controls();
+            manage({action:"apply",operation:review.operation,draft:review.draft,token:review.token}).then(function(value){
+                if(g!==generation || !manager)return;
+                el("skill-manager-status").textContent=(value.deleted ? "Deleted." : "Saved.")+" Backup: "+value.backup;
+                manager.editable=false;manager.content=value.content;manager.document=value.document;skillChoice=null;refreshSkills();
+            }).catch(function(e){if(g===generation && manager){manager.editable=false;el("skill-manager-status").textContent=e.message+" Close and refresh before trying again.";}}).then(function(){managerBusy=false;controls();});
+        });
+        el("skill-manager-copy").addEventListener("click",function(){
+            if(!manager || managerBusy || manager.content===undefined)return;
+            var text=manager.document || manager.content;
+            var area=node("textarea",text);document.body.appendChild(area);area.select();
+            try{if(!document.execCommand("copy"))throw new Error("Copy failed");el("skill-manager-status").textContent="Copied skill to clipboard.";}
+            catch(e){el("skill-manager-status").textContent="Copy unavailable. Select the instructions and copy them manually.";}
+            document.body.removeChild(area);el("skill-manager-copy").focus();
+        });
+        el("skill-manager-close").addEventListener("click",closeManager);
+        el("skill-manager").addEventListener("keydown",function(e){
+            if(e.key==="Escape"){e.preventDefault();closeManager();}
+            if(e.key==="Tab"){
+                var fields=["skill-manager-name","skill-manager-description","skill-manager-content","skill-manager-copy","skill-manager-edit","skill-manager-delete","skill-manager-confirm","skill-manager-close"].map(el).filter(function(f){return !f.disabled&&!f.hidden;});
+                if(fields.length&&e.shiftKey&&document.activeElement===fields[0]){e.preventDefault();fields[fields.length-1].focus();}
+                else if(fields.length&&!e.shiftKey&&document.activeElement===fields[fields.length-1]){e.preventDefault();fields[0].focus();}
+            }
+        });
         var capturing=false, retryLoading=false, retrySource=null, retryPrevious=null, retryButtons=[];
         function clearRetry(){retrySource=null;retryPrevious=null;el("chat-retry-note").hidden=true;}
         function retryDraft(message){
@@ -63,7 +122,7 @@
         el("target-search").addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();findTargets(null);}});
         el("chat-target-picker").addEventListener("keydown",function(e){if(e.key==="Escape"){e.preventDefault();closeTargets();}if(e.key==="Tab" && this.querySelectorAll){var focus=Array.prototype.slice.call(this.querySelectorAll('button:not(:disabled),input,select'));if(focus.length && e.shiftKey && document.activeElement===focus[0]){e.preventDefault();focus[focus.length-1].focus();}else if(focus.length&&!e.shiftKey&&document.activeElement===focus[focus.length-1]){e.preventDefault();focus[0].focus();}}});
         function switchBlocked() {
-            return retryLoading || state.connection!=="connected" || client.renderWorking || capturing || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview ||
+            return !!manager || managerBusy || retryLoading || state.connection!=="connected" || client.renderWorking || capturing || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview ||
                 conversationSwitching || deliveryUnknown || !!client.panelPending || state.busy || state.uncertain || !!state.lock ||
                 !!(snapshot && (snapshot.status!=="idle" || snapshot.owned || snapshot.restore && ["pending","unconfirmed"].indexOf(snapshot.restore.status)>=0));
         }
@@ -230,7 +289,7 @@
         el("chat-skills").addEventListener("keydown",function(e){if(e.key==="Escape" && this.open){e.preventDefault();this.open=false;this.querySelector("summary").focus();}});
         el("chat-skill-picker").addEventListener("change",function(){
             skillChoice=this.value==="" ? null : skills[Number(this.value)] || null;
-            el("chat-skill-status").textContent=skillChoice ? "Selected: "+skillChoice.name+" (not loaded)" : "No skill selected";
+            el("chat-skill-status").textContent=skillChoice ? "Selected: "+skillChoice.name+" (not loaded)" : "No skill selected";controls();
         });
         function projectIdentity(s) { return s.project ? JSON.stringify(s.project) : ""; }
         function pins() { if(!store.state.chatPins)store.state.chatPins={};return store.state.chatPins; }
@@ -246,7 +305,13 @@
             var selectedLayers=state.selectedLayers || [];
             el("chat-selected-layers").hidden=!selectedLayers.length;
             el("chat-selected-layers").textContent=selectedLayers.length ? "Selected in AE: "+selectedLayers.slice(0,3).map(function(l){return l.name+" (#"+l.layerId+")";}).join(", ")+(selectedLayers.length>3?" +"+(selectedLayers.length-3):"")+" · Use @ to reference" : "";
-            var connected=state.connection==="connected", busy=retryLoading || client.renderWorking || capturing || conversationSwitching || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
+            var connected=state.connection==="connected", busy=!!manager || managerBusy || retryLoading || client.renderWorking || capturing || conversationSwitching || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
+            el("chat-skill-manage").disabled=!!switchBlocked() || !skillChoice || !snapshot || !snapshot.sessionID;
+            ["skill-manager-name","skill-manager-description","skill-manager-content"].forEach(function(id){el(id).readOnly=!manager || !manager.editable;el(id).disabled=managerBusy;});
+            el("skill-manager-copy").disabled=managerBusy || !manager || manager.content===undefined;
+            el("skill-manager-edit").disabled=el("skill-manager-delete").disabled=managerBusy || !connected || !manager || !manager.editable;
+            el("skill-manager-confirm").hidden=!managerReview;el("skill-manager-confirm").disabled=managerBusy || !connected;
+            el("skill-manager-close").disabled=managerBusy;
             retryButtons.forEach(function(button){button.disabled=!!switchBlocked() || !!retrySource;});
             el("chat-retry-cancel").disabled=sending || deliveryUnknown;
             var frame=(state.compositions || []).filter(function(c){return c.id===selected();})[0];
@@ -445,9 +510,10 @@
             if(retryLoading || capturing || sending || deliveryUnknown || !state.project)return;
             var g=generation;
             Array.prototype.forEach.call(files,function(file){
-                var extension=file.name.split(".").pop().toLowerCase(),mime={png:"image/png",jpg:"image/jpeg",jpeg:"image/jpeg",webp:"image/webp",pdf:"application/pdf",txt:"text/plain",md:"text/plain"}[extension];
-                if(!mime){error({message:"Use PNG, JPEG, WebP, PDF, TXT or Markdown references."});return;}
-                if(attachments.length>=4 || !file.size || file.size+attachments.reduce(function(n,a){return n+a.size;},0)>2*1024*1024){error({message:"Attach up to four non-empty files, 2 MB total."});return;}
+                var extension=file.name.split(".").pop().toLowerCase(),mime={png:"image/png",jpg:"image/jpeg",jpeg:"image/jpeg",gif:"image/gif",webp:"image/webp",pdf:"application/pdf",txt:"text/plain",md:"text/plain"}[extension];
+                if(!mime && "c cc cjs conf cpp css csv cts env go gql graphql h hh hpp htm html ini java js json jsonld jsx log md mdx mjs mts py rb rs sass scss sh sql toml ts tsx txt xml yaml yml zsh".split(" ").indexOf(extension)>=0)mime="text/plain";
+                if(!mime){error({message:"Use images, PDF or text/code files. Audio, video and Office documents are not supported by CookieMonster's attachment path."});return;}
+                if(attachments.length>=4 || !file.size || file.size+attachments.reduce(function(n,a){return n+a.size;},0)>10*1024*1024){error({message:"Attach up to four non-empty files, 10 MB total."});return;}
                 var a={filename:file.name,mime:mime,size:file.size},reader=new FileReader();attachments.push(a);
                 reader.onload=function(){if(g!==generation || attachments.indexOf(a)<0)return;a.url="data:"+mime+";base64,"+String(reader.result).split(",")[1];drawAttachments();controls();};
                 reader.onerror=function(){if(g!==generation || attachments.indexOf(a)<0)return;attachments=attachments.filter(function(item){return item!==a;});error({message:"Could not read "+file.name});drawAttachments();controls();};
@@ -473,7 +539,7 @@
                 if(g!==generation)return;
                 if(result.compId!==target.compId || result.time!==target.time || !result.attachment || result.attachment.mime!=="image/png")throw {code:"invalid_response",message:"Capture did not confirm this frame"};
                 var file=result.attachment,data=file.url.split(",")[1],size=data.length*3/4-(data.slice(-2)==="==" ? 2 : data.slice(-1)==="=" ? 1 : 0);
-                if(attachments.length>=4 || size+attachments.reduce(function(n,a){return n+a.size;},0)>2*1024*1024)throw {code:"payload_too_large",message:"Captured frame exceeds the remaining attachment limit. Nothing was attached."};
+                if(attachments.length>=4 || size+attachments.reduce(function(n,a){return n+a.size;},0)>10*1024*1024)throw {code:"payload_too_large",message:"Captured frame exceeds the remaining attachment limit. Nothing was attached."};
                 attachments.push({filename:"ae-comp-"+target.compId+"-at-"+target.time+"s.png",mime:file.mime,url:file.url,size:size,
                     caption:name+" (#"+target.compId+") · "+target.time.toFixed(3)+"s · PNG with alpha"});
                 el("chat-error").textContent="";drawAttachments();
@@ -542,7 +608,7 @@
                     var messageKey="message:"+(message.id || messageIndex),activity=null;
                     (message.parts || []).forEach(function(part,partIndex){
                         var partKey=messageKey+":"+(part.id || partIndex);
-                        if(part.type==="image" && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(part.url)) {
+                        if(part.type==="image" && /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(part.url)) {
                             var imageBox=disclosure(partKey,part.compId ? "Composition #"+part.compId+" · "+part.time.toFixed(3)+"s" : "Image · "+(part.filename || "Composition frame"),!!message.completed && messageIndex>=(data.messages || []).length-2);
                             var img=node("img");img.src=part.url;img.alt=part.filename || "Composition frame";imageBox.appendChild(img);content.appendChild(imageBox);
                         } else if(part.type==="skill") {
@@ -653,6 +719,7 @@
             if(restoreReview && restoreReview!==client.restoreApproval)cancelRestore();
             if(s.connection!=="connected")el("chat-progress").textContent="Connecting to CookieMonster…";
             if(key!==projectKey) {
+                manager=null;managerReview=null;el("skill-manager").hidden=true;
                 clearRetry();retryButtons=[];
                 references=[];drawReferences();closeTargets();
                 conversationEpoch++;conversationLoading=false;conversationSwitching=false;conversationRows=[];el("chat-conversations").hidden=true;el("chat-conversations-list").textContent="";el("chat-title").textContent="";

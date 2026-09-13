@@ -657,7 +657,7 @@ async function startBridge({
     }
     const captureReply = endpoint === "/reply" &&
       live.get(credential?.connectionId)?.pending?.command.method === "capture"
-    const limit = endpoint === "/panel" ? 65536 : captureReply ? CAPTURE_BYTES : MAX_BYTES
+    const limit = endpoint === "/chat" ? 16 * 1024 * 1024 : endpoint === "/panel" ? 65536 : captureReply ? CAPTURE_BYTES : MAX_BYTES
     const chunks = []
     let bytes = 0
     for await (const chunk of req) {
@@ -751,8 +751,8 @@ async function startBridge({
       fail("disconnected", "Heartbeat expired; reconnect and explicitly rebind")
     }
     if (endpoint === "/chat") {
-      schema(body, ["action", "project"], ["text", "requestId", "compId", "directory", "permissionId", "response", "takeover", "attachments", "model", "before", "skill", "draft", "token", "sessionID", "expectedSessionID", "search", "offset", "title", "references", "cursor", "messageID", "retryMessageID"])
-      if (!["state", "history", "retryDraft", "send", "new", "stop", "permission", "models", "model", "checkpoints", "bind", "captureBind", "targets", "skills", "skillReview", "skillSave", "conversations", "reopen", "rename"].includes(body.action)) fail("invalid_payload", "Unknown chat action")
+      schema(body, ["action", "project"], ["text", "requestId", "compId", "directory", "permissionId", "response", "takeover", "attachments", "model", "before", "skill", "draft", "token", "sessionID", "expectedSessionID", "search", "offset", "title", "references", "cursor", "messageID", "retryMessageID", "management"])
+      if (!["skillManage", "state", "history", "retryDraft", "send", "new", "stop", "permission", "models", "model", "checkpoints", "bind", "captureBind", "targets", "skills", "skillReview", "skillSave", "conversations", "reopen", "rename"].includes(body.action)) fail("invalid_payload", "Unknown chat action")
       const expected = project(body.project), credentialHash = credential.hash
       const check = () => {
         if (live.get(c.id) !== c || !c.connected || credential.hash !== credentialHash || !sameProject(c.project, expected))
@@ -765,7 +765,7 @@ async function startBridge({
         check()
         const result = await handler({ connectionId: c.id, panelId: c.panelId, project: clone(expected), body: clone(body), check })
         check()
-        if (Buffer.byteLength(JSON.stringify(result)) > 8 * 1024 * 1024) fail("payload_too_large", "Chat response exceeds its display budget")
+        if (Buffer.byteLength(JSON.stringify(result)) > 16 * 1024 * 1024) fail("payload_too_large", "Chat response exceeds its display budget")
         return { result }
       }
     }

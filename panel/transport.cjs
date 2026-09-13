@@ -226,14 +226,14 @@ Store.prototype.close = function () {
 function request(descriptor, credential, endpoint, body, timeout) {
     return new Promise(function (resolve, reject) {
         var data = body === undefined ? null : Buffer.from(JSON.stringify(body), "utf8"), finished = false, timer;
-        if (data && data.length > MAX) { reject(error("payload_too_large", "Reply exceeds bridge JSON limit")); return; }
+        if (data && data.length > (endpoint==="/chat" ? 16*1024*1024 : MAX)) { reject(error("payload_too_large", "Reply exceeds bridge JSON limit")); return; }
         var headers = {"Content-Type":"application/json"};
         if (credential) headers.Authorization = "Bearer " + credential;
         if (data) headers["Content-Length"] = data.length;
         function done(err, result) { if (finished) return; finished = true; clearTimeout(timer); if (err) reject(err); else resolve(result); }
         var req = http.request({hostname:"127.0.0.1", port:descriptor.port, path:endpoint, method:endpoint === "/poll" ? "GET" : "POST", headers:headers, agent:false}, function (res) {
             var chunks = [], size = 0;
-            res.on("data", function (chunk) { size += chunk.length; if (size > (endpoint==="/chat" ? 8*1024*1024 : MAX)) { req.destroy(); done(error("invalid_response", "Oversized bridge response")); } else chunks.push(chunk); });
+            res.on("data", function (chunk) { size += chunk.length; if (size > (endpoint==="/chat" ? 16*1024*1024 : MAX)) { req.destroy(); done(error("invalid_response", "Oversized bridge response")); } else chunks.push(chunk); });
             res.on("error", function () { done(error("disconnected", "Bridge response interrupted")); });
             res.on("end", function () {
                 try {

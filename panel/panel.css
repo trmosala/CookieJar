@@ -273,3 +273,7 @@ header { display:grid; grid-template-columns:28px minmax(0,1fr) auto; gap:10px; 
 @media(max-width:420px) { .brand h1 { font-size:12px; } #chat-title { max-width:110px; font-size:11px; padding-left:7px; } #connection-status { font-size:0; gap:0; } .header-controls { gap:6px; } main { padding:0 10px 10px; } .composer-reasoning { max-width:72px; } }
 @media(max-height:460px) { .header-composition { padding:5px 0; } #chat-selected-layers { max-height:1.5em; } #chat-input { min-height:40px; height:40px; } #chat-form { min-height:85px; } }
 @media(max-width:340px) { .chat-model-controls { order:-1; flex-basis:100%; } }
+
+#skill-manager { max-height:55vh; overflow:auto; flex-shrink:0; }
+#skill-manager input,#skill-manager textarea { width:100%; box-sizing:border-box; }
+#skill-manager-location { overflow-wrap:anywhere; }
