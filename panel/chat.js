@@ -12,8 +12,9 @@
             technique=null, techniqueReview=null, techniqueBusy=false;
         var conversationLoading=false, conversationSwitching=false, conversationEpoch=0, conversationOffset=0,
             conversationNext=null, conversationRows=[], renameConversation=null;
+        var capturing=false;
         function switchBlocked() {
-            return state.connection!=="connected" || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview ||
+            return state.connection!=="connected" || capturing || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview ||
                 conversationSwitching || deliveryUnknown || !!client.panelPending || state.busy || state.uncertain || !!state.lock ||
                 !!(snapshot && (snapshot.status!=="idle" || snapshot.owned || snapshot.restore && ["pending","unconfirmed"].indexOf(snapshot.restore.status)>=0));
         }
@@ -191,7 +192,10 @@
         }
         function error(e) { el("chat-error").textContent=(e.code ? e.code+": " : "")+(e.message || String(e)); }
         function controls() {
-            var connected=state.connection==="connected", busy=conversationSwitching || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
+            var connected=state.connection==="connected", busy=capturing || conversationSwitching || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
+            var frame=(state.compositions || []).filter(function(c){return c.id===selected();})[0];
+            el("chat-capture").disabled=!!switchBlocked() || attachments.length>=4 || attachments.some(function(a){return !a.url;}) || !state.project || !state.project.saved || !frame || typeof frame.time!=="number" || !isFinite(frame.time) || frame.time<0;
+            el("chat-capture").title=capturing ? "Capturing. Keep this panel visible; no automatic retry." : frame && typeof frame.time==="number" ? "Attach "+frame.name+" (#"+frame.id+") at "+frame.time.toFixed(3)+"s with alpha" : "Waiting for an explicit composition time from After Effects";
             var restoring=snapshot && snapshot.restore && ["pending","unconfirmed"].indexOf(snapshot.restore.status)>=0;
             var restoreBlocked=!connected || !!busy || !!restoring || !!client.panelPending || state.busy || state.uncertain || !!state.lock || deliveryUnknown || !!(snapshot && snapshot.owned) || !!(state.binding && state.binding.sessionID!==(snapshot && snapshot.sessionID));
             el("chat-skill-picker").disabled=!connected || !!busy || skillLoading;
@@ -216,7 +220,7 @@
             el("chat-send").disabled=!connected || !!busy || !!restoring || !!(snapshot && snapshot.missing) || state.uncertain || deliveryUnknown || attachments.some(function(a){return !a.url;}) || !el("chat-input").value.trim();
             el("chat-attach").disabled=!!busy || deliveryUnknown;
             el("chat-input").disabled=!!sending || deliveryUnknown;
-            el("chat-stop").disabled=!connected || restoreWorking || !!restoreReview || !busy;
+            el("chat-stop").disabled=!connected || capturing || restoreWorking || !!restoreReview || !busy;
             el("chat-new").disabled=!!switchBlocked();
             el("chat-conversations-open").disabled=conversationSwitching || !!technique || restoreWorking || !!restoreReview;
             conversationControls();
@@ -226,7 +230,7 @@
         }
         function request(action, extra) {
             var g=generation, project=JSON.parse(projectIdentity(state)),descriptor=client.descriptor, credential=store.state.credential;
-            var expected=["send","new","reopen","rename","model","bind","history","stop","permission"].indexOf(action)>=0 ? {expectedSessionID:snapshot && snapshot.sessionID || null} : {};
+            var expected=["send","new","reopen","rename","model","bind","captureBind","history","stop","permission"].indexOf(action)>=0 ? {expectedSessionID:snapshot && snapshot.sessionID || null} : {};
             return api.request(descriptor,credential,"/chat",Object.assign({action:action,project:project},expected,extra || {}),30000).then(function(r){
                 if(g!==generation || descriptor!==client.descriptor || credential!==store.state.credential)throw {code:"stale_project",message:"Project changed; response belongs to the previous conversation"};
                 if(!r || !r.result || typeof r.result!=="object")throw {code:"invalid_response",message:"Invalid chat response"};
@@ -374,14 +378,14 @@
             attachments.forEach(function(a){
                 var row=node("div",undefined,"chat-reference");
                 if(a.url && a.mime.indexOf("image/")===0){var img=node("img");img.src=a.url;img.alt=a.filename;row.appendChild(img);}
-                row.appendChild(node("span",a.filename+(a.url ? "" : " · Reading…")));
+                row.appendChild(node("span",a.caption || a.filename+(a.url ? "" : " · Reading…")));
                 var remove=node("button","×");remove.type="button";remove.setAttribute("aria-label","Remove "+a.filename);remove.disabled=sending || deliveryUnknown;
                 remove.addEventListener("click",function(){attachments=attachments.filter(function(item){return item!==a;});drawAttachments();controls();});
                 row.appendChild(remove);box.appendChild(row);
             });
         }
         function addFiles(files) {
-            if(sending || deliveryUnknown || !state.project)return;
+            if(capturing || sending || deliveryUnknown || !state.project)return;
             var g=generation;
             Array.prototype.forEach.call(files,function(file){
                 var extension=file.name.split(".").pop().toLowerCase(),mime={png:"image/png",jpg:"image/jpeg",jpeg:"image/jpeg",webp:"image/webp",pdf:"application/pdf",txt:"text/plain",md:"text/plain"}[extension];
@@ -395,6 +399,35 @@
             drawAttachments();controls();
         }
         el("chat-attach").addEventListener("click",function(){el("chat-files").click();});
+        el("chat-capture").addEventListener("click",function(){
+            if(el("chat-capture").disabled)return;
+            var comp=(state.compositions || []).filter(function(c){return c.id===selected();})[0];
+            if(!comp)return;
+            var target={compId:comp.id,time:comp.time},name=comp.name,g=generation;
+            capturing=true;el("chat-error").textContent="Capturing frame. Keep this panel visible...";controls();
+            request("captureBind",{directory:el("chat-workspace").value || undefined}).then(function(data){
+                if(g!==generation)throw {code:"stale_project",message:"Project changed; frame discarded"};
+                if(!snapshot)snapshot={status:"idle"};snapshot.sessionID=data.sessionID;
+                return client.heartbeat();
+            }).then(function(){
+                if(g!==generation)throw {code:"stale_project",message:"Project changed; frame discarded"};
+                return client.panel("frame.capture",target);
+            }).then(function(result){
+                if(g!==generation)return;
+                if(result.compId!==target.compId || result.time!==target.time || !result.attachment || result.attachment.mime!=="image/png")throw {code:"invalid_response",message:"Capture did not confirm this frame"};
+                var file=result.attachment,data=file.url.split(",")[1],size=data.length*3/4-(data.slice(-2)==="==" ? 2 : data.slice(-1)==="=" ? 1 : 0);
+                if(attachments.length>=4 || size+attachments.reduce(function(n,a){return n+a.size;},0)>2*1024*1024)throw {code:"payload_too_large",message:"Captured frame exceeds the remaining attachment limit. Nothing was attached."};
+                attachments.push({filename:"ae-comp-"+target.compId+"-at-"+target.time+"s.png",mime:file.mime,url:file.url,size:size,
+                    caption:name+" (#"+target.compId+") · "+target.time.toFixed(3)+"s · PNG with alpha"});
+                el("chat-error").textContent="";drawAttachments();
+            }).catch(function(e){
+                if(g!==generation)return;
+                if(!e.code || ["timeout","disconnected","invalid_response","ECONNRESET","ETIMEDOUT","capture_timeout","outcome_uncertain","uncertain_outcome"].indexOf(e.code)>=0){
+                    client.state.uncertain=true;if(client.mark)client.mark(true);
+                    error({message:"Capture was not confirmed. Wait for AE, then use recovery settings. No automatic retry. "+(e.message || "")});
+                }else error(e);
+            }).then(function(){capturing=false;controls();refresh();});
+        });
         el("chat-files").addEventListener("change",function(){addFiles(this.files);this.value="";});
         el("chat-form").addEventListener("dragover",function(e){e.preventDefault();});
         el("chat-form").addEventListener("drop",function(e){e.preventDefault();if(e.dataTransfer)addFiles(e.dataTransfer.files);});
@@ -521,7 +554,7 @@
             controls();
         }
         function refresh() {
-            if(polling || conversationSwitching || modelSaving || restoreWorking || state.connection!=="connected" || !state.project)return Promise.resolve();
+            if(polling || capturing || conversationSwitching || modelSaving || restoreWorking || state.connection!=="connected" || !state.project)return Promise.resolve();
             polling=true;var g=generation, revision=modelRevision;
             return request("state").then(function(data){if(g===generation && revision===modelRevision){if(el("chat-error").textContent===refreshError)el("chat-error").textContent="";refreshError="";draw(data);return Promise.all([Date.now()-catalogAt>15000 ? refreshModels() : null,Date.now()-checkpointAt>10000 ? refreshCheckpoints() : null]);}}).catch(function(e){if(g===generation){messagesKey="";error(e);refreshError=el("chat-error").textContent;}}).then(function(){polling=false;});
         }

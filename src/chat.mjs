@@ -157,6 +157,7 @@ export async function createChat(runtime) {
     const current = (await runtime.bridge.connections()).find(c => c.id === connectionId)
     const owned = !!current?.binding && current.binding.sessionID !== r?.sessionID
     const matchingWorkspace = dir => project.path && (project.path === dir || project.path.startsWith(dir + path.sep))
+    if (body.action === "captureBind") await assertSwitchable(r, connectionId)
     if (body.action === "conversations") {
       const search = body.search ?? "", offset = body.offset ?? 0
       if (typeof search !== "string" || search.length > 256 || !Number.isSafeInteger(offset) || offset < 0 || offset > 100000)
@@ -409,7 +410,7 @@ export async function createChat(runtime) {
     const client = clientFor(r)
     const statuses = await result(client.session.status({ query: { directory: r.directory }, signal: AbortSignal.timeout(20000) }))
     if (statuses?.[r.sessionID]?.type && statuses[r.sessionID].type !== "idle") fail("chat_busy", "Wait for the current reply or stop it first")
-    if (body.action === "bind") return { bound: true }
+    if (["bind", "captureBind"].includes(body.action)) return { bound: true, sessionID: r.sessionID }
     const selectedModel = await selection(r)
     if (selectedModel) validateModel(selectedModel, await models(r))
     // Validate the pinned target against the host, not the panel's cached picker.

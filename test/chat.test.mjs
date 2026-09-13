@@ -37,6 +37,19 @@ async function fixture(t) {
   }
   return { p, chat, runtime, client, catalog, selections, calls, inputs, messages, statuses, sessions, send, set admitted(fn) { admitted = fn } }
 }
+test("composer capture binds an idle owned session without submitting a prompt", async t => {
+  const f = await fixture(t)
+  const first = await f.send({ action: "captureBind", expectedSessionID: null })
+  assert.equal(first.bound, true)
+  assert.equal(f.inputs.length, 0)
+  assert.equal(f.p.bridge.binding(first.sessionID).connectionId, f.p.connectionId)
+  assert.equal((await f.send({ action: "captureBind", expectedSessionID: first.sessionID })).sessionID, first.sessionID)
+  assert.equal(f.calls.filter(c => c[0] === "create").length, 1)
+  f.statuses[first.sessionID] = { type: "busy" }
+  await assert.rejects(f.send({ action: "captureBind", expectedSessionID: first.sessionID }), { code: "chat_busy" })
+  assert.equal(f.inputs.length, 0)
+})
+
 test("project conversations reopen and rename through CM after reload without replay or target loss", async t => {
   const f = await fixture(t), first = await f.send(message({ compId: 3 }))
   const second = await f.send({ action: "new" })

@@ -1095,7 +1095,7 @@ var CookieMonsterAE = (function () {
                 var compositions=[], ci, currentComp=app.project.activeItem instanceof CompItem ? app.project.activeItem : null;
                 for(ci=1;ci<=app.project.numItems && compositions.length<2000;ci++){
                     var composition=app.project.item(ci);
-                    if(composition instanceof CompItem)compositions.push({id:composition.id,name:composition.name});
+                    if(composition instanceof CompItem)compositions.push({id:composition.id,name:composition.name,time:composition.time});
                 }
                 result={project:project(),activeCompId:currentComp ? currentComp.id : null,compositions:compositions,
                     aeVersion:String(app.version),capabilities:capability(),busy:busy,uncertain:uncertain};

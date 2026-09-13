@@ -415,8 +415,8 @@ Client.prototype.emit=function(){
 Client.prototype.panel=function(action,args){
     var self=this,allowed={
         "checkpoints":[],"checkpoint.pin":["id","pinned"],"checkpoint.delete":["id"],
-        "checkpoint.restore.propose":["id"],"checkpoint.restore.confirm":["token"],"diagnostics":[],"renders":[]
-    },payload={action:action},context=self.context(),mutating=typeof action==="string" && action.indexOf("checkpoint.")===0;
+        "checkpoint.restore.propose":["id"],"checkpoint.restore.confirm":["token"],"diagnostics":[],"renders":[],"frame.capture":["compId","time"]
+    },payload={action:action},context=self.context(),mutating=typeof action==="string" && (action.indexOf("checkpoint.")===0 || action==="frame.capture");
     args=args || {};
     if(!Object.prototype.hasOwnProperty.call(allowed,action) || !record(args) || Object.keys(args).sort().join(",")!==allowed[action].slice().sort().join(","))return Promise.reject(error("invalid_payload","Unknown panel action or fields"));
     if(self.panelPending)return Promise.reject(error("panel_busy","Panel request already outstanding"));
@@ -424,6 +424,7 @@ Client.prototype.panel=function(action,args){
     if(mutating && (self.state.busy || self.state.uncertain || self.state.lock || !self.state.binding || self.state.binding.state!=="active"))return Promise.reject(error("target_locked","Checkpoint changes require an active unlocked binding"));
     if(Object.prototype.hasOwnProperty.call(args,"id") && !text(args.id,256))return Promise.reject(error("invalid_payload","Invalid checkpoint ID"));
     if(action==="checkpoint.pin" && typeof args.pinned!=="boolean")return Promise.reject(error("invalid_payload","pinned must be boolean"));
+    if(action==="frame.capture" && (!Number.isSafeInteger(args.compId) || args.compId<1 || !Number.isFinite(args.time) || args.time<0))return Promise.reject(error("invalid_payload","Choose an explicit composition and time"));
     var confirming=action==="checkpoint.restore.confirm",proposing=action==="checkpoint.restore.propose",approval=self.restoreApproval;
     if(confirming){
         self.restoreApproval=null;
@@ -442,7 +443,7 @@ Client.prototype.panel=function(action,args){
     return Promise.resolve().then(function(){
         if(guard.stale || guard.scope!==self.scope() || guard.credential!==self.store.state.credential || context!==self.context())
             throw error("stale_binding","Panel scope changed before dispatch");
-        return self.request(descriptor,guard.credential,"/panel",payload,(confirming || proposing) ? 300000 : 15000);
+        return self.request(descriptor,guard.credential,"/panel",payload,(confirming || proposing) ? 300000 : action==="frame.capture" ? 60000 : 15000);
     }).then(function(response){
         if(!record(response) || Object.keys(response).length!==1 || !Object.prototype.hasOwnProperty.call(response,"result"))throw error("invalid_response","Panel service must return {result}");
         if(guard.stale || guard.scope!==self.scope() || guard.credential!==self.store.state.credential)throw error("stale_binding","Connection or binding changed during panel request");
@@ -476,7 +477,12 @@ Client.prototype.panel=function(action,args){
                 emergencyPath:r.emergencyPath,originalPath:r.originalPath || null,recoveryCopy:r.recoveryCopy,canonicalReplaced:r.canonicalReplaced,
                 rebindRequired:r.rebindRequired,automationSuspended:r.automationSuspended,fingerprint:r.fingerprint,cleanup:r.cleanup,warning:r.warning};
         }
-        if(action==="checkpoints"){
+        if(action==="frame.capture"){
+            var image=r && r.attachment;
+            if(!record(r) || r.compId!==args.compId || r.time!==args.time || !Number.isSafeInteger(r.width) || r.width<1 || r.width>1200 || !Number.isSafeInteger(r.height) || r.height<1 || r.height>2000 ||
+                !record(image) || image.type!=="file" || image.mime!=="image/png" || !text(image.filename,255) || !text(image.url,2800000) || !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(image.url))
+                throw error("invalid_response","Capture did not confirm the requested frame");
+        } else if(action==="checkpoints"){
             if(!Array.isArray(r) || r.length>10000)throw error("invalid_response","Expected bounded checkpoint list");
             r=r.map(function(c){
                 if(!record(c) || !text(c.id,256) || !Number.isFinite(c.createdAt) || typeof c.pinned!=="boolean" || !text(c.storageMode,64) || !Number.isFinite(c.size) || c.size<0)throw error("invalid_response","Invalid checkpoint metadata");
@@ -497,7 +503,7 @@ Client.prototype.panel=function(action,args){
     }).then(function(r){self.panelPending=false;self.panelGuard=null;self.emit();return r;},function(e){
         self.panelPending=false;self.panelGuard=null;
         if(proposing)self.restoreApproval=null;
-        if(action==="checkpoint.restore.confirm" && ["disconnected","invalid_response","stale_binding","outcome_uncertain","uncertain_outcome"].indexOf(e.code)>=0){
+        if((action==="checkpoint.restore.confirm" || action==="frame.capture") && ["disconnected","invalid_response","stale_binding","outcome_uncertain","uncertain_outcome","capture_timeout","timeout","ETIMEDOUT","ECONNRESET"].indexOf(e.code)>=0){
             self.state.busy=true;self.mark(true);
         }
         self.emit();throw e;
@@ -646,7 +652,7 @@ Client.prototype.status=function(){
         if(!record(s) || !record(s.project) || !record(s.capabilities) || typeof s.capabilities.fileNetwork!=="boolean" || !text(s.aeVersion,128) ||
             !(s.activeCompId === null || (Number.isSafeInteger(s.activeCompId) && s.activeCompId>0)))throw error("invalid_host_result","Host status incomplete");
         self.state.project=s.project;self.state.activeCompId=s.activeCompId;self.state.capabilities=s.capabilities;self.state.aeVersion=s.aeVersion;
-        if(s.compositions!==undefined && (!Array.isArray(s.compositions) || s.compositions.length>2000 || s.compositions.some(function(c){return !record(c) || !Number.isSafeInteger(c.id) || c.id<1 || typeof c.name!=="string" || c.name.length>32768;})))
+        if(s.compositions!==undefined && (!Array.isArray(s.compositions) || s.compositions.length>2000 || s.compositions.some(function(c){return !record(c) || !Number.isSafeInteger(c.id) || c.id<1 || typeof c.name!=="string" || c.name.length>32768 || c.time!==undefined && (!Number.isFinite(c.time) || c.time<0);})))
             throw error("invalid_host_result","Invalid composition list");
         self.state.compositions=s.compositions || [];
         if(s.uncertain) { self.mark(true); throw error("outcome_uncertain","Host requires recovery"); }

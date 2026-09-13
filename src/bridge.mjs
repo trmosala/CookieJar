@@ -17,7 +17,7 @@ const CAPTURE_BYTES = 7 * 1024 * 1024
 const panelActions = {
   checkpoints: [], "checkpoint.pin": ["id", "pinned"], "checkpoint.delete": ["id"],
   "checkpoint.restore.propose": ["id"], "checkpoint.restore.confirm": ["token"],
-  renders: [], diagnostics: [],
+  renders: [], diagnostics: [], "frame.capture": ["compId", "time"],
 }
 
 function schema(value, required, optional = []) {
@@ -751,7 +751,7 @@ async function startBridge({
     }
     if (endpoint === "/chat") {
       schema(body, ["action", "project"], ["text", "requestId", "compId", "directory", "permissionId", "response", "takeover", "attachments", "model", "before", "skill", "draft", "token", "sessionID", "expectedSessionID", "search", "offset", "title"])
-      if (!["state", "history", "send", "new", "stop", "permission", "models", "model", "checkpoints", "bind", "skills", "skillReview", "skillSave", "conversations", "reopen", "rename"].includes(body.action)) fail("invalid_payload", "Unknown chat action")
+      if (!["state", "history", "send", "new", "stop", "permission", "models", "model", "checkpoints", "bind", "captureBind", "skills", "skillReview", "skillSave", "conversations", "reopen", "rename"].includes(body.action)) fail("invalid_payload", "Unknown chat action")
       const expected = project(body.project), credentialHash = credential.hash
       const check = () => {
         if (live.get(c.id) !== c || !c.connected || credential.hash !== credentialHash || !sameProject(c.project, expected))

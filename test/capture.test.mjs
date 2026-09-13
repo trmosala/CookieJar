@@ -5,9 +5,36 @@ import { createWorkflow } from "../src/workflow.mjs"
 import { createCheckpoints, createGrants } from "../src/storage.mjs"
 import { panelFixture, simulatedHost } from "./bridge-panel.mjs"
 import { hostDouble } from "./workflow-host.mjs"
+import { createRuntime } from "../src/plugin.mjs"
 
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLttAAAAABJRU5ErkJggg=="
 const result = () => ({ mime: "image/png", data: png, width: 1, height: 1 })
+
+test("authenticated panel capture uses the guarded pipeline and returns only the exact alpha frame", async t => {
+  const cleanup = []
+  const p = await panelFixture({ after: close => cleanup.push(close) })
+  p.state.items = [{ id: 1, kind: "comp", name: "Frame", duration: 2, frameRate: 25 }]
+  Object.assign(p.state, { revision: 1, projectEpoch: "panel-capture", aeVersion: "26.0", fingerprint: "capture", nextCursor: null })
+  const runtime = await createRuntime({ factories: { bridge: async () => p.bridge, renderer: async () => ({ list: async () => [], close: async () => {} }) } })
+  t.after(async () => { await p.stop(); await runtime.close(); for (const close of cleanup) await close() })
+  let count = 0
+  await p.start(async command => {
+    if (command.method !== "capture") return simulatedHost(command, p)
+    count++
+    assert.equal(command.params.compId, 1);assert.equal(command.params.time, 0.4);assert.equal(command.params.alpha, true)
+    assert.equal(p.bridge.binding("session", { allowLocked: true }).lock.state, "executing")
+    return result()
+  })
+  const image = await p.send("/panel", { action: "frame.capture", compId: 1, time: 0.4 })
+  assert.equal(image.status, 200);assert.equal(image.body.result.time, 0.4)
+  assert.equal(image.body.result.attachment.mime, "image/png")
+  assert.equal(p.bridge.binding("session").lock, null)
+  const missing = await p.send("/panel", { action: "frame.capture", compId: 99, time: 0.4 })
+  assert.equal(missing.status, 400);assert.equal(count, 1)
+  await p.bridge.lock("session", { kind: "test" })
+  const locked = await p.send("/panel", { action: "frame.capture", compId: 1, time: 0.4 })
+  assert.notEqual(locked.status, 200);assert.equal(count, 1)
+})
 
 test("capture attachment validates actual PNG/JPEG headers, canonical base64, dimensions and alpha", () => {
   assert.deepEqual(imageAttachment(result()), { type: "file", mime: "image/png", url: "data:image/png;base64," + png, filename: "ae-frame.png" })

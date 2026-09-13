@@ -35,6 +35,61 @@ function fixture(saved = new Map()) {
   el('chat-input').value='Describe this';el('chat-input').events.input()
   return {el,chat,client,readers,calls,tick,drop,finish,messages,panelCalls,set skills(v){skills=v},set skillDirectory(v){skillDirectory=v},set sessionID(v){sessionID=v},set failSkillSave(v){failSkillSave=v},set checkpointList(v){checkpointList=v},set failRestore(v){failRestore=v},get restores(){return restores},refresh:()=>refresh(),releaseState:()=>releaseState(),set holdState(v){holdState=v},set failSend(v){failSend=v},set failModel(v){failModel=v},set status(v){status=v}}
 }
+test('composer capture freezes the pinned composition and time, previews alpha, removes and submits a file part',async()=>{
+  const f=fixture();await f.tick()
+  const state={...f.client.state,project:{id:'one',path:'one.aep',saved:true},compositions:[{id:1,name:'Main',time:0.5},{id:2,name:'Pinned',time:1.25}]}
+  f.client.state=state;f.chat.update(state);f.el('chat-comp').value='2';f.el('chat-comp').events.change()
+  let finish
+  f.client.panel=async(action,args)=>{f.panelCalls.push({action,args});return new Promise(resolve=>{finish=()=>resolve({compId:args.compId,time:args.time,attachment:{mime:'image/png',url:'data:image/png;base64,AAAA'}})})}
+  f.el('chat-capture').click();await f.tick()
+  assert.equal(f.panelCalls[0].action,'frame.capture')
+  assert.equal(f.panelCalls[0].args.compId,2);assert.equal(f.panelCalls[0].args.time,1.25)
+  assert.equal(f.el('chat-send').disabled,true)
+  f.chat.update({...state,activeCompId:1,compositions:[{id:1,name:'Main',time:1},{id:2,name:'Pinned',time:2}]})
+  finish();await f.tick()
+  assert.match(f.el('chat-attachments').textContent,/Pinned \(#2\).*1.250s.*alpha/)
+  f.el('chat-attachments').children[0].children.at(-1).click()
+  assert.equal(f.el('chat-attachments').children.length,0)
+  f.el('chat-capture').click();await f.tick();finish();await f.tick()
+  f.el('chat-input').value='Use this frame';f.el('chat-input').events.input();f.el('chat-form').events.submit({preventDefault(){}});await f.tick()
+  const sent=f.calls.find(c=>c.action==='send')
+  assert.equal(sent.attachments[0].mime,'image/png');assert.match(sent.attachments[0].filename,/ae-comp-2-at-2s/)
+})
+
+test('capture discards project changes, respects attachment count and blocks uncertain retries',async()=>{
+  const f=fixture();await f.tick()
+  const state={...f.client.state,project:{id:'one',path:'one.aep',saved:true},compositions:[{id:1,name:'Main',time:0}]}
+  f.client.state=state;f.chat.update(state)
+  let finish,captures=0
+  f.client.panel=async()=>{captures++;return new Promise(resolve=>{finish=()=>resolve({compId:1,time:0,attachment:{mime:'image/png',url:'data:image/png;base64,AAAA'}})})}
+  f.el('chat-capture').click();await f.tick()
+  const next={...state,project:{id:'two',path:'two.aep',saved:true}}
+  f.client.state=next;f.chat.update(next);finish();await f.tick()
+  assert.equal(f.el('chat-attachments').children.length,0)
+  for(let i=0;i<4;i++){f.drop('ref'+i+'.png');f.finish(f.readers[i])}
+  assert.equal(f.el('chat-capture').disabled,true)
+  f.el('chat-capture').click();assert.equal(captures,1)
+  f.el('chat-attachments').children[0].children.at(-1).click()
+  f.client.panel=async()=>{captures++;throw {code:'capture_timeout',message:'Native frame still pending'}}
+  f.el('chat-capture').click();await f.tick()
+  assert.equal(f.client.state.uncertain,true);assert.equal(f.el('chat-capture').disabled,true)
+  assert.match(f.el('chat-error').textContent,/No automatic retry/)
+  f.el('chat-capture').click();assert.equal(captures,2)
+})
+
+test('captured frames share the remaining byte budget with uploaded references',async()=>{
+  const f=fixture();await f.tick()
+  const state={...f.client.state,project:{id:'one',path:'one.aep',saved:true},compositions:[{id:1,name:'Main',time:0}]}
+  f.client.state=state;f.chat.update(state)
+  f.drop('large.png',2*1024*1024-2);f.finish(f.readers[0])
+  f.client.panel=async()=>({compId:1,time:0,attachment:{mime:'image/png',url:'data:image/png;base64,AAAA'}})
+  f.el('chat-capture').click();await f.tick()
+  assert.equal(f.el('chat-attachments').children.length,1)
+  assert.match(f.el('chat-error').textContent,/remaining attachment limit/)
+  assert.equal(f.client.state.uncertain,undefined)
+  assert.equal(f.el('chat-capture').disabled,false)
+})
+
 test('skill picker searches and clears on workspace, session and project changes',async()=>{
   const f=fixture();await f.tick()
   f.skills=[{name:'brand-motion',description:'Logo easing',source:'b'.repeat(64),revision:'c'.repeat(64)},{name:'titles',description:'Text',source:'d'.repeat(64),revision:'e'.repeat(64)}]

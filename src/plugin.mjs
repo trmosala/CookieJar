@@ -599,11 +599,22 @@ async function panel(r, input) {
   const schemas = {
     checkpoints: {}, "checkpoint.pin": { id: text, pinned: z.boolean() }, "checkpoint.delete": { id: text },
     "checkpoint.restore.propose": { id: text }, "checkpoint.restore.confirm": { token: text },
-    renders: {}, diagnostics: {},
+    renders: {}, diagnostics: {}, "frame.capture": { compId: captureArgs.compId, time: captureArgs.time },
   }
   if (!Object.hasOwn(schemas, body?.action)) fail("invalid_payload", "Unknown panel action")
   const a = z.object({ action: z.literal(body.action), ...schemas[body.action] }).strict().parse(body)
   const consent = async () => { current(r, c, b); return true }
+  if (a.action === "frame.capture") {
+    await r.chat?.assertRestorable(sessionID)
+    current(r, c, b, { write: true })
+    // The explicit panel click approves only this frozen composition/time.
+    // Reuse the tool's capture guards, lock, PNG validation and uncertainty path.
+    const result = await capture(r, sessionID, { compId: a.compId, time: a.time, alpha: true, maxWidth: 1200 }, consent, c.check)
+    const attachment = result.attachments[0]
+    if (Buffer.from(attachment.url.slice(attachment.url.indexOf(",") + 1), "base64").length > 2 * 1024 * 1024)
+      fail("payload_too_large", "Captured frame exceeds the 2 MB attachment limit. Nothing was attached")
+    return { attachment, ...JSON.parse(result.output) }
+  }
   if (a.action === "checkpoints") return (await checkpointList(r, c)).map(record => ({
     id: record.id, createdAt: Date.parse(record.createdAt), pinned: record.pinned, storageMode: record.storageMode, size: record.size,
   }))
