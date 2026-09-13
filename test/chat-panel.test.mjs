@@ -262,6 +262,24 @@ test('unsupported and oversized files are rejected, uncertain delivery cannot re
 })
 
 
+test('attachment dialogs wait for host polling and prevent new scripts until closed',async()=>{
+  const {default:transport}=await import('../panel/transport.cjs')
+  let calls=0
+  const host={pending:true,call(){calls++;return Promise.reject(new Error('Script ran during modal'))}}
+  const client=new transport.Client({host,store:{state:{}},changed(){}})
+  let opened=false
+  const requests=[]
+  client.state.connection='connected'
+  client.send=async(path,body)=>{requests.push({path,body});return {binding:null,lock:null}}
+  const ready=client.beginFileDialog().then(()=>{opened=true})
+  await client.tick();assert.equal(calls,0);assert.equal(opened,false)
+  host.pending=false;await ready
+  assert.equal(opened,true);await client.tick();assert.equal(calls,0)
+  assert.equal(requests.length,1);assert.equal(requests[0].path,'/heartbeat');assert.equal(requests[0].body.busy,true)
+  await assert.rejects(client.status(),{code:'host_busy'});assert.equal(calls,0)
+  client.endFileDialog();assert.equal(client.fileDialogOpen,false)
+})
+
 test('AE file dialogs defer read-only status without creating uncertain edits or repeated calls',async()=>{
   const {default:transport}=await import('../panel/transport.cjs')
   let callback,calls=0,late

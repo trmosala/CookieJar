@@ -648,6 +648,7 @@ Client.prototype.management=function(endpoint){
 };
 Client.prototype.status=function(){
     var self=this;
+    if(self.fileDialogOpen)return Promise.reject(error("host_busy","Close the attachment picker before host access"));
     if(self.recovering)return Promise.reject(error("host_busy","Credential recovery is outstanding"));
     if(self.state.connection==="incompatible")return Promise.reject(error("incompatible_version","Host access is stopped until versions match"));
     return self.host.call("status",{}).then(function(s){
@@ -665,7 +666,7 @@ Client.prototype.status=function(){
 };
 Client.prototype.heartbeat=function(){
     var self=this;
-    return self.send("/heartbeat",{project:self.state.project,activeCompId:self.state.activeCompId,capabilities:self.state.capabilities,busy:self.state.busy || self.state.uncertain}).then(function(r){
+    return self.send("/heartbeat",{project:self.state.project,activeCompId:self.state.activeCompId,capabilities:self.state.capabilities,busy:self.state.busy || self.state.uncertain || !!self.fileDialogOpen}).then(function(r){
         if(!record(r) || !Object.prototype.hasOwnProperty.call(r,"binding") || !Object.prototype.hasOwnProperty.call(r,"lock") || !(r.binding=== null || record(r.binding)) || !(r.lock=== null || record(r.lock)))throw error("invalid_response","Malformed heartbeat");
         self.state.binding=r.binding;self.state.lock=r.lock;self.emit();return r;
     });
@@ -749,8 +750,27 @@ Client.prototype.command=function(cmd){
         throw e;
     });
 };
+Client.prototype.beginFileDialog=function(){
+    var self=this;
+    if(self.fileDialogPending || self.fileDialogOpen || self.state.busy || self.state.uncertain || self.panelPending)return Promise.reject(error("host_busy","Wait for active work before browsing files"));
+    self.fileDialogPending=true;
+    return new Promise(function(resolve,reject){
+        var started=Date.now();
+        function ready(){
+            if(self.inFlight || self.host.pending){
+                if(Date.now()-started>30000){self.fileDialogPending=false;reject(error("host_busy","Host work is still pending. Try browsing again when AE is ready."));return;}
+                setTimeout(ready,50);return;
+            }
+            self.fileDialogPending=false;self.fileDialogOpen=true;resolve();
+        }
+        ready();
+    });
+};
+Client.prototype.endFileDialog=function(){this.fileDialogOpen=false;};
 Client.prototype.tick=function(){
     var self=this;
+    if(self.fileDialogPending)return Promise.resolve();
+    if(self.fileDialogOpen)return self.state.connection==="connected" ? self.heartbeat().catch(function(){}) : Promise.resolve();
     if(self.inFlight || self.host.pending || self.state.uncertain || self.state.connection==="incompatible")return Promise.resolve();
     self.inFlight=true;
     return Promise.resolve().then(function(){

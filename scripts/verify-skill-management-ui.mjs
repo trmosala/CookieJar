@@ -34,6 +34,7 @@ try {
   for(const width of [320,360,700]){
     await page.setViewportSize({width,height:700})
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true)
+    assert.equal(await page.evaluate(()=>document.getElementById('chat-form').getBoundingClientRect().bottom<=innerHeight),true,'Composer stays inside the panel with the manager open')
     await page.screenshot({path:'coverage/skill-manager-'+width+'.png'})
   }
   await page.getByRole('button',{name:'Copy skill',exact:true}).click()

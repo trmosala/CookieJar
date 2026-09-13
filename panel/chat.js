@@ -52,7 +52,7 @@
                 if(g!==generation || !manager)return;
                 el("skill-manager-status").textContent=(value.deleted ? "Deleted." : "Saved.")+" Backup: "+value.backup;
                 manager.editable=false;manager.content=value.content;manager.document=value.document;skillChoice=null;refreshSkills();
-            }).catch(function(e){if(g===generation && manager){manager.editable=false;el("skill-manager-status").textContent=e.message+" Close and refresh before trying again.";}}).then(function(){managerBusy=false;controls();});
+            }).catch(function(e){if(g===generation && manager){manager.editable=false;el("skill-manager-status").textContent=e.message+" Close and refresh before trying again.";}}).then(function(){managerBusy=false;controls();if(g===generation && manager)el("skill-manager-close").focus();});
         });
         el("skill-manager-copy").addEventListener("click",function(){
             if(!manager || managerBusy || manager.content===undefined)return;
@@ -521,7 +521,22 @@
             });
             drawAttachments();controls();
         }
-        el("chat-attach").addEventListener("click",function(){el("chat-files").click();});
+        var browsingFiles=false;
+        function endBrowse(){if(!browsingFiles)return;browsingFiles=false;if(client.endFileDialog)client.endFileDialog();controls();}
+        el("chat-attach").addEventListener("click",function(){
+            if(browsingFiles || el("chat-attach").disabled)return;
+            browsingFiles=true;
+            var ready=client.beginFileDialog ? client.beginFileDialog() : Promise.resolve();
+            ready.then(function(){el("chat-files").click();}).catch(function(e){endBrowse();error(e);});
+        });
+        // Chromium 99 does not emit the file-input cancel event. Window focus is
+        // the fallback for cancellation; defer until the modal has finished closing.
+        window.addEventListener("focus",function(){if(browsingFiles)setTimeout(endBrowse,300);});
+        // CEP may keep its window focused when Cancel closes the native picker.
+        // Input delivered to the panel proves that the blocking dialog has closed.
+        window.addEventListener("pointerdown",endBrowse);
+        window.addEventListener("keydown",endBrowse);
+        el("chat-files").addEventListener("cancel",endBrowse);
         el("chat-capture").addEventListener("click",function(){
             if(el("chat-capture").disabled)return;
             var comp=(state.compositions || []).filter(function(c){return c.id===selected();})[0];
@@ -551,7 +566,7 @@
                 }else error(e);
             }).then(function(){capturing=false;controls();refresh();});
         });
-        el("chat-files").addEventListener("change",function(){addFiles(this.files);this.value="";});
+        el("chat-files").addEventListener("change",function(){endBrowse();addFiles(this.files);this.value="";});
         el("chat-form").addEventListener("dragover",function(e){e.preventDefault();});
         el("chat-form").addEventListener("drop",function(e){e.preventDefault();if(e.dataTransfer)addFiles(e.dataTransfer.files);});
         el("chat-input").addEventListener("paste",function(e){
@@ -682,7 +697,7 @@
             controls();
         }
         function refresh() {
-            if(polling || capturing || conversationSwitching || modelSaving || restoreWorking || state.connection!=="connected" || !state.project)return Promise.resolve();
+            if(polling || browsingFiles || capturing || conversationSwitching || modelSaving || restoreWorking || state.connection!=="connected" || !state.project)return Promise.resolve();
             polling=true;var g=generation, revision=modelRevision;
             return request("state").then(function(data){if(g===generation && revision===modelRevision){if(el("chat-error").textContent===refreshError)el("chat-error").textContent="";refreshError="";draw(data);return Promise.all([Date.now()-catalogAt>15000 ? refreshModels() : null,Date.now()-checkpointAt>10000 ? refreshCheckpoints() : null]);}}).catch(function(e){if(g===generation){messagesKey="";error(e);refreshError=el("chat-error").textContent;}}).then(function(){polling=false;});
         }

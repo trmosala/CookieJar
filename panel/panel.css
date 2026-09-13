@@ -274,6 +274,6 @@ header { display:grid; grid-template-columns:28px minmax(0,1fr) auto; gap:10px; 
 @media(max-height:460px) { .header-composition { padding:5px 0; } #chat-selected-layers { max-height:1.5em; } #chat-input { min-height:40px; height:40px; } #chat-form { min-height:85px; } }
 @media(max-width:340px) { .chat-model-controls { order:-1; flex-basis:100%; } }
 
-#skill-manager { max-height:55vh; overflow:auto; flex-shrink:0; }
+#skill-manager { max-height:55vh; min-height:0; overflow:auto; flex-shrink:1; }
 #skill-manager input,#skill-manager textarea { width:100%; box-sizing:border-box; }
 #skill-manager-location { overflow-wrap:anywhere; }
