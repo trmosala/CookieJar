@@ -657,6 +657,8 @@ Client.prototype.status=function(){
         if(s.compositions!==undefined && (!Array.isArray(s.compositions) || s.compositions.length>2000 || s.compositions.some(function(c){return !record(c) || !Number.isSafeInteger(c.id) || c.id<1 || typeof c.name!=="string" || c.name.length>32768 || c.time!==undefined && (!Number.isFinite(c.time) || c.time<0);})))
             throw error("invalid_host_result","Invalid composition list");
         self.state.compositions=s.compositions || [];
+        if(s.selectedLayers!==undefined && (!Array.isArray(s.selectedLayers) || s.selectedLayers.length>100 || s.selectedLayers.some(function(l){return !record(l) || !Number.isSafeInteger(l.compId) || l.compId<1 || !Number.isSafeInteger(l.layerId) || l.layerId<1 || typeof l.name!=="string" || l.name.length>4096;})))throw error("invalid_host_result","Invalid selected layer context");
+        self.state.selectedLayers=s.selectedLayers || [];
         if(s.uncertain) { self.mark(true); throw error("outcome_uncertain","Host requires recovery"); }
         self.emit();return s;
     });

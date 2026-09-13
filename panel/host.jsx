@@ -1097,7 +1097,9 @@ var CookieMonsterAE = (function () {
                     var composition=app.project.item(ci);
                     if(composition instanceof CompItem)compositions.push({id:composition.id,name:composition.name,time:composition.time});
                 }
-                result={project:project(),activeCompId:currentComp ? currentComp.id : null,compositions:compositions,
+                var selectedLayers=[], sl=currentComp ? currentComp.selectedLayers || [] : [];
+                for(ci=0;ci<sl.length && ci<100;ci++)selectedLayers.push({compId:currentComp.id,layerId:sl[ci].id,name:String(sl[ci].name).slice(0,4096)});
+                result={project:project(),activeCompId:currentComp ? currentComp.id : null,compositions:compositions,selectedLayers:selectedLayers,
                     aeVersion:String(app.version),capabilities:capability(),busy:busy,uncertain:uncertain};
             }
             else if(request.method==="inspect"){

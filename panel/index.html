@@ -25,6 +25,7 @@
 <label class="sr-only" for="chat-comp">Composition</label>
 <select id="chat-comp" aria-describedby="chat-target"><option value="follow">Follow active composition</option></select>
 <p id="chat-target">Following active composition</p>
+<p id="chat-selected-layers" aria-live="polite"></p>
 </div>
 <div class="header-controls"><span id="connection-status" class="is-disconnected" role="status">Not connected</span><details id="advanced"><summary id="settings-toggle" aria-label="Settings and troubleshooting" title="Settings &amp; troubleshooting">☰</summary><div class="advanced-content" role="dialog" aria-modal="true" aria-labelledby="settings-title">
 <aside class="settings-sidebar">
@@ -293,6 +294,14 @@
 </section>
 
 <form id="chat-form">
+<section id="chat-target-picker" role="dialog" aria-modal="true" aria-label="Composition and layer references" hidden>
+<div class="chat-heading"><h2>Reference a composition or layer</h2><button id="target-close" type="button" aria-label="Close references">×</button></div>
+<label for="target-scope">Search in</label><select id="target-scope"></select>
+<label for="target-search">Name or ID</label><input id="target-search" type="search" maxlength="256">
+<button id="target-find" type="button">Search</button><p id="target-status" role="status"></p><div id="target-results"></div>
+<button id="target-next" type="button" disabled>Next page</button>
+</section>
+<div id="chat-references" aria-live="polite"></div>
 <details id="chat-skills"><summary>Skills</summary>
 <label for="chat-skill-search">Search skills</label><input id="chat-skill-search" type="search" maxlength="256" placeholder="Name or description">
 <select id="chat-skill-picker" aria-label="Reusable skill"><option value="">No skill selected</option></select>

@@ -214,3 +214,8 @@ a { color:#b5c6df; overflow-wrap:anywhere; }
 :root[data-density="compact"] .chat-message { margin-bottom:12px; padding-top:4px; padding-bottom:4px; }
 :root[data-density="compact"] .settings-card { padding:10px; }
 :root[data-density="compact"] header { padding-top:8px; padding-bottom:8px; }
+#chat-selected-layers { font-size:11px; max-height:3em; overflow:hidden; margin:2px 0; }
+#chat-target-picker { position:absolute; inset:8px; z-index:5; background:var(--surface); border:1px solid var(--border); padding:12px; overflow:auto; }
+#target-results button { display:block; width:100%; white-space:normal; text-align:left; margin:6px 0; overflow-wrap:anywhere; }
+#target-scope,#target-search { width:100%; min-width:0; margin-bottom:8px; }
+#chat-references { max-height:120px; overflow:auto; }

@@ -13,6 +13,33 @@
         var conversationLoading=false, conversationSwitching=false, conversationEpoch=0, conversationOffset=0,
             conversationNext=null, conversationRows=[], renameConversation=null;
         var capturing=false;
+        var references=[],targetEpoch=0,targetCursor=null,targetLoading=false;
+        function drawReferences(){var box=el("chat-references");box.textContent="";references.forEach(function(ref){var row=node("div",ref.compName+" (#"+ref.compId+")"+(ref.layerId===null?"":" / "+ref.name+" (#"+ref.layerId+")"),"chat-reference");var remove=node("button","×");remove.type="button";remove.setAttribute("aria-label","Remove reference "+ref.name);remove.disabled=sending || deliveryUnknown;remove.addEventListener("click",function(){references=references.filter(function(r){return r!==ref;});drawReferences();});row.appendChild(remove);box.appendChild(row);});}
+        function closeTargets(){targetEpoch++;targetLoading=false;el("chat-target-picker").hidden=true;el("chat-mention").focus();}
+        function findTargets(cursor){
+            if(targetLoading)return;
+            var g=generation,turn=++targetEpoch,scope=el("target-scope").value;
+            targetLoading=true;el("target-status").textContent="Searching…";el("target-next").disabled=true;
+            request("targets",{compId:scope==="comps"?null:Number(scope),search:el("target-search").value,cursor:cursor || null,directory:el("chat-workspace").value || undefined}).then(function(data){
+                if(g!==generation || turn!==targetEpoch)return;
+                if(data.sessionID){if(!snapshot)snapshot={status:"idle"};snapshot.sessionID=data.sessionID;}
+                targetCursor=data.nextCursor;var box=el("target-results");box.textContent="";
+                data.targets.forEach(function(ref){var b=node("button",ref.name+" (#"+(ref.layerId || ref.compId)+")"+(ref.layerId?" in "+ref.compName+" (#"+ref.compId+")":"")+(ref.selected?" · Selected in AE":""));b.type="button";b.addEventListener("click",function(){
+                    if(references.length>=8){el("target-status").textContent="Up to eight references. Remove one first.";return;}
+                    if(!references.some(function(r){return r.compId===ref.compId&&r.layerId===ref.layerId;}))references.push({compId:ref.compId,layerId:ref.layerId,compName:ref.compName,name:ref.name,projectEpoch:ref.projectEpoch});drawReferences();closeTargets();el("chat-input").focus();
+                });box.appendChild(b);});
+                el("target-status").textContent=(data.targets.length ? data.targets.length+" matches. " : "No matches on this page. ")+data.note;
+                el("target-next").disabled=!targetCursor;
+            }).catch(function(e){if(g===generation&&turn===targetEpoch)el("target-status").textContent=(e.code || "search_failed")+": "+e.message;}).then(function(){if(turn===targetEpoch)targetLoading=false;});
+        }
+        el("target-find").addEventListener("click",function(){findTargets(null);});
+        function invalidateTargets(){targetEpoch++;targetLoading=false;targetCursor=null;el("target-results").textContent="";el("target-next").disabled=true;el("target-status").textContent="Search to refresh this scope.";}
+        el("target-scope").addEventListener("change",invalidateTargets);
+        el("target-search").addEventListener("input",invalidateTargets);
+        el("target-next").addEventListener("click",function(){findTargets(targetCursor);});
+        el("target-close").addEventListener("click",closeTargets);
+        el("target-search").addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();findTargets(null);}});
+        el("chat-target-picker").addEventListener("keydown",function(e){if(e.key==="Escape"){e.preventDefault();closeTargets();}if(e.key==="Tab" && this.querySelectorAll){var focus=Array.prototype.slice.call(this.querySelectorAll('button:not(:disabled),input,select'));if(focus.length && e.shiftKey && document.activeElement===focus[0]){e.preventDefault();focus[focus.length-1].focus();}else if(focus.length&&!e.shiftKey&&document.activeElement===focus[focus.length-1]){e.preventDefault();focus[0].focus();}}});
         function switchBlocked() {
             return state.connection!=="connected" || client.renderWorking || capturing || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview ||
                 conversationSwitching || deliveryUnknown || !!client.panelPending || state.busy || state.uncertain || !!state.lock ||
@@ -192,6 +219,9 @@
         }
         function error(e) { el("chat-error").textContent=(e.code ? e.code+": " : "")+(e.message || String(e)); }
         function controls() {
+            var selectedLayers=state.selectedLayers || [];
+            el("chat-selected-layers").hidden=!selectedLayers.length;
+            el("chat-selected-layers").textContent=selectedLayers.length ? "Selected in AE: "+selectedLayers.slice(0,3).map(function(l){return l.name+" (#"+l.layerId+")";}).join(", ")+(selectedLayers.length>3?" +"+(selectedLayers.length-3):"")+" · Use @ to reference" : "";
             var connected=state.connection==="connected", busy=client.renderWorking || capturing || conversationSwitching || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
             var frame=(state.compositions || []).filter(function(c){return c.id===selected();})[0];
             el("chat-capture").disabled=!!switchBlocked() || attachments.length>=4 || attachments.some(function(a){return !a.url;}) || !state.project || !state.project.saved || !frame || typeof frame.time!=="number" || !isFinite(frame.time) || frame.time<0;
@@ -230,7 +260,7 @@
         }
         function request(action, extra) {
             var g=generation, project=JSON.parse(projectIdentity(state)),descriptor=client.descriptor, credential=store.state.credential;
-            var expected=["send","new","reopen","rename","model","bind","captureBind","history","stop","permission"].indexOf(action)>=0 ? {expectedSessionID:snapshot && snapshot.sessionID || null} : {};
+            var expected=["send","new","reopen","rename","model","bind","captureBind","targets","history","stop","permission"].indexOf(action)>=0 ? {expectedSessionID:snapshot && snapshot.sessionID || null} : {};
             return api.request(descriptor,credential,"/chat",Object.assign({action:action,project:project},expected,extra || {}),30000).then(function(r){
                 if(g!==generation || descriptor!==client.descriptor || credential!==store.state.credential)throw {code:"stale_project",message:"Project changed; response belongs to the previous conversation"};
                 if(!r || !r.result || typeof r.result!=="object")throw {code:"invalid_response",message:"Invalid chat response"};
@@ -441,7 +471,7 @@
             snapshot=data;
             el("chat-title").textContent=data.title || "";
             if(collapseSession!==data.sessionID && data.targetCompId!==undefined)applyTarget(data.targetCompId);
-            if(collapseSession!==data.sessionID){collapseSession=data.sessionID;loadCollapse();messagesKey="";historyMessages=[];historyLoaded=false;historyCursor=null;}
+            if(collapseSession!==data.sessionID){if(collapseSession){references=[];drawReferences();closeTargets();}collapseSession=data.sessionID;loadCollapse();messagesKey="";historyMessages=[];historyLoaded=false;historyCursor=null;}
             if(!historyLoaded)historyCursor=data.nextCursor || null;
             var combined=historyMessages.concat(data.messages || []),seen={},merged=[];
             for(var mi=combined.length-1;mi>=0;mi--){var msg=combined[mi];if(msg.id && seen["id:"+msg.id])continue;if(msg.id)seen["id:"+msg.id]=true;merged.unshift(msg);}
@@ -562,13 +592,13 @@
         el("chat-form").addEventListener("submit",function(e){
             e.preventDefault();if(el("chat-send").disabled)return;
             var text=el("chat-input").value.trim(),g=generation;
-            sending=true;drawAttachments();el("chat-error").textContent="";controls();
-            request("send",{text:text,skill:skillChoice && skillContext ? {name:skillChoice.name,source:skillChoice.source,revision:skillChoice.revision,directory:skillContext.directory,sessionID:skillContext.sessionID} : undefined,attachments:attachments.map(function(a){return {filename:a.filename,mime:a.mime,url:a.url};}),requestId:api.requestId(),compId:selected(),directory:el("chat-workspace").value || undefined,takeover:takeover}).then(function(data){
+            sending=true;drawReferences();drawAttachments();el("chat-error").textContent="";controls();
+            request("send",{text:text,references:references.map(function(r){return Object.assign({},r);}),skill:skillChoice && skillContext ? {name:skillChoice.name,source:skillChoice.source,revision:skillChoice.revision,directory:skillContext.directory,sessionID:skillContext.sessionID} : undefined,attachments:attachments.map(function(a){return {filename:a.filename,mime:a.mime,url:a.url};}),requestId:api.requestId(),compId:selected(),directory:el("chat-workspace").value || undefined,takeover:takeover}).then(function(data){
                 if(g!==generation)return;
                 if(data.delivery!=="accepted"){deliveryUnknown=true;throw {code:"delivery_unknown",message:"Delivery is uncertain. Check the conversation before resending."};}
-                el("chat-input").value="";attachments=[];drawAttachments();takeover=false;
+                el("chat-input").value="";references=[];drawReferences();attachments=[];drawAttachments();takeover=false;
                 return refresh();
-            }).catch(function(e){if(g===generation){if(!e.code || ["timeout","disconnected","invalid_response","ECONNRESET","ETIMEDOUT"].indexOf(e.code)>=0){deliveryUnknown=true;error({message:"Delivery is uncertain. Check this conversation in CookieMonster before starting a new chat."});}else error(e);}}).then(function(){sending=false;drawAttachments();controls();});
+            }).catch(function(e){if(g===generation){if(!e.code || ["timeout","disconnected","invalid_response","ECONNRESET","ETIMEDOUT"].indexOf(e.code)>=0){deliveryUnknown=true;error({message:"Delivery is uncertain. Check this conversation in CookieMonster before starting a new chat."});}else error(e);}}).then(function(){sending=false;drawReferences();drawAttachments();controls();});
         });
         el("chat-input").addEventListener("input",controls);
         var composing=false;
@@ -581,7 +611,7 @@
             if(key.length<=256){delete saved[key];saved[key]=el("chat-comp").value;Object.keys(saved).slice(0,-20).forEach(function(k){delete saved[k];});store.save();}
             controls();
         });
-        el("chat-mention").addEventListener("click",function(){if(selected()){el("chat-input").value+="@"+label()+" ";el("chat-input").focus();controls();}});
+        el("chat-mention").addEventListener("click",function(){if(switchBlocked())return;var select=el("target-scope");select.textContent="";var all=node("option","Compositions");all.value="comps";select.appendChild(all);(state.compositions || []).forEach(function(c){var o=node("option","Layers in "+c.name+" (#"+c.id+")");o.value=String(c.id);select.appendChild(o);});el("chat-target-picker").hidden=false;el("target-search").focus();findTargets(null);});
         el("chat-takeover").addEventListener("click",function(){takeover=!takeover;controls();});
         el("chat-stop").addEventListener("click",function(){request("stop").then(refresh,error);});
         el("chat-new").addEventListener("click",function(){
@@ -592,6 +622,7 @@
             if(restoreReview && restoreReview!==client.restoreApproval)cancelRestore();
             if(s.connection!=="connected")el("chat-progress").textContent="Connecting to CookieMonster…";
             if(key!==projectKey) {
+                references=[];drawReferences();closeTargets();
                 conversationEpoch++;conversationLoading=false;conversationSwitching=false;conversationRows=[];el("chat-conversations").hidden=true;el("chat-conversations-list").textContent="";el("chat-title").textContent="";
                 clearSkills();el("chat-workspace").value="";el("chat-workspace").workspaceKey="";projectKey=key;generation++;attachments=[];deliveryUnknown=false;drawAttachments();snapshot=null;takeover=false;messagesKey="";approvalsKey="";compKey="";serverError="";collapseState={};collapseSession="";
                 catalog=[];catalogKey="";catalogAt=0;modelError="";drawModels();

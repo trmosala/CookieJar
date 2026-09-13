@@ -37,6 +37,20 @@ async function fixture(t) {
   }
   return { p, chat, runtime, client, catalog, selections, calls, inputs, messages, statuses, sessions, send, set admitted(fn) { admitted = fn } }
 }
+test("target search and reference submission use fixed server-validated IDs without prompt replay",async t=>{
+  const f=await fixture(t)
+  let layerName="Title"
+  f.runtime.workflow.inspectQuery=async()=>({projectEpoch:"e",revision:1,items:[{id:1,kind:"comp",name:"Main",layers:[{id:5,name:layerName}]}],nextCursor:null})
+  const found=await f.send({action:"targets",compId:1,search:"Title",cursor:null})
+  assert.equal(found.targets[0].layerId,5);assert.equal(f.inputs.length,0)
+  const {selected,...ref}=found.targets[0]
+  const sent=await f.send({...message({compId:1}),references:[ref]})
+  assert.equal(sent.delivery,"accepted");assert.match(f.inputs[0].body.system,/"layerId":5/)
+  layerName="Renamed"
+  await assert.rejects(f.send({...message({compId:1,requestId:"b".repeat(40)}),references:[ref]}),{code:"stale_target"})
+  assert.equal(f.inputs.length,1)
+})
+
 test("composer capture binds an idle owned session without submitting a prompt", async t => {
   const f = await fixture(t)
   const first = await f.send({ action: "captureBind", expectedSessionID: null })
