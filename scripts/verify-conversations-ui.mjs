@@ -72,6 +72,7 @@ try {
   // A poll started before switching must not restore the old messages afterwards.
   await page.evaluate(() => { window.holdOld = true })
   await page.waitForFunction(() => typeof window.releaseOld === "function")
+  await page.getByRole("button", { name: "Conversations", exact: true }).click()
   await page.getByRole("button", { name: "New chat", exact: true }).click()
   await page.getByText("History of New conversation", { exact: true }).waitFor()
   await page.evaluate(() => window.releaseOld())

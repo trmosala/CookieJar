@@ -305,9 +305,11 @@ test("panel chat uses CM sessions, fixes the message target, avoids duplicate ad
   assert.equal(f.inputs.length, 1)
   await assert.rejects(f.send(message({ text: "Different" })), { code: "invalid_payload" })
   f.messages.push({ info: { id: "msg_assistant", role: "assistant" }, parts: [{ type: "text", text: "Here is the frame" },
-    { type: "tool", tool: "ae_capture", state: { status: "completed", attachments: [{ url: "data:image/png;base64,AAAA", filename: "frame.png" }] } }] })
+    { type: "tool", tool: "ae_capture", state: { status: "completed", output: JSON.stringify({compId:1,time:2.5}), attachments: [{ url: "data:image/png;base64,AAAA", filename: "frame.png" }] } }] })
   const state = await f.send()
   assert.equal(state.messages[0].parts[2].type, "image")
+  assert.equal(state.messages[0].parts[2].compId, 1)
+  assert.equal(state.messages[0].parts[2].time, 2.5)
   const reopened = await createChat(f.runtime)
   reopened.register({ client: f.client, directory: f.p.dataDir })
   f.p.bridge.setChatHandler(reopened.handle)

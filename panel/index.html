@@ -20,14 +20,14 @@
 
 <main>
 
-<header><div class="brand"><img class="brand-mark" src="brand-dev.png" alt="" aria-hidden="true"><h1>CookieJar-AE</h1><span class="host-label">After Effects</span><h2 id="chat-project-name" class="header-project-name">Opening project…</h2></div>
-<div class="header-composition">
+<header><button id="chat-conversations-open" type="button" class="header-menu" aria-label="Conversations" title="Conversations" aria-expanded="false" aria-controls="chat-conversations">☰</button><div class="brand"><img class="brand-mark" src="brand-dev.png" alt="" aria-hidden="true"><h1>CookieJar-AE</h1><span id="chat-title" title="Current conversation">New conversation</span></div>
+<div class="header-composition"><h2 id="chat-project-name" class="header-project-name">Opening project…</h2>
 <label class="sr-only" for="chat-comp">Composition</label>
 <select id="chat-comp" aria-describedby="chat-target"><option value="follow">Follow active composition</option></select>
 <p id="chat-target">Following active composition</p>
 <p id="chat-selected-layers" aria-live="polite"></p>
 </div>
-<div class="header-controls"><span id="connection-status" class="is-disconnected" role="status">Not connected</span><details id="advanced"><summary id="settings-toggle" aria-label="Settings and troubleshooting" title="Settings &amp; troubleshooting">☰</summary><div class="advanced-content" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+<div class="header-controls"><span id="connection-status" class="is-disconnected" role="status">Not connected</span><details id="advanced"><summary id="settings-toggle" aria-label="Settings and troubleshooting" title="Settings &amp; troubleshooting">⚙</summary><div class="advanced-content" role="dialog" aria-modal="true" aria-labelledby="settings-title">
 <aside class="settings-sidebar">
 <div class="settings-sidebar-heading"><h2 id="settings-title">Settings</h2><button id="settings-close" class="settings-close" type="button" aria-label="Close settings">×</button></div>
 <p class="settings-nav-label">Preferences</p>
@@ -232,10 +232,10 @@
 
 <section class="chat" aria-label="Project chat">
 
-<div class="chat-heading"><span id="chat-title"></span><button id="chat-conversations-open" type="button">Conversations</button><button id="chat-new" type="button">New chat</button></div>
+
 <section id="chat-conversations" role="dialog" aria-modal="true" aria-label="Project conversations" hidden>
-<div class="chat-heading"><h2>Project conversations</h2><button id="chat-conversations-close" type="button" aria-label="Close conversations">×</button></div>
-<label for="chat-conversations-search">Search conversations</label>
+<div class="chat-heading"><h2>Conversations</h2><button id="chat-conversations-close" type="button" aria-label="Close conversations">×</button></div>
+<p id="conversation-project"></p><button id="chat-new" type="button" aria-label="New chat">+ New chat</button><p id="conversation-switch-status" role="status"></p><label for="chat-conversations-search">Search conversations</label>
 <input id="chat-conversations-search" type="search" maxlength="256" placeholder="Search by title">
 <button id="chat-conversations-search-button" type="button">Search</button>
 <p id="chat-conversations-status" role="status"></p>
@@ -302,12 +302,7 @@
 <button id="target-next" type="button" disabled>Next page</button>
 </section>
 <div id="chat-references" aria-live="polite"></div>
-<details id="chat-skills"><summary>Skills</summary>
-<label for="chat-skill-search">Search skills</label><input id="chat-skill-search" type="search" maxlength="256" placeholder="Name or description">
-<select id="chat-skill-picker" aria-label="Reusable skill"><option value="">No skill selected</option></select>
-<button id="chat-skills-refresh" type="button">Refresh skills</button>
-<p id="chat-skill-workspace"></p>
-</details>
+
 <p id="chat-skill-status" role="status"></p>
 
 <label class="sr-only" for="chat-input">Message CookieMonster</label>
@@ -316,11 +311,16 @@
 <input id="chat-files" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf,.txt,.md" multiple hidden>
 <textarea id="chat-input" rows="2" maxlength="16000" placeholder="Ask anything about your composition…"></textarea>
 
-<div class="chat-actions">
+<div class="chat-actions"><details id="chat-skills"><summary title="Reusable skills">Skills⌄</summary><div class="skills-popup">
+<label for="chat-skill-search">Search skills</label><input id="chat-skill-search" type="search" maxlength="256" placeholder="Name or description">
+<select id="chat-skill-picker" aria-label="Reusable skill"><option value="">No skill selected</option></select>
+<button id="chat-skills-refresh" type="button">Refresh skills</button>
+<p id="chat-skill-workspace"></p>
+</div></details>
 <button id="chat-attach" class="composer-icon" type="button" aria-label="Attach references" title="Attach references · Up to 4 files, 2 MB total">+</button>
 <button id="chat-capture" class="composer-icon" type="button" aria-label="Attach current frame" title="Attach current composition frame with alpha">▣</button>
 <div class="chat-model-controls"><span class="composer-model-mark" aria-hidden="true">✧</span><label><span class="sr-only">Model</span><select id="chat-model" title="Model"><option value="">CookieMonster default</option></select></label><label class="composer-reasoning"><span class="sr-only">Reasoning</span><select id="chat-reasoning" title="Reasoning effort"><option value="default">Default</option></select></label></div>
-<button id="chat-mention" class="composer-icon" type="button" aria-label="Mention current composition" title="Mention current composition">@</button>
+<button id="chat-mention" class="composer-icon" type="button" aria-label="Reference a composition or layer" title="Reference a composition or layer">@</button>
 <button id="chat-stop" class="composer-icon" type="button" aria-label="Stop generation" title="Stop generation" disabled>■</button>
 <button id="chat-send" class="composer-icon" type="submit" aria-label="Send message" title="Send message" disabled>↑</button>
 </div>
