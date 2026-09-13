@@ -523,7 +523,7 @@
         function refresh() {
             if(polling || conversationSwitching || modelSaving || restoreWorking || state.connection!=="connected" || !state.project)return Promise.resolve();
             polling=true;var g=generation, revision=modelRevision;
-            return request("state").then(function(data){if(g===generation && revision===modelRevision){if(el("chat-error").textContent===refreshError)el("chat-error").textContent="";refreshError="";draw(data);return Promise.all([Date.now()-catalogAt>15000 ? refreshModels() : null,Date.now()-checkpointAt>10000 ? refreshCheckpoints() : null]);}},function(e){if(g===generation){error(e);refreshError=el("chat-error").textContent;}}).then(function(){polling=false;});
+            return request("state").then(function(data){if(g===generation && revision===modelRevision){if(el("chat-error").textContent===refreshError)el("chat-error").textContent="";refreshError="";draw(data);return Promise.all([Date.now()-catalogAt>15000 ? refreshModels() : null,Date.now()-checkpointAt>10000 ? refreshCheckpoints() : null]);}}).catch(function(e){if(g===generation){messagesKey="";error(e);refreshError=el("chat-error").textContent;}}).then(function(){polling=false;});
         }
         el("chat-form").addEventListener("submit",function(e){
             e.preventDefault();if(el("chat-send").disabled)return;

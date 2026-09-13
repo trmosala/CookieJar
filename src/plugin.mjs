@@ -318,6 +318,7 @@ export function createTools(runtime) {
           if (name === "ae_reconcile") await r.chat?.recordReconciliation(c.sessionID)
           if (name === "ae_restore") await r.chat?.recordRestore(c.sessionID, { status: "completed",
             checkpointId: result.checkpointId, currentCheckpointId: result.currentCheckpointId,
+            previousCheckpointId: result.previousCheckpointId,
             recoveryCopy: result.recoveryCopy, path: result.path, emergencyPath: result.emergencyPath, warning: result.warning })
           if (name !== "ae_release" && name !== "ae_bind") check()
           if (name !== "ae_release" && !lifetime?.aborted) r.diagnostics?.record(c.sessionID, name.slice(3), "ok", { durationMs: performance.now() - started })
@@ -659,12 +660,13 @@ async function panel(r, input) {
         return true
       })
       await r.chat?.recordRestore(sessionID, { status: "completed", checkpointId: restored.checkpointId,
-        currentCheckpointId: restored.currentCheckpointId, recoveryCopy: restored.recoveryCopy,
+        currentCheckpointId: restored.currentCheckpointId, previousCheckpointId: restored.previousCheckpointId, recoveryCopy: restored.recoveryCopy,
         path: restored.path, emergencyPath: restored.emergencyPath, warning: restored.warning })
       return restored
     } catch (error) {
       if (started) await r.chat?.recordRestore(sessionID, { status: "unconfirmed", checkpointId: plan.checkpointId,
         emergencyPath: error.details?.emergencyPath || null, currentCheckpointId: error.details?.currentCheckpointId || null,
+        previousCheckpointId: error.details?.previousCheckpointId || null,
         message: "Restore was not confirmed. Inspect After Effects and retain the recovery files before continuing." })
       throw error
     }

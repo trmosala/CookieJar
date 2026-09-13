@@ -841,7 +841,7 @@ var CookieMonsterAE = (function () {
         str(value.id,"transaction id");str(value.sessionID,"session");str(value.bindingID,"binding");
         return stringify(value);
     }
-    var RESTORE_PROOF = "compact-restore-v1";
+    var RESTORE_PROOF = "compact-restore-v2";
     function restoreGuard() {
         ready(false);requireFiles();
         var nativeProject=app.project, identity=project(), epoch=projectEpoch, revision, dirty, callback;
@@ -878,15 +878,18 @@ var CookieMonsterAE = (function () {
                 receipt:approved,phase:"saving",manual:true};
             recovery=rec;plan=null;
             try {
-                if(stringify(restoreGuard())!==stringify(approved))fail("unsafe_state","State changed before Save As");
-                rec.projectObject.save(file);
-                if(!isValid(rec.projectObject) || app.project!==rec.projectObject)fail("unsafe_state","Save As replaced the native project");
+                if(stringify(restoreGuard())!==stringify(approved))fail("unsafe_state","State changed before save");
+                // Save in place: native Save As changes revision even without an edit.
+                // The workflow has already preserved the previous on-disk file.
+                rec.projectObject.save(rec.projectObject.file);
+                if(!isValid(rec.projectObject) || app.project!==rec.projectObject)fail("unsafe_state","Save replaced the native project");
                 var saved=restoreGuard();
-                // A save-only increment and a serialized edit are indistinguishable.
-                // Refuse every revision change before permitting publication or close.
-                if(saved.project.path!==file.fsName || saved.projectEpoch!==approved.projectEpoch || saved.dirty!==false ||
+                if(stringify(saved.project)!==stringify(approved.project) || saved.projectEpoch!==approved.projectEpoch || saved.dirty!==false ||
                     saved.revision!==approved.revision)
-                    fail("unsafe_state","Save As did not preserve native ownership and revision");
+                    fail("unsafe_state","Save did not preserve native ownership and revision");
+                if(file.exists || !rec.projectObject.file.copy(file.fsName) || !file.exists ||
+                    stringify(restoreGuard())!==stringify(saved))
+                    fail("unsafe_state","Emergency copy or saved state did not confirm");
                 rec.receipt=saved;rec.phase="saved";
                 return {status:"recovery_saved",project:saved.project,receipt:saved};
             }catch(e){uncertain=true;fail("uncertain_outcome","Emergency save was not confirmed; do not close or retry");}

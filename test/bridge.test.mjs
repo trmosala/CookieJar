@@ -304,16 +304,17 @@ test("manual restore protocol validates scope proof phase replay and durable fal
     const durable = JSON.parse(await readFile(path.join(p.dataDir, "bridge-state.json"))).locks[0]
     assert.equal(durable.recoveryOriginal.path, original.path)
     assert.equal(durable.restore.phase, command.params.phase === "restore_prepare" ? "preparing" : "finishing")
-    p.state.project = { id: "path:" + hash(command.params.path), path: command.params.path, saved: true }
+    if (command.params.phase === "restore_finish")
+      p.state.project = { id: "path:" + hash(command.params.path), path: command.params.path, saved: true }
     return { status: command.params.phase === "restore_prepare" ? "recovery_saved" : "recovered",
       project: p.state.project, receipt: { ...receipt(p.state),
         projectEpoch: command.params.phase === "restore_prepare" ? "native-original" : "native-opened" } }
   })
   const saved = await p.bridge.call("session", "execute", prepare, { allowLocked: true })
-  assert.equal(p.bridge.binding("session", { allowLocked: true }).project.path, prepare.path)
-  await assert.rejects(p.bridge.call("session", "execute", prepare, { allowLocked: true }), { code: "invalid_host_result" })
+  assert.equal(p.bridge.binding("session", { allowLocked: true }).project.path, original.path)
+  await assert.rejects(p.bridge.call("session", "execute", prepare, { allowLocked: true }), { code: "unsafe_state" })
   await assert.rejects(p.bridge.call("session", "save", {}, { allowLocked: true }), { code: "restore_in_progress" })
-  await assert.rejects(p.bridge.unlock("session"), { code: "recovery_target_mismatch" })
+  await assert.rejects(p.bridge.unlock("session"), { code: "restore_in_progress" })
   const finish = { phase: "restore_finish", transaction, recoveryId: prepare.recoveryId,
     expected: saved.receipt, path: path.join(p.dataDir, "workflow-recovery-" + randomUUID() + ".aep"),
     verifiedCheckpoint: { id: "backup", hash: hash("bytes"), size: 1 } }
@@ -356,7 +357,7 @@ test("manual restore rejects forged prepare replies without advancing durable st
       path: path.join(p.dataDir, "workflow-emergency-" + randomUUID() + ".aep") }
     await p.bridge.lock("session", restoreReason(p))
     await p.start(async () => {
-      const project = { id: "saved", path: mode === "path" ? original.path : params.path, saved: true }
+      const project = { ...original, path: mode === "path" ? params.path : original.path }
       return { status: mode === "status" ? "recovered" : "recovery_saved", project,
         receipt: { ...receipt(p.state), project, revision: mode === "snapshot" ? 3 : mode === "save_increment" ? 2 : 1,
           projectEpoch: mode === "epoch" ? "replaced" : "native-original",
@@ -383,8 +384,7 @@ test("manual restore forged finish and foreign replies cannot confirm a path tra
     const planHash = hash("plan")
     await p.bridge.lock("session", restoreReason(p))
     await p.start(async command => {
-      const project = command.params.phase === "restore_prepare"
-        ? { id: "emergency", path: prepare.path, saved: true } : { ...original }
+      const project = { ...original }
       if (command.params.phase === "restore_finish") {
         if (fault === "path") project.path = path.join(p.dataDir, "foreign.aep")
         if (fault === "identity") project.id = "foreign"
@@ -422,7 +422,7 @@ test("manual restore forged finish and foreign replies cannot confirm a path tra
     const lock = JSON.parse(await readFile(path.join(p.dataDir, "bridge-state.json"))).locks[0]
     assert.equal(lock.state, "uncertain")
     assert.equal(lock.restore.phase, "finishing")
-    assert.equal(lock.project.path, prepare.path)
+    assert.equal(lock.project.path, original.path)
     assert.equal(lock.recoveryOriginal.path, original.path)
   }
 })

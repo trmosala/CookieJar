@@ -1,5 +1,7 @@
 # Compact restore validation, 11 September 2026
 
+Historical report for `compact-restore-v1`. The in-place-save implementation and current qualification evidence are tracked in [RESTORE_VALIDATION.md](RESTORE_VALIDATION.md). The refusal below explains why v1 was replaced; it is not the current save strategy.
+
 The implementation on `codex/chat-checkpoint-restore` replaces repeated full-scene restore inspection with `compact-restore-v1` receipts. Structured-action recovery keeps its existing full-scene checks. The original `RESTORE_HANDOFF.md` predates this implementation.
 
 ## Save As safety

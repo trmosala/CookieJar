@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createBridge } from "../src/bridge.mjs";
@@ -510,9 +510,10 @@ test("manual restore host close requires exact owner, compact receipt, clean sta
         const canonical=path.join(dir,"original.aep"),h=hostDouble(canonical);
         h.props[0].setValue(42);
         if(mode==="save_revision"){const save=h.project.save.bind(h.project);h.project.save=file=>{save(file);h.project.revision++;};}
+        const originalBytes=readFileSync(canonical);
         const transaction={id:"restore",sessionID:"session",bindingID:"binding"};
         const saved=h.call("execute",{phase:"restore_prepare",transaction,recoveryId:"restore",
-            expected:h.call("inspect",{restore:"compact-restore-v1"}).result,path:path.join(dir,"emergency.aep")});
+            expected:h.call("inspect",{restore:"compact-restore-v2"}).result,path:path.join(dir,"emergency.aep")});
         if(mode==="save_revision"){
             assert.equal(saved.error.code,"uncertain_outcome");
             assert.equal(h.closes,0);
@@ -547,6 +548,7 @@ test("manual restore host close requires exact owner, compact receipt, clean sta
             const open=h.app.open.bind(h.app);
             h.app.open=file=>{const result=open(file);h.props[0].setValue(19);return result;};
         }
+        writeFileSync(canonical,originalBytes); // Storage publishes the selected checkpoint before finish.
         const result=h.call("execute",finish);
         if(mode==="success"){
             assert.equal(result.result.status,"recovered");
@@ -568,7 +570,7 @@ test("compact host guards reject unsupported native reads and protocol mismatche
         const dir=mkdtempSync(path.join(os.tmpdir(),"cm-compact-guard-"));
         t.after(()=>rmSync(dir,{recursive:true,force:true}));
         const h=hostDouble(path.join(dir,"original.aep"));
-        const expected=h.call("inspect",{restore:"compact-restore-v1"}).result;
+        const expected=h.call("inspect",{restore:"compact-restore-v2"}).result;
         let saves=0;h.project.save=()=>{saves++;};
         if(mode==="dirty")delete h.project.dirty;
         if(mode==="revision")h.project.revision=undefined;
@@ -590,7 +592,7 @@ test("compact Save As rejects replaced native objects extra revision and post-sa
         t.after(()=>rmSync(dir,{recursive:true,force:true}));
         const h=hostDouble(path.join(dir,"original.aep"));
         h.props[0].setValue(42);
-        const expected=h.call("inspect",{restore:"compact-restore-v1"}).result;
+        const expected=h.call("inspect",{restore:"compact-restore-v2"}).result;
         const save=h.project.save.bind(h.project);
         h.project.save=file=>{
             if(mode==="serialized_edit")h.props[0].setValue(19);
