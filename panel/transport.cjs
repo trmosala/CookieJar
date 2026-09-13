@@ -1,6 +1,6 @@
 "use strict";
 var fs = require("fs"), path = require("path"), os = require("os"), http = require("http"), crypto = require("crypto"), child = require("child_process");
-var VERSION = "0.2.2", PROTOCOL = 1, MAX = 4 * 1024 * 1024;
+var VERSION = "0.2.3", PROTOCOL = 1, MAX = 4 * 1024 * 1024;
 function error(code, message) { var e = new Error(message); e.code = code; return e; }
 function record(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
 function text(v, max) { return typeof v === "string" && v.length > 0 && v.length <= max; }
@@ -243,6 +243,8 @@ function request(descriptor, credential, endpoint, body, timeout) {
                     if (res.statusCode !== 200 || value.error) {
                         var code = value.error && value.error.code;
                         var rejected=error(typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? code : "bridge_error", endpoint==="/chat" && typeof value.error.message==="string" ? value.error.message.slice(0,8192) : "Bridge rejected request");
+                        if(code==="storage_space")rejected.message="Not enough free disk space for saving and recovery copies. Free space before continuing.";
+                        if(code==="checkpoint_capacity")rejected.message="Checkpoint storage is full. Review old pins and recovery holds before continuing.";
                         if(["/pair","/connect","/compatibility"].indexOf(endpoint)>=0 && ["incompatible","incompatible_version"].indexOf(code)>=0 &&
                             record(value.error.details) && Object.prototype.hasOwnProperty.call(value.error.details,"compatibility"))
                             rejected.details={compatibility:compatibilityMetadata(value.error.details.compatibility)};

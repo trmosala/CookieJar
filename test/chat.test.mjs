@@ -2,6 +2,9 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { createChat } from "../src/chat.mjs"
 import { panelFixture } from "./bridge-panel.mjs"
+import path from "node:path"
+import { readFile } from "node:fs/promises"
+import { secureWrite } from "../src/storage.mjs"
 
 async function fixture(t) {
   const p = await panelFixture(t)
@@ -215,6 +218,40 @@ test("new chat retires the old tool scope, and deleted CM sessions can be recrea
   assert.notEqual(next.sessionID, fresh.sessionID)
 })
 
+test("deleting a replacement preserves retired conversation restrictions across restart", async t => {
+  const f = await fixture(t), first = await f.send(message())
+  const replacement = await f.send({ action: "new" })
+  await f.chat.event({ type: "session.deleted", properties: { info: { id: replacement.sessionID } } })
+  assert.throws(() => f.chat.checkSession(first.sessionID), { code: "chat_closed" })
+  assert.throws(() => f.chat.checkSession(replacement.sessionID), { code: "chat_closed" })
+  const reopened = await createChat(f.runtime)
+  reopened.register({ client: f.client, directory: f.p.dataDir })
+  f.p.bridge.setChatHandler(reopened.handle)
+  assert.equal((await f.send()).sessionID, null)
+  assert.throws(() => reopened.checkSession(first.sessionID), { code: "chat_closed" })
+  assert.throws(() => reopened.checkSession(replacement.sessionID), { code: "chat_closed" })
+  assert.doesNotThrow(() => reopened.checkSession("unrelated-cm-session"))
+  const next = await f.send(message({ requestId: "c".repeat(40) }))
+  assert.notEqual(next.sessionID, replacement.sessionID)
+  assert.throws(() => reopened.checkSession(first.sessionID), { code: "chat_closed" })
+})
+
+test("legacy chat migration preserves old session restrictions when the current record is deleted", async t => {
+  const f = await fixture(t), first = await f.send(message())
+  const replacement = await f.send({ action: "new" })
+  const file = path.join(f.p.dataDir, "chat-projects.json")
+  const saved = JSON.parse(await readFile(file, "utf8"))
+  const legacy = saved.projects
+  Object.values(legacy)[0].previousSessions = [first.sessionID]
+  await secureWrite(file, JSON.stringify(legacy))
+  const migrated = await createChat(f.runtime)
+  assert.throws(() => migrated.checkSession(first.sessionID), { code: "chat_closed" })
+  await migrated.event({ type: "session.deleted", properties: { info: { id: replacement.sessionID } } })
+  const restarted = await createChat(f.runtime)
+  assert.throws(() => restarted.checkSession(first.sessionID), { code: "chat_closed" })
+  assert.throws(() => restarted.checkSession(replacement.sessionID), { code: "chat_closed" })
+})
+
 test("inline permissions are scoped, exact, once-only and disappear after reply", async t => {
   const f = await fixture(t), sent = await f.send(message())
   f.chat.event({ type: "permission.asked", properties: { id: "per_one", sessionID: sent.sessionID, permission: "ae_execute", metadata: { source: "return 1;", project: f.p.state.project } } })
@@ -269,6 +306,61 @@ test("unknown prompt delivery is not resent; invalid payload and foreign project
   assert.equal(f.inputs.length, 1)
   await assert.rejects(f.send(message({ requestId: "x", compId: -1 })), { code: "invalid_payload" })
   await assert.rejects(f.send({ project: { ...f.p.state.project, id: "foreign" } }), { code: "stale_project" })
+})
+
+test("unknown delivery blocks fresh requests across restart even when CM reports idle", async t => {
+  const f = await fixture(t)
+  f.admitted = () => { throw new Error("Acknowledgement lost after admission") }
+  const first = await f.send(message())
+  assert.equal(first.delivery, "unknown")
+  f.admitted = undefined
+  f.statuses[first.sessionID] = { type: "idle" }
+  await assert.rejects(f.send(message({ requestId: "b".repeat(40) })), { code: "chat_busy" })
+  const reopened = await createChat(f.runtime)
+  reopened.register({ client: f.client, directory: f.p.dataDir })
+  f.p.bridge.setChatHandler(reopened.handle)
+  await assert.rejects(f.send(message({ requestId: "c".repeat(40) })), { code: "chat_busy" })
+  assert.equal((await f.send(message())).delivery, "unknown")
+  assert.equal(f.inputs.length, 1)
+  await reopened.recordReconciliation(first.sessionID, reopened.deliveryReview(first.sessionID))
+  assert.equal((await f.send(message())).delivery, "reconciled", "review must not replay the old request")
+  assert.equal((await f.send(message({ requestId: "d".repeat(40) }))).delivery, "accepted")
+  assert.equal(f.inputs.length, 2)
+})
+
+test("deletion cancels delayed inspection and stops admission without reviving a conversation", async t => {
+  for (const boundary of ["inspection", "admission"]) await t.test(boundary, async t => {
+    const f = await fixture(t), first = await f.send(message())
+    let enter, finish
+    const ready = new Promise(resolve => { enter = resolve })
+    const delayed = () => { enter(); return new Promise(resolve => { finish = resolve }) }
+    if (boundary === "inspection") {
+      const inspect = f.runtime.workflow.inspectQuery
+      f.runtime.workflow.inspectQuery = async (...args) => { await delayed(); return inspect(...args) }
+    } else f.admitted = delayed
+    const sending = f.send(message({ requestId: "e".repeat(40) }))
+    const rejected = assert.rejects(sending, { code: "chat_closed" })
+    await ready
+    if (boundary === "admission") assert.throws(() => f.chat.deliveryReview(first.sessionID), { code: "chat_busy" })
+    await f.chat.event({ type: "session.deleted", properties: { info: { id: first.sessionID } } })
+    finish()
+    await rejected
+    assert.equal(f.inputs.length, boundary === "inspection" ? 1 : 2)
+    assert.throws(() => f.chat.checkSession(first.sessionID), { code: "chat_closed" })
+    if (boundary === "admission") assert.ok(f.calls.some(c => c[0] === "abort"))
+  })
+})
+
+test("reconciliation clears only its reviewed delivery identity", async t => {
+  const f = await fixture(t), first = await f.send(message())
+  const ticket = f.chat.deliveryReview(first.sessionID)
+  assert.equal(ticket, null)
+  f.admitted = async () => { throw new Error("Admission unknown") }
+  await f.send(message({ requestId: "e".repeat(40) }))
+  await f.chat.recordReconciliation(first.sessionID, ticket)
+  assert.equal(f.chat.deliveryReview(first.sessionID), "e".repeat(40))
+  await assert.rejects(f.chat.recordReconciliation(first.sessionID, "f".repeat(40)), { code: "stale_session" })
+  await assert.rejects(f.send(message({ requestId: "f".repeat(40) })), { code: "chat_busy" })
 })
 
 test("Stop also aborts a prompt whose admission finishes after cancellation", async t => {

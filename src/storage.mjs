@@ -417,11 +417,46 @@ export function createCheckpoints({ dataDir }) {
   }
 
   return {
-    create({ projectPath, projectId, planHash, pinned = false }) {
+    preflight({ projectPath, projectId, copies = 1, restoreBytes = 0, protectedIds = [] }) {
+      return run(async root => {
+        assertString(projectId, "projectId")
+        if (![1, 2].includes(copies) || !Number.isSafeInteger(restoreBytes) || restoreBytes < 0 || restoreBytes > MAX_BYTES ||
+            !Array.isArray(protectedIds) || protectedIds.some(id => typeof id !== "string" || !UUID.test(id)))
+          fail("invalid_payload", "Invalid checkpoint capacity request")
+        const project = await canonical(projectPath), source = await regular(project)
+        if (source.size > MAX_BYTES) fail("checkpoint_capacity", "Project exceeds the 5 GB checkpoint cap")
+        const entries = (await scan(root, true)).filter(entry => entry.projectId === projectId)
+          .map(entry => protectedIds.includes(entry.id) ? { ...entry, inUse: true } : entry)
+        // Read-only planning: actual creation repeats quota checks after saving.
+        retention([...entries, ...Array.from({ length: copies }, (_, i) => ({
+          id: "planned-" + i, createdAt: "9999", size: source.size, pinned: false, inUse: true,
+        }))])
+        const volumes = new Map()
+        async function volume(directory) {
+          const dev = String((await fs.stat(directory)).dev)
+          if (!volumes.has(dev)) {
+            const available = await fs.statfs(directory, { bigint: true })
+            volumes.set(dev, { available: available.bavail * available.bsize, required: 16n * 1024n * 1024n })
+          }
+          return volumes.get(dev)
+        }
+        const projectVolume = await volume(path.dirname(project)), privateVolume = await volume(root)
+        // AE save + restore publication may need additional full files. Allow
+        // checkpoints on either destination because protected storage can fall back.
+        projectVolume.required += BigInt(source.size + restoreBytes)
+        for (const v of new Set([projectVolume, privateVolume])) v.required += BigInt(copies * source.size)
+        if (restoreBytes) privateVolume.required += BigInt(source.size + restoreBytes)
+        for (const v of volumes.values()) if (v.available < v.required)
+          fail("storage_space", "Not enough free space for saving and verified recovery copies; free space before continuing")
+        return { projectBytes: source.size, checkpointBytes: copies * source.size }
+      })
+    },
+    create({ projectPath, projectId, planHash, pinned = false, protectionOwner }) {
       return run(async root => {
         assertString(projectId, "projectId")
         assertString(planHash, "planHash")
         if (typeof pinned !== "boolean") fail("invalid_payload", "pinned must be boolean")
+        if (protectionOwner !== undefined) assertString(protectionOwner, "protection owner", 256)
         const project = await canonical(projectPath)
         if (inside(root, project) || path.basename(path.dirname(project)) === "CookieMonster Checkpoints") fail("invalid_path", "A checkpoint cannot be used as a canonical source project")
         const source = await regular(project)
@@ -452,7 +487,8 @@ export function createCheckpoints({ dataDir }) {
             const info = await copyVerified(project, temp)
             if (!sameStat(source, await regular(project))) fail("checkpoint_changed", "Project changed during checkpoint creation")
             manifest = { id, path: file, projectId, projectPath: project, planHash, createdAt: new Date().toISOString(),
-              size: info.size, hash: info.hash, verified: true, pinned, storageMode }
+              size: info.size, hash: info.hash, verified: true, pinned, storageMode,
+              ...(protectionOwner === undefined ? {} : { inUse: true, protectionOwners: [protectionOwner] }) }
             if (warning) manifest.warning = warning
             await unchangedParent(directory)
             await fs.rename(temp, file)

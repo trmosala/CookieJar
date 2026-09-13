@@ -74,6 +74,27 @@ test("bundled config preserves browser entries/policy, isolates invalid artifact
   await assert.rejects(exec(process.execPath, [cli, input, invalid, join(dir, "bad-output.json")]));
   await assert.rejects(readFile(join(dir, "bad-output.json")), { code: "ENOENT" });
   assert.deepEqual(JSON.parse(await readFile(input, "utf8")), before);
+  const clientInput = join(dir, "client-input.json"), clientOutput = join(dir, "client-output.json");
+  await writeFile(clientInput, JSON.stringify({ permission: { browser_click: "ask" } }));
+  await exec(process.execPath, [cli, clientInput, path, clientOutput, "--client"]);
+  const clientConfig = JSON.parse(await readFile(clientOutput, "utf8"));
+  assert.equal(clientConfig.permission.ae_execute, "ask");
+  assert.equal(clientConfig.permission.browser_click, "ask");
+  await writeFile(clientInput, JSON.stringify({ permission: { ae_execute: "allow" } }));
+  const unsafeOutput = join(dir, "unsafe-client.json");
+  await assert.rejects(exec(process.execPath, [cli, clientInput, path, unsafeOutput, "--client"]));
+  await assert.rejects(readFile(unsafeOutput), { code: "ENOENT" });
+  for (const config of [
+    { permission: { "ae_exec*": "allow" } },
+    { permission: { ae_execute: { "*": "allow" } } },
+    { agent: { client: { permission: { ae_execute: "allow" } } } },
+    { mode: { client: { permission: { "ae_exec*": "allow" } } } },
+    { tools: { ae_execute: true } },
+  ]) {
+    await writeFile(clientInput, JSON.stringify(config));
+    await assert.rejects(exec(process.execPath, [cli, clientInput, path, unsafeOutput, "--client"]));
+    await assert.rejects(readFile(unsafeOutput), { code: "ENOENT" });
+  }
 });
 
 test("multiple bundles preserve options through path aliases and omit failed optional defaults", async (t) => {
@@ -108,6 +129,27 @@ test("multiple bundles preserve options through path aliases and omit failed opt
   assert.deepEqual((await mergeBundledPlugins(merged.config, artifacts)).config, merged.config);
 });
 
+test("compiled client plugin refuses CM auto-allow overrides and preserves denial", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "cm-ae-client-policy-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const bundle = join(dir, "client.mjs");
+  await exec("bun", ["build", "./src/plugin.mjs", "--target=node", "--format=esm", "--packages=bundle",
+    "--env=disable", "--define", "COOKIEJAR_CLIENT_BUILD=true", "--outfile", bundle]);
+  await exec(process.execPath, ["--input-type=module", "-e", `
+    import assert from 'node:assert/strict';
+    import { pathToFileURL } from 'node:url';
+    const { checkPermissionConfig: check } = await import(pathToFileURL(process.argv[1]));
+    check({permission:{ae_execute:'ask'}}, 'ae_execute');
+    for (const config of [
+      {permission:{ae_execute:'allow'}},
+      {permission:{ae_execute:'ask','ae_exec*':'allow'}},
+      {permission:{ae_execute:'ask'},agent:{client:{permission:{ae_execute:'allow'}}}},
+      {permission:{ae_execute:'ask'},tools:{ae_execute:true}}
+    ]) assert.throws(() => check(config, 'ae_execute'), {code:'unsafe_permission_config'});
+    assert.throws(() => check({permission:{ae_execute:'deny'}}, 'ae_execute'), {code:'permission_denied'});
+  `, bundle]);
+});
+
 test("packaging verifies inventory and hashes, rejects unsafe inputs, and signing fails without credentials", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "cm-ae-package-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -115,9 +157,15 @@ test("packaging verifies inventory and hashes, rejects unsafe inputs, and signin
   await mkdir(dist);
   const data = "export default {};\n";
   await writeFile(join(dist, "plugin.mjs"), data);
+  await mkdir(join(dist, "cm-ae"));
+  const policy = JSON.stringify({ ae_execute: "allow" });
+  await writeFile(join(dist, "cm-ae", "permissions.json"), policy);
   await writeFile(join(dist, "manifest.json"), JSON.stringify({
-    schemaVersion: 1, signed: false,
-    artifacts: [{ path: "plugin.mjs", bytes: Buffer.byteLength(data), sha256: createHash("sha256").update(data).digest("hex") }],
+    schemaVersion: 1, signed: false, profile: "development",
+    artifacts: [
+      { path: "cm-ae/permissions.json", bytes: Buffer.byteLength(policy), sha256: createHash("sha256").update(policy).digest("hex") },
+      { path: "plugin.mjs", bytes: Buffer.byteLength(data), sha256: createHash("sha256").update(data).digest("hex") },
+    ],
   }));
   await verifyBuild(dir);
   await writeFile(join(dist, "plugin.mjs"), data.replace("{}", "[]"));
@@ -176,6 +224,12 @@ test("build bundles dependencies but preserves the real worker URL and reproduci
   );
   await build(fixture);
   assert.deepEqual(await verifyBuild(fixture), before);
+  await build(fixture, "client");
+  const clientBuild = await verifyBuild(fixture);
+  assert.equal(clientBuild.profile, "client");
+  assert.equal(JSON.parse(await readFile(join(fixture, "dist", "cm-ae", "permissions.json"), "utf8")).ae_execute, "ask");
+  await build(fixture, "client");
+  assert.deepEqual(await verifyBuild(fixture), clientBuild);
   await cp(join(fixture, "dist", "cm-ae"), isolated, { recursive: true });
   const smoke = `
     import assert from "node:assert/strict";

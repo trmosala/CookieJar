@@ -42,7 +42,11 @@ export async function withJobLock(jobDir, operation) {
   // Case folding also covers default case-insensitive macOS volumes; on a
   // case-sensitive volume it can only serialize otherwise independent jobs.
   const key = canonical.toLowerCase()
-  const port = 49152 + parseInt(hash(key).slice(0, 8), 16) % 16384
+  // The immutable ID namespace selects the gate even after retirement removes
+  // the manifest. Keep old jobs on their original gate for existing supervisors.
+  // New jobs avoid the OS outbound pool used by bridge/CM HTTP connections.
+  const basePort = path.basename(jobDir).toLowerCase().startsWith("g2-") ? 16384 : 49152
+  const port = basePort + parseInt(hash(key).slice(0, 8), 16) % 16384
   const deadline = Date.now() + 30000
   let server
   for (;;) {
@@ -55,8 +59,8 @@ export async function withJobLock(jobDir, operation) {
       break
     } catch (error) {
       server.close()
-      if (error.code !== "EADDRINUSE") fail("render_busy", "Exclusive job gate unavailable")
-      if (Date.now() >= deadline) fail("render_busy", "Exclusive job gate is occupied; holder left untouched")
+      if (error.code !== "EADDRINUSE") fail("render_busy", "Exclusive job gate unavailable", { cause: error.code, port })
+      if (Date.now() >= deadline) fail("render_busy", "Exclusive job gate is occupied; holder left untouched", { cause: error.code, port })
       await delay(25)
     }
   }
@@ -168,7 +172,7 @@ export async function readJob(jobDir) {
   if (await fs.realpath(jobDir) !== jobDir) fail("render_corrupt", "Job directory is not canonical")
   const job = await load(path.join(jobDir, "manifest.json"))
   const id = path.basename(jobDir)
-  if (![1, 2].includes(job.version) || job.jobId !== id || !/^[0-9a-f-]{36}$/.test(id) ||
+  if (![1, 2].includes(job.version) || job.jobId !== id || !/^(?:g2-)?[0-9a-f-]{36}$/.test(id) ||
       job.version === 2 && (job.checkpoint?.id !== id || job.checkpoint?.storageMode !== "render-private" ||
         ![".aep", ".aepx"].includes(path.extname(job.sourceCheckpoint?.path || "").toLowerCase()) ||
         job.checkpoint.path !== path.join(jobDir, "checkpoint" + path.extname(job.sourceCheckpoint.path).toLowerCase()) ||

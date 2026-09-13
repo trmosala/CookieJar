@@ -25,7 +25,8 @@ export async function files(dir, prefix = "") {
   return found;
 }
 
-export async function build(directory = root) {
+export async function build(directory = root, profile = "development") {
+  if (!["development", "client"].includes(profile)) throw new Error("Unknown build profile");
   if (Number(process.versions.node.split(".")[0]) < 22) throw new Error("Node 22+ required");
   const pkg = JSON.parse(await readFile(join(directory, "package.json"), "utf8"));
   if (!pkg || typeof pkg !== "object" || typeof pkg.version !== "string") {
@@ -64,6 +65,7 @@ export async function build(directory = root) {
       execFileSync("bun", [
         "build", `./src/${entry}`, "--target=node", "--format=esm", "--packages=bundle",
         "--env=disable", "--reject-unresolved",
+        "--define", `COOKIEJAR_CLIENT_BUILD=${profile === "client"}`,
         ...(entry === "plugin.mjs" ? ["--external=./render-worker.mjs"] : []),
         "--outfile", join(stage, "cm-ae", entry),
       ], { cwd: directory, stdio: "pipe" });
@@ -80,14 +82,15 @@ export async function build(directory = root) {
       const markedPackage = require.resolve("marked/package.json");
       await copyFile(join(dirname(markedPackage), "LICENSE.md"), join(stage, "cm-ae", "MARKED-LICENSE.txt"));
     }
-    await writeFile(join(stage, "cm-ae", "permissions.json"), JSON.stringify(AE_PERMISSIONS, null, 2) + "\n");
+    const permissions = { ...AE_PERMISSIONS, ...(profile === "client" ? { ae_execute: "ask" } : {}) };
+    await writeFile(join(stage, "cm-ae", "permissions.json"), JSON.stringify(permissions, null, 2) + "\n");
     const artifacts = [];
     for (const path of await files(stage)) {
       const data = await readFile(join(stage, path));
       artifacts.push({ path, bytes: data.length, sha256: createHash("sha256").update(data).digest("hex") });
     }
     await writeFile(join(stage, "manifest.json"), JSON.stringify({
-      schemaVersion: 1, version: pkg.version, signed: false,
+      schemaVersion: 1, version: pkg.version, signed: false, profile,
       build: { bun, target: "node", format: "esm", zod: zod.version },
       artifacts,
     }, null, 2) + "\n");
@@ -103,7 +106,10 @@ export async function build(directory = root) {
 }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
-  try { await build(); }
+  try {
+    if (process.argv.slice(2).some(arg => arg !== "--client")) throw new Error("Usage: node scripts/build.mjs [--client]");
+    await build(root, process.argv.includes("--client") ? "client" : "development");
+  }
   catch (error) {
     console.error(error.stderr?.toString() || error.message);
     process.exitCode = 1;

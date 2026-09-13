@@ -1,12 +1,12 @@
 # CookieJar-AE
 
-**0.2.2 — local development build for first testing on disposable projects.** A Node sidecar and CEP panel connect CookieMonster/OpenCode to After Effects. Unsigned; no environments are certified.
+**0.2.3 — deployment hardening candidate, blocked for client release.** A Node sidecar and CEP panel connect CookieMonster/OpenCode to After Effects. Unsigned; no environments are certified. See the [deployment evidence and remaining gates](docs/DEPLOYMENT_READINESS.md).
 
 The panel now provides [chat inside After Effects](docs/PRODUCT_GOAL.md), backed by CookieMonster's existing conversation runtime. Open it, type a message, and review replies, captured frames and approvals in AE. It follows the active composition; choose a comp to pin it or insert an explicit @mention. Conversations stay with the project, and project changes stop previous work. Normal connection is automatic. Multiple targets or another conversation's ownership require an explicit choice.
 
 The compact composer stays at the bottom of the panel. Settings, troubleshooting and the project checkpoint list live in the header menu beside the connection indicator. Replies render Markdown; images, activity and older exchanges collapse, with manual choices saved for each project conversation. Load earlier messages above the conversation. The restore arrow beneath a request selects its first edit checkpoint and opens a review before changing the whole project. Restore now preserves the previous disk version, saves current work in place and verifies an emergency copy before restoring. This avoids AE 26.3's Save As revision increment without accepting intervening edits; see [current validation](docs/RESTORE_VALIDATION.md).
 
-The current editing flow is **inspect → verify a checkpoint → execute → inspect the result**. `ae_inspect` supports bounded project/composition/layer/property queries and returns an `expectedRevision` token. `ae_execute` accepts that token, a label and a script body. It runs without a permission prompt by default, but only after saving and verifying a checkpoint. Explicit `ask` and `deny` policies remain supported. Scripts are unsandboxed; partial edits and external effects can remain after failure. There is no automatic rollback or retry for scripts.
+The current editing flow is **inspect → verify a checkpoint → execute → inspect the result**. `ae_inspect` supports bounded project/composition/layer/property queries and returns an `expectedRevision` token. `ae_execute` accepts that token, a label and a script body. Development builds run without a permission prompt by default, but only after saving and verifying a checkpoint. Client builds require explicit approval and reject auto-allow overrides. Explicit `deny` remains supported. Scripts are unsandboxed; partial edits and external effects can remain after failure. There is no automatic rollback or retry for scripts.
 
 `ae_propose` and the three `ae_raw_*` tools are no longer exposed. Structured transaction internals remain for existing recovery paths and regression tests. Pairing, exclusive bindings, checkpoints, manual restore, render management and diagnostics remain available.
 
@@ -49,6 +49,8 @@ node scripts/merge-config.mjs existing-config.json dist/cm-ae/plugin.mjs merged-
 Read tools and checkpoint-backed script execution default to allow; capture, filesystem grants, restore, template discovery and render control require approval. Auto-allow policies for those other privileged tools are rejected. Filesystem grants constrain managed operations; they do not sandbox arbitrary ExtendScript.
 
 ## Release status
+
+Build the client candidate with `node scripts/build.mjs --client`, then run `node scripts/verify-build.mjs --rebuild`. This profile requires explicit script approval in the plugin and packages `ae_execute: "ask"`; development builds retain their existing default. Rebuild verification preserves the chosen profile. Install the panel and plugin as a matching pair. Prepare consumer configuration with the merge command's `--client` option; matching auto-allow overrides are refused and stricter denial is preserved.
 
 The 264-test baseline and September 9 packaged desktop smoke belong to the previous `0.1.0` source, not this refactor. Current development evidence is recorded in [FIRST_TEST.md](docs/FIRST_TEST.md). The [issue ledger](docs/ISSUE_STATUS.md) records the replacement product roadmap and preserves historical release gaps. Closing the earlier issues does not establish certification or pilot completion.
 

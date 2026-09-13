@@ -9,18 +9,35 @@ import { markdown } from "./markdown.mjs"
 export async function createChat(runtime) {
   const file = path.join(runtime.dataDir, "chat-projects.json")
   let records = {}
+  const retiredSessions = new Set()
   try {
     const s = await lstat(file)
     if (!s.isFile() || s.isSymbolicLink() || s.size > 1024 * 1024) fail("unsafe_storage", "Invalid chat state")
-    records = JSON.parse(await readFile(file, "utf8"))
+    const stored = JSON.parse(await readFile(file, "utf8"))
+    if (stored?.schemaVersion !== undefined) {
+      if (stored.schemaVersion !== 2 || !Array.isArray(stored.retiredSessions) ||
+          stored.retiredSessions.some(id => typeof id !== "string" || !id.length))
+        fail("unsafe_storage", "Preserve unsupported chat state for recovery")
+      records = stored.projects
+      for (const id of stored.retiredSessions) retiredSessions.add(id)
+    } else records = stored
     if (!records || Array.isArray(records) || typeof records !== "object" || Object.values(records).some(r =>
-      !r || typeof r.sessionID !== "string" || typeof r.directory !== "string" || !Array.isArray(r.requests)))
+      !r || typeof r.sessionID !== "string" || typeof r.directory !== "string" || !Array.isArray(r.requests) ||
+      r.previousSessions !== undefined && (!Array.isArray(r.previousSessions) || r.previousSessions.some(id => typeof id !== "string" || !id.length))))
       fail("unsafe_storage", "Preserve invalid chat state for recovery")
+    // Migrate only scoped session references. Conversation content remains in CM.
+    for (const r of Object.values(records)) {
+      for (const id of r.previousSessions || []) retiredSessions.add(id)
+      delete r.previousSessions
+      // A process restart cannot confirm an interrupted admission.
+      for (const request of r.requests) if (request.status === "sending") request.status = "unknown"
+    }
   } catch (e) { if (e.code !== "ENOENT") throw e }
   const clients = new Map(), permissions = new Map(), errors = new Map(), queues = new Map(), active = new Map(), generations = new Map()
   let saving = Promise.resolve()
   const save = () => {
-    const data = JSON.stringify(records)
+    const data = JSON.stringify({ schemaVersion: 2, projects: records, retiredSessions: [...retiredSessions] })
+    if (Buffer.byteLength(data) > 1024 * 1024) fail("unsafe_storage", "Chat safety state is full; preserve it for recovery")
     const task = saving.then(() => secureWrite(file, data))
     saving = task.catch(() => {})
     return task
@@ -100,8 +117,8 @@ export async function createChat(runtime) {
   }
   runtime.bridge.onRelease(sessionID => { void pause(sessionID).catch(() => {}) })
   async function handle(input) {
-    const { body, project, panelId, connectionId, check } = input
-    check()
+    const { body, project, panelId, connectionId } = input
+    input.check()
     const attachments = body.action === "send" ? validateAttachments(body.attachments) : []
     const messageHash = () => hash(body.skill ? [body.text, body.compId, attachments, body.skill] :
       attachments.length ? [body.text, body.compId, attachments] : [body.text, body.compId])
@@ -115,6 +132,11 @@ export async function createChat(runtime) {
     }
     active.set(panelId, key)
     let r = records[key]
+    function check() {
+      input.check()
+      if (records[key] !== r || r && retiredSessions.has(r.sessionID))
+        fail("chat_closed", "Conversation changed or was deleted; refresh before continuing")
+    }
     const workspaces = [...clients.keys()].sort()
     const current = (await runtime.bridge.connections()).find(c => c.id === connectionId)
     const owned = !!current?.binding && current.binding.sessionID !== r?.sessionID
@@ -235,6 +257,8 @@ export async function createChat(runtime) {
         if (duplicate.hash !== messageHash()) fail("invalid_payload", "Request ID belongs to another message")
         return { sessionID: r.sessionID, delivery: duplicate.status }
       }
+      if (["sending", "unknown"].includes(r?.requests.at(-1)?.status))
+        fail("chat_busy", "Resolve uncertain delivery before submitting another message; the previous edit may have run")
     }
     let chosenSkill
     if (body.action === "send" && body.skill) {
@@ -266,7 +290,9 @@ export async function createChat(runtime) {
         body: { title: "After Effects · " + (project.path ? path.basename(project.path) : "Unsaved project") } }))
       check()
       if (!session?.id) fail("chat_backend", "CookieMonster did not return a conversation")
-      r = records[key] = { ...fresh, sessionID: session.id, previousSessions: [...(r?.previousSessions || []), ...(r ? [r.sessionID] : [])] }
+      if (retiredSessions.has(session.id)) fail("chat_closed", "CM returned a retired conversation; refresh before continuing")
+      if (r) retiredSessions.add(r.sessionID)
+      r = records[key] = { ...fresh, sessionID: session.id }
       await save()
       if (body.action === "new") return { sessionID: r.sessionID }
     }
@@ -336,6 +362,11 @@ export async function createChat(runtime) {
       request.status = "unknown"
       errors.set(r.sessionID, "Message delivery could not be confirmed. Check the conversation before sending again. " + e.message)
     }
+    if (records[key] !== r || retiredSessions.has(r.sessionID)) {
+      await result(client.session.abort(options(r))).catch(() => {})
+      errors.delete(r.sessionID)
+      fail("chat_closed", "Conversation was deleted during admission; check CM for any partial work")
+    }
     await save()
     return { sessionID: r.sessionID, delivery: request.status }
   }
@@ -347,10 +378,20 @@ export async function createChat(runtime) {
       if (statuses?.[sessionID]?.type && statuses[sessionID].type !== "idle" || ["sending", "unknown"].includes(r.requests.at(-1)?.status))
         fail("chat_busy", "Wait for the reply to finish before restoring the project")
     },
-    async recordReconciliation(sessionID) {
+    deliveryReview(sessionID) {
+      const request = Object.values(records).find(r => r.sessionID === sessionID)?.requests.at(-1)
+      if (request?.status === "sending") fail("chat_busy", "Wait for message admission before reviewing delivery")
+      return request?.status === "unknown" ? request.id : null
+    },
+    async recordReconciliation(sessionID, deliveryId = null) {
       const r = Object.values(records).find(r => r.sessionID === sessionID)
-      if (!r || !["pending", "unconfirmed"].includes(r.restore?.status)) return
-      r.restore = { ...r.restore, status: "reconciled", at: new Date().toISOString() }
+      if (!r) return
+      const restore = ["pending", "unconfirmed"].includes(r.restore?.status)
+      const delivery = deliveryId !== null && r.requests.at(-1)?.id === deliveryId && r.requests.at(-1)?.status === "unknown"
+      if (deliveryId !== null && !delivery) fail("stale_session", "Reviewed message delivery changed; refresh before continuing")
+      if (!restore && !delivery) return
+      if (restore) r.restore = { ...r.restore, status: "reconciled", at: new Date().toISOString() }
+      if (delivery) r.requests.at(-1).status = "reconciled"
       await save()
     },
     async recordRestore(sessionID, update) {
@@ -370,6 +411,7 @@ export async function createChat(runtime) {
       if (event?.type === "session.deleted") {
         let removed = false
         for (const [key, r] of Object.entries(records)) if (r.sessionID === p?.info?.id) {
+          retiredSessions.add(r.sessionID)
           delete records[key]; permissions.delete(r.sessionID); errors.delete(r.sessionID)
           removed = true
         }
@@ -388,11 +430,9 @@ export async function createChat(runtime) {
       if (event.type === "session.error") errors.set(sessionID, p.error?.data?.message || p.error?.message || "CookieMonster encountered an error")
     },
     checkSession(sessionID) {
+      if (retiredSessions.has(sessionID)) fail("chat_closed", "This project chat was replaced or deleted; use its current conversation")
       const r = Object.values(records).find(r => r.sessionID === sessionID)
-      if (!r) {
-        if (Object.values(records).some(r => r.previousSessions?.includes(sessionID))) fail("chat_closed", "This project chat was replaced; use its current conversation")
-        return
-      }
+      if (!r) return
       const b = runtime.bridge.binding(sessionID, { allowLocked: true })
       if (!r.project || b.connectionId !== r.connectionId || hash(b.project) !== hash(r.project))
         fail("stale_project", "This conversation cannot retarget after a project change")

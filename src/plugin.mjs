@@ -10,7 +10,7 @@ import { createRenderer } from "./render.mjs"
 import { createDiagnostics } from "./diagnostics.mjs"
 import { createChat } from "./chat.mjs"
 import { capture, captureArgs, safeRefusals } from "./capture.mjs"
-import { AE_PERMISSIONS } from "./config.mjs"
+import { AE_PERMISSIONS, CLIENT_BUILD } from "./config.mjs"
 import { fail, hash, PROPOSAL_TTL, releaseMetadata } from "./protocol.mjs"
 
 const text = z.string().min(1).max(256)
@@ -40,12 +40,12 @@ function policyRules(policy, name) {
   return values
 }
 
-export function checkPermissionConfig(config, name, { configure = false } = {}) {
+export function checkPermissionConfig(config, name, { configure = false, requireReview = CLIENT_BUILD } = {}) {
   if (!object(config)) fail("permission_policy_required", "The CookieMonster config hook must run before privileged tools")
   const agents = [...Object.values(config.agent || {}), ...Object.values(config.mode || {})]
   for (const tool of name ? [name] : privileged) {
     const policies = [config.permission, ...agents.map(agent => agent?.permission)]
-    if (tool === "ae_execute") {
+    if (tool === "ae_execute" && !requireReview) {
       const rules = policies.flatMap(policy => policyRules(policy, tool))
       if (!configure) {
         if (!rules.length || rules.includes("deny")) fail("permission_denied", "Script execution is denied by policy")
@@ -315,7 +315,7 @@ export function createTools(runtime) {
             check()
           }
           const result = await execute(parsed, c, askFor(r, c, name))
-          if (name === "ae_reconcile") await r.chat?.recordReconciliation(c.sessionID)
+          if (name === "ae_reconcile") await r.chat?.recordReconciliation(c.sessionID, c.deliveryReview)
           if (name === "ae_restore") await r.chat?.recordRestore(c.sessionID, { status: "completed",
             checkpointId: result.checkpointId, currentCheckpointId: result.currentCheckpointId,
             previousCheckpointId: result.previousCheckpointId,
@@ -483,7 +483,10 @@ export function createTools(runtime) {
       compatibility: r.bridge.compatibility(c.sessionID) })
   })
   tool("ae_reconcile", "Review uncertain outcome evidence before unlocking; never retries a command.", {},
-    (_, c, ask) => r.workflow.reconcile(c.sessionID, ask))
+    (_, c, ask) => {
+      c.deliveryReview = r.chat?.deliveryReview(c.sessionID) ?? null
+      return r.workflow.reconcile(c.sessionID, ask, { reviewRequired: c.deliveryReview !== null })
+    })
   return tools
 }
 

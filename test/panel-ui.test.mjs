@@ -38,7 +38,7 @@ function fixture(...args) {
         if(action==="checkpoints")return {result:[{id:"checkpoint-1",createdAt:1000,pinned:false,storageMode:"project",size:123}]};
         if(action==="renders")return {result:[{id:"job-1",state:"running",path:"DO NOT DISPLAY"}]};
         if(action==="checkpoint.restore.propose")return {result:{token:"SECRET-RESTORE-TOKEN",sourceTimestamp:1000,destinationTimestamp:2000,operation}};
-        if(action==="diagnostics")return {result:{version:"0.2.2",events:[{code:"ready"}]}};
+        if(action==="diagnostics")return {result:{version:"0.2.3",events:[{code:"ready"}]}};
         if(action==="checkpoint.restore.confirm"){
             const recoveryCopy=!!options.fallback;
             const result={checkpointId:"checkpoint-1",currentCheckpointId:"backup-1",canonicalPath:project.path,
@@ -59,7 +59,7 @@ function fixture(...args) {
         store.profile=profile;return store;
     },Client:function(options){
         client=new transport.Client({...options,request});
-        client.descriptor={instanceId:"instance",port:12345,protocol:1,version:"0.2.2"};
+        client.descriptor={instanceId:"instance",port:12345,protocol:1,version:"0.2.3"};
         Object.assign(client.state,{connection:"connected",project,capabilities:{fileNetwork:true},binding:{id:"binding",sessionID:"session",state:"active",project},lock:null});
         client.start=()=>{client.running=true;};client.stop=()=>{client.running=false;};
         return client;
@@ -142,7 +142,7 @@ test("actual UI diagnostics prepare only backend metadata, revoke downloads, and
     const f=fixture();
     await f.click("diagnostics");
     assert.equal(f.calls.length,1);assert.deepEqual(f.calls[0].body,{action:"diagnostics"});
-    assert.deepEqual(JSON.parse(await f.blobs[0].text()),{version:"0.2.2",events:[{code:"ready"}]});
+    assert.deepEqual(JSON.parse(await f.blobs[0].text()),{version:"0.2.3",events:[{code:"ready"}]});
     assert.equal(f.e["diagnostics-download"].hidden,false);assert.equal(f.e["diagnostics-download"].href,"blob:metadata-1");
     f.e["services-auto"].checked=true;f.document.hidden=true;f.intervals[0]();
     assert.equal(f.calls.length,1);
@@ -202,21 +202,21 @@ test("UI never announces success or discloses unvalidated stale, foreign or malf
 });
 test("compatibility UI separates versions, exposes only configured HTTPS links and cleans stale links",()=>{
     const f=fixture();
-    assert.match(f.e.versions.textContent,/Panel 0.2.2 \/ Bridge Plugin unknown \/ CookieMonster Desktop not configured/);
+    assert.match(f.e.versions.textContent,/Panel 0.2.3 \/ Bridge Plugin unknown \/ CookieMonster Desktop not configured/);
     for(const key of ["plugin","panel","cookieMonster"]){
         assert.equal(f.e["update-"+key].hidden,true);
         assert.equal(f.e["update-"+key].href,undefined);
         assert.equal(f.e["update-"+key+"-status"].textContent,"not configured");
     }
-    const empty={status:"compatible",pluginVersion:"0.2.2",protocol:1,panelVersion:"0.2.2",panelProtocol:1,
+    const empty={status:"compatible",pluginVersion:"0.2.3",protocol:1,panelVersion:"0.2.3",panelProtocol:1,
         cookieMonsterVersion:null,cookieMonsterVersionStatus:"not_configured",releaseSourceUrl:"https://github.com/trmosala/CookieJar/releases",
         updates:Object.fromEntries(["plugin","panel","cookieMonster"].map(k=>[k,{status:"not_configured",version:null,protocol:null,url:null}]))};
     const configured=structuredClone(empty);
     configured.cookieMonsterVersion="2.4.1";configured.cookieMonsterVersionStatus="configured";
     for(const key of ["plugin","panel","cookieMonster"])
-        configured.updates[key]={status:"configured",version:key==="cookieMonster" ? "2.4.1" : "0.2.2",protocol:1,url:"https://releases.example.test/"+key};
+        configured.updates[key]={status:"configured",version:key==="cookieMonster" ? "2.4.1" : "0.2.3",protocol:1,url:"https://releases.example.test/"+key};
     f.client.state.compatibility=configured;f.client.emit();
-    assert.match(f.e.versions.textContent,/Bridge Plugin 0.2.2 \/ CookieMonster Desktop 2.4.1/);
+    assert.match(f.e.versions.textContent,/Bridge Plugin 0.2.3 \/ CookieMonster Desktop 2.4.1/);
     for(const key of ["plugin","panel","cookieMonster"]){
         assert.equal(f.e["update-"+key].href,configured.updates[key].url);
         assert.equal(f.e["update-"+key].hidden,false);

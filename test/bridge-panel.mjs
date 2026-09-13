@@ -72,7 +72,7 @@ export async function panelFixture(t, options = {}) {
   let descriptor = JSON.parse(await readFile(path.join(dataDir, "descriptor.json"), "utf8"))
   const panelId = "test-panel"
   const paired = await request(descriptor.port, "/pair", {
-    code: bridge.pairingCode("session").code, protocol: 1, version: "0.2.2", panelId,
+    code: bridge.pairingCode("session").code, protocol: 1, version: "0.2.3", panelId,
   })
   if (paired.status !== 200) throw new Error(JSON.stringify(paired))
   let credential = paired.body.credential
@@ -89,7 +89,7 @@ export async function panelFixture(t, options = {}) {
     get port() { return descriptor.port },
     send(endpoint, body, extra = {}) { return request(descriptor.port, endpoint, body, { credential, ...extra }) },
     async connect() {
-      const result = await api.send("/connect", { protocol: 1, version: "0.2.2", panelId,
+      const result = await api.send("/connect", { protocol: 1, version: "0.2.3", panelId,
         project: state.project, aeVersion: "26.0-test", capabilities: state.capabilities })
       if (result.status !== 200) throw new Error(JSON.stringify(result))
     },
