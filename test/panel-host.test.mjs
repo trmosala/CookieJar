@@ -871,6 +871,15 @@ test("invalidated native project handle starts a new inspection epoch",()=>{
     assert.notEqual(after.projectEpoch,before.projectEpoch);
 });
 
+test("inspection does not query spatial tangents on a nonspatial value type",()=>{
+    const f=fixture(), p=new f.Property("ADBE Text Position 3D",[0,0,0],f.context.PropertyValueType.ThreeD);
+    p.isSpatial=true;p.setValueAtTime(0,[0,0,0]);
+    p.keyInSpatialTangent=()=>{throw new Error("This property does not have a spatial PropertyValueType");};
+    f.lyr.effects.children.push(p);
+    const result=f.call("inspect");
+    assert.equal(result.error,undefined,JSON.stringify(result)); assert.ok(result.result);
+});
+
 test("preference is read-only and disabled files leave inspection available; oversized snapshot refuses",()=>{
     const f=fixture();f.app.preferences.getPrefAsLong=()=>0;
     assert.equal(f.call("inspect").result.capabilities.fileNetwork,false);assert.equal(f.call("save").error.code,"preference_disabled");

@@ -792,7 +792,21 @@ function revealRenderOutput(file){
         if(!/^[a-f0-9]{64}$/.test(file.hash) || !Number.isSafeInteger(file.size) || file.size<1)throw error("invalid_output","Output verification is missing");
         var info=fs.lstatSync(file.path);
         if(!info.isFile() || info.isSymbolicLink() || info.size!==file.size)throw error("output_changed","Output changed since verification");
-        return new Promise(function(resolve,reject){var sum=crypto.createHash("sha256"),stream=fs.createReadStream(file.path);stream.on("data",function(data){sum.update(data);});stream.on("error",reject);stream.on("end",function(){if(sum.digest("hex")!==file.hash){reject(error("output_changed","Output hash changed"));return;}child.execFile(process.platform==="win32" ? "explorer.exe" : "open",process.platform==="win32" ? ["/select,",file.path] : ["-R",file.path],function(e){if(e)reject(e);else resolve();});});});
+        return new Promise(function(resolve,reject){
+            var sum=crypto.createHash("sha256"),stream=fs.createReadStream(file.path);
+            stream.on("data",function(data){sum.update(data);});stream.on("error",reject);
+            stream.on("end",function(){
+                if(sum.digest("hex")!==file.hash){reject(error("output_changed","Output hash changed"));return;}
+                if(process.platform==="win32"){
+                    // Explorer hands off to an existing shell and may exit 1 after success.
+                    // A successful spawn acknowledges the reveal request, not file validation.
+                    try{
+                        var reveal=child.spawn("explorer.exe",["/select,"+file.path],{windowsHide:true,stdio:"ignore",shell:false});
+                        reveal.once("error",reject);reveal.once("spawn",function(){reveal.unref();resolve();});
+                    }catch(e){reject(e);}
+                }else child.execFile("open",["-R",file.path],function(e){if(e)reject(e);else resolve();});
+            });
+        });
     });
 }
 module.exports={renderDirectory:renderDirectory,revealRenderOutput:revealRenderOutput,Store:Store,automaticStore:automaticStore,Client:Client,HostRPC:HostRPC,request:request,requestId:function(){return crypto.randomBytes(20).toString("hex");},compatibilityMetadata:compatibilityMetadata,normalizeCapture:normalizeCapture,cleanupCapture:cleanupCapture,secure:secure,VERSION:VERSION,PROTOCOL:PROTOCOL};

@@ -1,12 +1,12 @@
 (function(){
     "use strict";
     window.CookieJarRender=function(client,api,bind){
-        var context=client.context(),ticket=null,done=null,polling=false,listKey="",epoch=0,approval=null;
+        var context=client.context(),ticket=null,done=null,polling=false,listKey="",epoch=0,approval=null,shownApproval=null;
         function el(id){return document.getElementById(id);}
         function node(tag,text){var n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;}
         function message(text){el("render-status").textContent=text;}
         function failed(e){message((e.code || "render_error")+": "+e.message+". No automatic retry.");}
-        function clear(){ticket=null;approval=null;done=null;client.renderWorking=false;el("render-review").hidden=true;}
+        function clear(){ticket=null;approval=null;shownApproval=null;done=null;client.renderWorking=false;el("render-review").hidden=true;}
         function controls(){
             var blocked=client.renderWorking || client.state.connection!=="connected" || client.state.uncertain || client.state.busy || !!client.state.lock;
             ["render-comp","render-settings","render-output","render-start","render-end","render-path","render-templates","render-submit","render-refresh"].forEach(function(id){el(id).disabled=!!blocked;});
@@ -16,7 +16,10 @@
         function accept(state){
             if(!state || ["running","approval","completed","failed"].indexOf(state.status)<0)throw {code:"invalid_response",message:"Invalid render operation state"};
             ticket=state.token;approval=state.approval;el("render-review").hidden=!approval;
-            if(approval){el("render-review-text").textContent=approval.summary;message("Review "+approval.permission);}
+            if(approval){
+                el("render-review-text").textContent=approval.summary;message("Review "+approval.permission);
+                if(shownApproval!==approval.id){shownApproval=approval.id;el("render-review").scrollIntoView({block:"nearest"});}
+            }
             else if(state.status==="running")message("Working… Keep AE available. No automatic retry.");
             if(state.status==="failed"){clear();failed(state.error || {message:"Operation failed"});}
             if(state.status==="completed"){var finish=done;clear();message("Operation completed.");if(finish)finish(state.result);}

@@ -194,6 +194,8 @@ test("build bundles dependencies but preserves the real worker URL and reproduci
     assert.equal(observed.args[0], fileURLToPath(new URL("./render-worker.mjs", pathToFileURL(join(process.cwd(), "plugin.mjs")))));
     assert.equal(observed.args[1], "test-job");
     assert.equal(observed.options.detached, true);
+    assert.equal(observed.options.env.ELECTRON_RUN_AS_NODE, "1");
+    assert.equal(observed.options.env.NODE_OPTIONS, "");
   `;
   await exec(process.execPath, ["--input-type=module", "-e", smoke], { cwd: isolated, timeout: 15000 });
 });

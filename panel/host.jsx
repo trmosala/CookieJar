@@ -190,6 +190,7 @@ var CookieMonsterAE = (function () {
         return o;
     }
     function ease(a) { var r = [], i; for (i = 0; i < a.length; i++) r.push({speed:a[i].speed, influence:a[i].influence}); return r; }
+    function spatialProperty(p) { return p.propertyValueType === PropertyValueType.TwoD_SPATIAL || p.propertyValueType === PropertyValueType.ThreeD_SPATIAL; }
     function keyData(p, k) {
         var o = {time:p.keyTime(k), value:plainValue(p.keyValue(k), p.propertyValueType)};
         if (p.propertyValueType !== PropertyValueType.MARKER) {
@@ -197,7 +198,7 @@ var CookieMonsterAE = (function () {
             o.inEase = ease(p.keyInTemporalEase(k)); o.outEase = ease(p.keyOutTemporalEase(k));
             o.temporalContinuous = p.keyTemporalContinuous(k); o.temporalAutoBezier = p.keyTemporalAutoBezier(k);
             o.label = p.keyLabel(k);
-            if (p.isSpatial) {
+            if (spatialProperty(p)) {
                 o.inTangent = p.keyInSpatialTangent(k); o.outTangent = p.keyOutSpatialTangent(k);
                 o.roving = p.keyRoving(k); o.spatialContinuous = p.keySpatialContinuous(k); o.spatialAutoBezier = p.keySpatialAutoBezier(k);
             }
@@ -653,7 +654,7 @@ var CookieMonsterAE = (function () {
                 var propertyKey=stringify(a.locator), state=propertyEdits[propertyKey], keyIndex=-1, destinationIndex=-1;
                 if(!state) {
                     state={keys:[],expressionEnabled:!!p.expressionEnabled};
-                    for(k=1;k<=p.numKeys;k++)state.keys.push({time:p.keyTime(k),value:plainValue(p.keyValue(k),p.propertyValueType),roving:p.isSpatial ? p.keyRoving(k) : false});
+                    for(k=1;k<=p.numKeys;k++)state.keys.push({time:p.keyTime(k),value:plainValue(p.keyValue(k),p.propertyValueType),roving:spatialProperty(p) ? p.keyRoving(k) : false});
                     propertyEdits[propertyKey]=state;
                 }
                 if(state.rovingPending)fail("unsupported_ordering","Roving changes neighboring times; inspect before another action on this property");
@@ -691,12 +692,12 @@ var CookieMonsterAE = (function () {
                             var dims=p.propertyValueType===PropertyValueType.TwoD ? 2 : (p.propertyValueType===PropertyValueType.ThreeD ? 3 : 1);
                             if(own(a,"inEase")) { validateEase(a.inEase,dims);validateEase(a.outEase,dims); }
                             if(own(a,"inTangent")) {
-                                if(!p.isSpatial) fail("unsupported_interpolation","Not a spatial property");
+                                if(!spatialProperty(p)) fail("unsupported_interpolation","Not a spatial property");
                                 var spatialDims=p.propertyValueType===PropertyValueType.ThreeD_SPATIAL ? 3 : 2;
                                 vec(a.inTangent,spatialDims,-1e9,1e9);vec(a.outTangent,spatialDims,-1e9,1e9);
                             }
                             var flags=["roving","temporalContinuous","temporalAutoBezier","spatialContinuous","spatialAutoBezier"];
-                            for(k=0;k<flags.length;k++) if(own(a,flags[k])) { bool(a[flags[k]]); if((flags[k]==="roving" || flags[k].indexOf("spatial")===0) && !p.isSpatial) fail("unsupported_interpolation","Spatial flag on nonspatial property"); }
+                            for(k=0;k<flags.length;k++) if(own(a,flags[k])) { bool(a[flags[k]]); if((flags[k]==="roving" || flags[k].indexOf("spatial")===0) && !spatialProperty(p)) fail("unsupported_interpolation","Spatial flag on nonspatial property"); }
                             if(a.roving && (keyIndex===0 || keyIndex===state.keys.length-1)) fail("unsupported_interpolation","First/last key cannot rove");
                             if(a.roving)state.rovingPending=true;
                             if(own(a,"roving"))state.keys[keyIndex].roving=a.roving;

@@ -26,6 +26,14 @@ try{
     dashboard.update(state)
   })
   await page.locator("#render-templates").click()
+  await page.waitForFunction(()=>{
+    const review=document.getElementById("render-review").getBoundingClientRect()
+    const content=document.querySelector(".settings-content").getBoundingClientRect()
+    return review.top>=content.top && review.bottom<=content.bottom
+  })
+  await page.evaluate(()=>document.querySelector(".settings-content").scrollTop=0)
+  await page.waitForTimeout(1200)
+  assert.equal(await page.evaluate(()=>document.querySelector(".settings-content").scrollTop),0,"Polling must not repeatedly scroll the same review into view")
   await page.locator("#render-approve").click()
   await page.waitForFunction(()=>document.getElementById("render-output").value==="Lossless")
   await page.locator("#render-path").fill("D:/output/frame.avi")

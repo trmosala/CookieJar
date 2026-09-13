@@ -5,7 +5,8 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { once } from "node:events";
+import { once, EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBridge } from "../src/bridge.mjs";
@@ -21,6 +22,25 @@ const { Client, HostRPC, Store, request, normalizeCapture } = transport;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const descriptor = {port:12345,instanceId:"instance",protocol:1,version:"0.2.2",updateUrl:"https://github.com/trmosala/CookieJar/releases"};
 const project = {id:"path:c:/test.aep",path:"c:/test.aep",saved:true};
+test("Windows reveal verifies content and accepts Explorer handoff without trusting its exit code",async t=>{
+    const dir=await fsp.mkdtemp(path.join(os.tmpdir(),"reveal-test-"));t.after(()=>fsp.rm(dir,{recursive:true,force:true}));
+    const filename=path.join(dir,"output with spaces.mp4"),bytes=Buffer.from("verified output");await fsp.writeFile(filename,bytes);
+    const file={path:filename,size:bytes.length,hash:createHash("sha256").update(bytes).digest("hex")};
+    const nativeRequire=createRequire(import.meta.url),exports={exports:{}},calls=[];let launchError=false;
+    vm.runInNewContext(fs.readFileSync(new URL("../panel/transport.cjs",import.meta.url),"utf8"),{
+        module:exports,Buffer,process:{platform:"win32"},setTimeout,clearTimeout,
+        require(name){if(name!=="child_process")return nativeRequire(name);return {spawn(executable,args,options){
+            calls.push({executable,args,options});const child=new EventEmitter();child.unref=()=>{};
+            queueMicrotask(()=>{if(launchError)child.emit("error",Object.assign(new Error("Missing Explorer"),{code:"ENOENT"}));else{child.emit("spawn");child.emit("exit",1);}});return child;
+        }};}
+    });
+    await exports.exports.revealRenderOutput(file);
+    assert.equal(calls[0].executable,"explorer.exe");assert.equal(calls[0].args[0],"/select,"+filename);assert.equal(calls[0].options.shell,false);
+    await fsp.writeFile(filename,Buffer.alloc(bytes.length));
+    await assert.rejects(exports.exports.revealRenderOutput(file),{code:"output_changed"});assert.equal(calls.length,1);
+    await fsp.writeFile(filename,bytes);launchError=true;
+    await assert.rejects(exports.exports.revealRenderOutput(file),{code:"ENOENT"});
+});
 const status = {project,activeCompId:1,capabilities:{fileNetwork:true},aeVersion:"25.3",busy:false,uncertain:false};
 function fixture(overrides={}) {
     const events=[],store={state:{panelId:"panel",credential:"a".repeat(43),uncertain:false},save(){events.push(["save",this.state.uncertain]);},descriptor(){return {...descriptor};}};
