@@ -29,7 +29,7 @@ function fixture(saved = new Map()) {
     FileReader:class {readAsDataURL(file){this.file=file;readers.push(this)}}}
   vm.runInNewContext(readFileSync(new URL('../panel/preferences.js',import.meta.url),'utf8'),context)
   vm.runInNewContext(readFileSync(new URL('../panel/chat.js',import.meta.url),'utf8'),context)
-  const chat=context.window.CookieMonsterChat(client,{state:{credential:'test'},save(){}},{requestId:()=> 'a'.repeat(40),async request(d,c,p,b){calls.push(b);if(b.action==='skills')return {result:{skills,directory:skillDirectory,sessionID}};if(b.action==='skillReview')return {result:{token:'review',directory:skillDirectory,destination:'skills/'+b.draft.name+'/SKILL.md'}};if(b.action==='skillSave'){if(failSkillSave)throw {message:'Save not confirmed'};return {result:{name:b.draft.name,destination:'SKILL.md'}};}if(b.action==='checkpoints')return {result:{checkpoints:checkpointList}};if(b.action==='state' && holdState){const prior=model;await new Promise(resolve=>{releaseState=resolve});return {result:{status:'idle',model:prior,messages:[],workspaces:[]}};}if(b.action==='send' && failSend)throw {code:'disconnected',message:'Disconnected'};if(b.action==='models')return {result:{models:catalog}};if(b.action==='model'){if(failModel)throw {message:'Model unavailable'};model=b.model;return {result:{model}};}return {result:b.action==='send'? {delivery:'accepted'}:{status,model,sessionID,directory:skillDirectory,messages,workspaces:[skillDirectory]}}}})
+  const chat=context.window.CookieMonsterChat(client,{state:{credential:'test'},save(){}},{requestId:()=> 'a'.repeat(40),async request(d,c,p,b){calls.push(b);if(b.action==='retryDraft')return {result:{sessionID,messageID:b.messageID,text:'Original request',attachments:[{filename:'ref.txt',mime:'text/plain',url:'data:text/plain;base64,SGVsbG8='}]}};if(b.action==='skills')return {result:{skills,directory:skillDirectory,sessionID}};if(b.action==='skillReview')return {result:{token:'review',directory:skillDirectory,destination:'skills/'+b.draft.name+'/SKILL.md'}};if(b.action==='skillSave'){if(failSkillSave)throw {message:'Save not confirmed'};return {result:{name:b.draft.name,destination:'SKILL.md'}};}if(b.action==='checkpoints')return {result:{checkpoints:checkpointList}};if(b.action==='state' && holdState){const prior=model;await new Promise(resolve=>{releaseState=resolve});return {result:{status:'idle',model:prior,messages:[],workspaces:[]}};}if(b.action==='send' && failSend)throw {code:'disconnected',message:'Disconnected'};if(b.action==='models')return {result:{models:catalog}};if(b.action==='model'){if(failModel)throw {message:'Model unavailable'};model=b.model;return {result:{model}};}return {result:b.action==='send'? {delivery:'accepted'}:{status,model,sessionID,directory:skillDirectory,messages,workspaces:[skillDirectory]}}}})
   const tick=()=>new Promise(r=>setImmediate(r))
   const drop=(name='ref.png',size=10)=>el('chat-form').events.drop({preventDefault(){},dataTransfer:{files:[{name,size}]}})
   const finish=r=>{r.result='data:image/png;base64,SGVsbG8=';r.onload()}
@@ -381,4 +381,42 @@ test('a rendering failure releases the poll latch and later refreshes recover',a
   await f.refresh()
   assert.match(box.textContent,/Login required/)
   assert.equal(f.el('chat-progress').textContent,'Ready')
+})
+
+
+test('edit and retry reviews originals, preserves the draft on cancel and never sends on click',async()=>{
+  const f=fixture();await f.tick()
+  f.messages.push({id:'msg_original',role:'user',parts:[{type:'text',text:'Display text'}]})
+  await f.refresh();await f.tick()
+  function find(element,label){if(element.textContent===label && element.events.click)return element;for(const child of element.children){const found=find(child,label);if(found)return found;}}
+  const retry=()=>find(f.el('chat-messages'),'Edit and retry')
+  retry().click();await f.tick()
+  assert.equal(f.el('chat-input').value,'Original request')
+  assert.match(f.el('chat-attachments').textContent,/ref.txt/)
+  assert.equal(f.calls.filter(c=>c.action==='send').length,0)
+  f.el('chat-retry-cancel').click()
+  assert.equal(f.el('chat-input').value,'Describe this')
+  assert.equal(f.el('chat-attachments').children.length,0)
+  retry().click();await f.tick()
+  f.el('chat-input').value='Edited request'
+  f.el('chat-form').events.submit({preventDefault(){}});await f.tick()
+  const sent=f.calls.find(c=>c.action==='send')
+  assert.equal(sent.text,'Edited request');assert.equal(sent.retryMessageID,'msg_original')
+  assert.equal(sent.attachments[0].filename,'ref.txt');assert.equal(f.el('chat-retry-note').hidden,true)
+  f.status='busy';await f.refresh();assert.equal(retry().disabled,true)
+})
+
+
+test('a retry draft arriving after a project change is discarded',async()=>{
+  const f=fixture();await f.tick()
+  f.messages.push({id:'msg_original',role:'user',parts:[{type:'text',text:'Request'}]})
+  await f.refresh();await f.tick()
+  const row=f.el('chat-messages').children.find(c=>c.className==='chat-message from-user')
+  row.children.at(-1).children[0].click()
+  f.chat.update({...f.client.state,project:{id:'two',path:'two.aep'}})
+  await f.tick()
+  assert.notEqual(f.el('chat-input').value,'Original request')
+  assert.equal(f.el('chat-attachments').children.length,0)
+  assert.equal(f.el('chat-retry-note').hidden,true)
+  assert.equal(f.calls.filter(c=>c.action==='send').length,0)
 })

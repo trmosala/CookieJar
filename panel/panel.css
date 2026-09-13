@@ -52,6 +52,9 @@ select,input { width:100%; background:var(--surface); border:1px solid var(--bor
 .chat-user-bubble { background:#232323; padding:12px 14px; border-radius:10px; }
 .chat-message.from-user>h3 { display:none; }
 .chat-message-actions { display:flex; justify-content:flex-end; margin-top:3px; }
+.chat-message-retry { background:transparent; border-color:transparent; color:var(--muted); font-size:11px; padding:0 6px; min-height:24px; }
+.chat-message-retry:hover { background:#252525; color:#eee; }
+#chat-retry-note { font-size:11px; max-height:110px; overflow:auto; margin:0 0 8px; }
 .chat-message-restore { background:transparent; border-color:transparent; color:#888; font-size:18px; padding:0 5px; min-height:24px; line-height:24px; }
 .chat-message-restore:hover { background:#252525; color:#eee; }
 .chat-message-restore:disabled { opacity:.3; }

@@ -487,3 +487,34 @@ test("reviewed recovery releases the chat hold without claiming a successful res
   assert.match(f.inputs.at(-1).body.system,/reconciled/)
   assert.match(f.inputs.at(-1).body.system,/never replay previous edits/)
 })
+
+
+test("retry drafts use complete CM messages and send a reviewed new attempt once", async t => {
+  const f = await fixture(t)
+  const opened = await f.send(message())
+  const source = {info:{id:"msg_original",role:"user",sessionID:opened.sessionID},parts:[
+    {type:"text",text:"Try this title"},{type:"text",text:"Private synthetic context",synthetic:true},
+    {type:"file",filename:"notes.txt",mime:"text/plain",url:"data:text/plain;base64,SGVsbG8="}]}
+  f.client.session.message = async options => {assert.equal(options.path.id,opened.sessionID);return {data:source}}
+  const draft = await f.send({action:"retryDraft",messageID:source.info.id,expectedSessionID:opened.sessionID})
+  assert.equal(draft.text,"Try this title");assert.equal(draft.attachments[0].filename,"notes.txt")
+  assert.equal(f.inputs.length,1)
+  const retry = message({requestId:"b".repeat(40),text:"Try a smaller title",retryMessageID:source.info.id,expectedSessionID:opened.sessionID,attachments:draft.attachments})
+  await f.send(retry);await f.send(retry)
+  assert.equal(f.inputs.length,2);assert.match(f.inputs[1].body.system,/never blindly repeat/)
+  await assert.rejects(f.send({...retry,retryMessageID:"different"}),{code:"invalid_payload"})
+  f.statuses[opened.sessionID]={type:"busy"}
+  await assert.rejects(f.send({action:"retryDraft",messageID:source.info.id,expectedSessionID:opened.sessionID}),{code:"chat_busy"})
+  f.statuses[opened.sessionID]={type:"idle"}
+  source.info.role="assistant"
+  await assert.rejects(f.send({action:"retryDraft",messageID:source.info.id,expectedSessionID:opened.sessionID}),{code:"chat_missing"})
+  source.info.role="user";source.parts[2].url="file:///missing.txt"
+  await assert.rejects(f.send({action:"retryDraft",messageID:source.info.id,expectedSessionID:opened.sessionID}),{code:"invalid_payload"})
+  await assert.rejects(f.send({action:"retryDraft",messageID:source.info.id,expectedSessionID:"another"}),{code:"stale_session"})
+  assert.equal(f.inputs.length,2)
+  source.parts.pop()
+  f.admitted=async()=>{throw new Error("Lost acknowledgement")}
+  const uncertain=await f.send({...retry,requestId:"c".repeat(40)})
+  assert.equal(uncertain.delivery,"unknown")
+  await assert.rejects(f.send({action:"retryDraft",messageID:source.info.id,expectedSessionID:opened.sessionID}),{code:"chat_busy"})
+})
