@@ -51,7 +51,7 @@ function activeComp(value = null) {
   return value
 }
 
-export const RESTORE_PROOF = "compact-restore-v1"
+export const RESTORE_PROOF = "compact-restore-v2"
 
 export function restoreReceipt(value, expectedProject) {
   if (value?.protocol !== RESTORE_PROOF)
@@ -895,7 +895,7 @@ async function startBridge({
           if (!rec || rec.id !== p.recoveryId || rec.owner !== canonical(p.transaction) ||
               rec.phase !== (preparing ? "preparing" : "finishing") ||
               r.status !== (preparing ? "recovery_saved" : "recovered") ||
-              next.path !== p.path || !next.saved || !b || b.id !== pending.bindingID ||
+              next.path !== (preparing ? pending.project.path : p.path) || !next.saved || !b || b.id !== pending.bindingID ||
               !sameProject(b.project, pending.project) || lock?.state !== "executing" ||
               lock.sessionID !== pending.command.sessionID || lock.restore?.id !== rec.id)
             fail("invalid_host_result", "Manual restore reply does not match the executing owner")
@@ -903,7 +903,7 @@ async function startBridge({
           if (r.receipt.dirty !== false) fail("invalid_host_result", "Restore transition must return a clean project")
           if (preparing) {
             const prior = p.expected
-            if (r.receipt.projectEpoch !== prior.projectEpoch ||
+            if (!sameProject(next, pending.project) || r.receipt.projectEpoch !== prior.projectEpoch ||
                 r.receipt.revision !== prior.revision)
               fail("invalid_host_result", "Manual emergency save changed the approved revision")
             rec.snapshot = canonical(r.receipt)

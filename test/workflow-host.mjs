@@ -1,5 +1,5 @@
 import vm from "node:vm"
-import { readFileSync, writeFileSync, existsSync } from "node:fs"
+import { readFileSync, writeFileSync, existsSync, copyFileSync, constants } from "node:fs"
 import { RESTORE_PROOF } from "../src/bridge.mjs"
 
 // Proposed parent bridge contract, not production bridge/transport qualification.
@@ -45,7 +45,7 @@ export function manualRestoreBridge(dataDir, host) {
       if (params.phase === "restore_prepare" || params.phase === "restore_finish") {
         state.project = structuredClone(reply.result.project)
         state.lock.project = structuredClone(state.project)
-        if (state.lock.recoveryOriginal.path === state.project.path) delete state.lock.recoveryOriginal
+        if (params.phase === "restore_finish" && state.lock.recoveryOriginal.path === state.project.path) delete state.lock.recoveryOriginal
       }
       return reply.result
     },
@@ -104,6 +104,7 @@ export function hostDouble(projectPath) {
   class File {
     constructor(name) { this.fsName = name; this.alias = false }
     get exists() { return existsSync(this.fsName) }
+    copy(destination) { copyFileSync(this.fsName, destination, constants.COPYFILE_EXCL); return true }
   }
   const props = [new Property("ADBE Opacity", 100, VT.OneD), new Property("ADBE Position", [0, 0], VT.TwoD)]
   const transform = new Group("ADBE Transform Group", props.slice())

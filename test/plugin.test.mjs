@@ -341,7 +341,7 @@ test("runtime registers authenticated panel services; scope, token expiry/replay
   r.workflow.inspect = () => assert.fail("Restore must not request a full scene")
   const command = client.command.bind(client)
   client.command = cmd => {
-    if (cmd.method === "inspect") assert.deepEqual(cmd.params, { restore: "compact-restore-v1" })
+    if (cmd.method === "inspect") assert.deepEqual(cmd.params, { restore: "compact-restore-v2" })
     return command(cmd)
   }
   const restoreAudit = []
@@ -350,7 +350,7 @@ test("runtime registers authenticated panel services; scope, token expiry/replay
     async recordRestore(id, update) { assert.equal(id, sessionID); restoreAudit.push(update) },
   }
   let proposed = await send({ action: "checkpoint.restore.propose", id: checkpoint.id })
-  assert.match(proposed.result.operation, /save current unsaved edits.*private emergency project.*verify a protected checkpoint/i)
+  assert.match(proposed.result.operation, /save current edits in place.*verify a private emergency copy and protected checkpoint/i)
   assert.match(proposed.result.operation, /recovery copy/i)
   assert.equal(commands.some(command => ["save", "open", "execute"].includes(command.method)), false)
   clock += 300001
@@ -373,7 +373,8 @@ test("runtime registers authenticated panel services; scope, token expiry/replay
   assert.equal(h.project.file.fsName, canonicalPath)
   assert.equal(h.props[0].value, 100)
   assert.deepEqual(await readFile(canonicalPath), source)
-  assert.deepEqual(await readFile(restored.originalPath), original)
+  assert.equal(JSON.parse(await readFile(restored.originalPath)).props[0].value, 42)
+  assert.deepEqual(await readFile((await r.checkpoints.verify(restored.previousCheckpointId)).path), original)
   const backup = await r.checkpoints.verify(restored.currentCheckpointId)
   assert.equal(backup.verified, true)
   assert.equal(backup.pinned, true)
@@ -401,7 +402,7 @@ test("compact panel restore rejects malformed receipts and stale guards without 
       f = await restoreFixture({ after: close => cleanup.push(close) }, {
         evalScript(code, cb, h) {
           const response = JSON.parse(vm.runInContext(code, h.context))
-          if (armed && response.result?.protocol === "compact-restore-v1") {
+          if (armed && response.result?.protocol === "compact-restore-v2") {
             reads++
             if (scenario === "legacy review") delete response.result.protocol
             if (scenario === "malformed confirmation") response.result.dirty = "unknown"
@@ -451,7 +452,7 @@ test("compact panel restore rejects malformed receipts and stale guards without 
       }
       assert.ok(commands.some(c => c.method === "inspect"))
       for (const cmd of commands.filter(c => c.method === "inspect"))
-        assert.deepEqual(cmd.params, { restore: "compact-restore-v1" })
+        assert.deepEqual(cmd.params, { restore: "compact-restore-v2" })
     })
   }
 })

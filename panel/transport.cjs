@@ -471,7 +471,8 @@ Client.prototype.panel=function(action,args){
                 throw error("stale_binding","Project changed during panel request");
         }
         if(confirming){
-            r={checkpointId:r.checkpointId,currentCheckpointId:r.currentCheckpointId,path:r.path,canonicalPath:r.canonicalPath,
+            if(r.previousCheckpointId !== undefined && !text(r.previousCheckpointId,256))throw error("invalid_host_result","Invalid previous disk checkpoint");
+            r={checkpointId:r.checkpointId,currentCheckpointId:r.currentCheckpointId,previousCheckpointId:r.previousCheckpointId || null,path:r.path,canonicalPath:r.canonicalPath,
                 emergencyPath:r.emergencyPath,originalPath:r.originalPath || null,recoveryCopy:r.recoveryCopy,canonicalReplaced:r.canonicalReplaced,
                 rebindRequired:r.rebindRequired,automationSuspended:r.automationSuspended,fingerprint:r.fingerprint,cleanup:r.cleanup,warning:r.warning};
         }

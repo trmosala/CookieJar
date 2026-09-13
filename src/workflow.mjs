@@ -689,7 +689,7 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
         await permit(ask, `Restore checkpoint ${checkpointId}.
 Source: ${checkpoint.createdAt}
 Destination file: ${destination.mtime.toISOString()} (${b.project.path})
-Save current unsaved edits to a private emergency project and verify a protected checkpoint first. Then restore the original path, retaining its displaced file, and close/reopen through compact native guards. Any Save As revision change stops restoration before publication or close and keeps automation locked, even if the change came from saving alone. These receipts do not prove scene equivalence. If canonical publication fails, open a verified recovery copy and keep automation locked. Never retry an uncertain host call.`, {
+Preserve the existing disk file first, save current edits in place, and verify a private emergency copy and protected checkpoint. Then restore the original path and close/reopen through compact native guards. Any revision change during saving stops restoration before publication or close and keeps automation locked. If canonical publication fails, the canonical file contains your saved current work; open a verified recovery copy and keep automation locked. Never retry an uncertain host call.`, {
           kind: "restore", checkpoint, binding: b, sourceTimestamp, destinationTimestamp: destination.mtimeMs,
           destinationIdentity: hash({ path: b.project.path, hash: destinationHash,
             ...Object.fromEntries(["dev", "ino", "size", "mtimeMs", "ctimeMs"].map(key => [key, destination[key]])) }),
@@ -707,16 +707,27 @@ Save current unsaved edits to a private emergency project and verify a protected
         restoreLock = current(sessionID, b, { allowLocked: true }).lock
         if (!restoreLock || restoreLock.state !== "executing")
           fail("outcome_uncertain", "Restore lock was not confirmed")
-        let currentCheckpoint, restored
+        let currentCheckpoint, previousCheckpoint, restored
         try {
           await checkpoints.protect(checkpointId, transaction.id)
           await checkApproval(b, initial.fingerprint)
+          // In-place saving must never destroy the prior on-disk version.
+          const previous = await checkpoints.create({ projectPath: b.project.path, projectId: b.project.id, planHash, pinned: true })
+          previousCheckpoint = await checkpoints.verify(previous.id)
+          if (!await checkpointMatches(previousCheckpoint, b) || previousCheckpoint.hash !== destinationHash)
+            fail("stale_project", "Destination changed before saving current work")
+          await checkpoints.protect(previousCheckpoint.id, transaction.id)
+          await checkApproval(b, initial.fingerprint)
+          const beforeSave = await lstat(b.project.path)
+          if (["dev", "ino", "size", "mtimeMs", "ctimeMs"].some(key => beforeSave[key] !== destination[key]) ||
+              await fileHash(b.project.path) !== destinationHash)
+            fail("stale_project", "Destination changed before saving current work")
           const saved = bounded(await bridge.call(sessionID, "execute", {
             phase: "restore_prepare", transaction, recoveryId: transaction.id, expected: initial.data, path: emergencyPath,
           }, { allowLocked: true, timeoutMs: 120000 }))
           const recoveryBinding = current(sessionID, null, { write: true, allowLocked: true })
           if (recoveryBinding.id !== b.id || recoveryBinding.connectionId !== b.connectionId ||
-              saved.status !== "recovery_saved" || saved.project?.path !== emergencyPath ||
+              saved.status !== "recovery_saved" || saved.project?.path !== b.project.path ||
               !sameProject(saved.project, recoveryBinding.project))
             fail("invalid_host_result", "Manual recovery save identity was not confirmed")
           restoreReceipt(saved.receipt, saved.project)
@@ -724,10 +735,12 @@ Save current unsaved edits to a private emergency project and verify a protected
               saved.receipt.revision !== initial.data.revision)
             fail("invalid_host_result", "Current state changed while saving")
           const savedFingerprint = restoreFingerprint(saved.receipt, b.connectionId)
-          const created = await checkpoints.create({ projectPath: emergencyPath, projectId: saved.project.id, planHash, pinned: true })
+          const savedDestination = await lstat(b.project.path)
+          const created = await checkpoints.create({ projectPath: b.project.path, projectId: saved.project.id, planHash, pinned: true })
           currentCheckpoint = await checkpoints.verify(created.id)
           if (!await checkpointMatches(currentCheckpoint, recoveryBinding) || currentCheckpoint.planHash !== planHash ||
-              await fileHash(emergencyPath) !== currentCheckpoint.hash)
+              await fileHash(emergencyPath) !== currentCheckpoint.hash ||
+              await fileHash(b.project.path) !== currentCheckpoint.hash)
             fail("checkpoint_invalid", "Current-state backup did not verify")
           await checkpoints.protect(currentCheckpoint.id, transaction.id)
           await bridge.recordOutcome(sessionID, { outcome: "prepared", planHash, checkpointId, currentCheckpointId: currentCheckpoint.id })
@@ -735,7 +748,7 @@ Save current unsaved edits to a private emergency project and verify a protected
           await beforeReplace()
           restored = await checkpoints.restore(checkpointId, {
             canonicalPath: checkpoint.projectPath, expectedCheckpoint: checkpoint,
-            expectedDestination: { ...destination, hash: destinationHash },
+            expectedDestination: { ...savedDestination, hash: currentCheckpoint.hash },
             beforeReplace: () => checkApproval(recoveryBinding, savedFingerprint, false),
           })
           if (restored.recoveryCopy !== true && restored.recoveryCopy !== false)
@@ -778,19 +791,21 @@ Save current unsaved edits to a private emergency project and verify a protected
           const cleanup = restored.recoveryCopy ? null : await Promise.all([
             checkpoints.protect(checkpointId, transaction.id, false),
             checkpoints.protect(currentCheckpoint.id, transaction.id, false),
+            checkpoints.protect(previousCheckpoint.id, transaction.id, false),
           ]).then(() => null, () => "Recovery checkpoints remain protected; cleanup failed")
           return { ...restored, path: openPath, canonicalPath: checkpoint.projectPath,
-            checkpointId, currentCheckpointId: currentCheckpoint.id, emergencyPath,
+            checkpointId, currentCheckpointId: currentCheckpoint.id, previousCheckpointId: previousCheckpoint.id, emergencyPath,
             canonicalReplaced: !restored.recoveryCopy, rebindRequired: restored.recoveryCopy,
             automationSuspended: restored.recoveryCopy, fingerprint: inspected.fingerprint,
             protocol: RESTORE_PROOF, receipt: inspected.data, cleanup,
             warning: restored.recoveryCopy
               ? "Recovery copy opened. Original bytes are retained at the canonical path or originalPath. Do not overwrite newer edits. Review the emergency backup, Save As to the intended path, explicitly rebind and reconcile; automation remains locked."
-              : "Current-state checkpoint and displaced originalPath are retained. Review them before explicit cleanup." }
+              : "Current-state checkpoint, previous disk checkpoint and displaced originalPath are retained. Review them before explicit cleanup." }
         } catch (error) {
           await bridge.markUncertain(sessionID, "Manual restore was not confirmed; retain all recovery files").catch(() => {})
           throw new AEError(uncertain(error) ? "outcome_uncertain" : error.code || "restore_failed", error.message, {
             ...error.details, checkpointId, currentCheckpointId: currentCheckpoint?.id || null,
+            previousCheckpointId: previousCheckpoint?.id || null,
             emergencyPath, originalPath: restored?.originalPath || null, canonicalReplaced: restored?.recoveryCopy === false,
           })
         }

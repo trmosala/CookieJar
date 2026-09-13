@@ -303,3 +303,17 @@ test('project checkpoint picker reviews a selected checkpoint without a message 
   assert.equal(f.el('chat-checkpoints').hidden,true)
   assert.equal(f.el('chat-checkpoint-picker').value,'')
 })
+
+
+test('a rendering failure releases the poll latch and later refreshes recover',async()=>{
+  const f=fixture();await f.tick()
+  const box=f.el('chat-messages'),append=box.appendChild
+  f.messages.push({id:'reply',role:'assistant',completed:true,error:'Login required',parts:[]})
+  box.appendChild=()=>{throw new Error('Render failed')}
+  await f.refresh()
+  assert.match(f.el('chat-error').textContent,/Render failed/)
+  box.appendChild=append
+  await f.refresh()
+  assert.match(box.textContent,/Login required/)
+  assert.equal(f.el('chat-progress').textContent,'Ready')
+})

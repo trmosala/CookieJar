@@ -121,7 +121,7 @@ test("restore completion accepts the same owner's validated fallback without wea
         return {result};
     };
     await f.client.panel("checkpoint.restore.propose",{id:"cp"});
-    assert.deepEqual(await f.client.confirmRestore(),result);
+    assert.deepEqual(await f.client.confirmRestore(),{...result,previousCheckpointId:null});
     assert.equal(f.client.restoreApproval,null);
 });
 test("restore completion refuses stale owners, reconnects, foreign sources and malformed recovery evidence",async()=>{
@@ -198,7 +198,7 @@ test("actual Client.panel restore returns canonical and fallback backups through
             await createRuntime({factories:{bridge:async()=>p.bridge,renderer:async()=>({list:async()=>[],close:async()=>{}})}});
             for(let i=0;!client.state.binding && i<200;i++)await sleep(10);
             const review=await client.panel("checkpoint.restore.propose",{id:checkpoint.id});
-            assert.match(review.operation,/private emergency project/);assert.equal("token" in review,false);
+            assert.match(review.operation,/private emergency copy/);assert.equal("token" in review,false);
             assert.equal(h.project.dirty,true);assert.equal(h.closes,0);
             const rename=fsp.rename.bind(fsp);
             const fault=t.mock.method(fsp,"rename",async(source,destination)=>{
@@ -217,7 +217,9 @@ test("actual Client.panel restore returns canonical and fallback backups through
             assert.deepEqual(f.commands.filter(c=>c.params.phase?.startsWith("restore_")).map(c=>c.params.phase),["restore_prepare","restore_finish"]);
             assert.equal(p.bridge.binding(sessionID,{allowLocked:true}).lock?.state || null,fallback ? "uncertain" : null);
             const list=await client.panel("checkpoints",{});
-            assert.equal(list.some(c=>c.id===result.currentCheckpointId),false,"backup disclosure must not broaden checkpoint scope");
+            assert.equal(list.some(c=>c.id===result.currentCheckpointId),!fallback,"current backup belongs to the canonical project only");
+            const previous=await checkpoints.verify(result.previousCheckpointId);
+            assert.equal(JSON.parse(await fsp.readFile(previous.path,"utf8")).props[0].value,100);
             await assert.rejects(client.confirmRestore(),{code:"invalid_token"});
             await f.stop();
         });
