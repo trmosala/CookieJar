@@ -42,6 +42,14 @@
 <div class="settings-content">
 <section id="settings-general" class="settings-page" aria-labelledby="settings-general-heading">
 <div class="settings-page-header"><p>Settings</p><h2 id="settings-general-heading">General</h2><span>Project recovery and build information.</span></div>
+<section class="settings-card" aria-label="Presentation preferences">
+<label for="preference-textSize">Text size</label><select id="preference-textSize"><option value="small">Small</option><option value="normal">Normal</option><option value="large">Large</option></select>
+<label for="preference-density">Interface density</label><select id="preference-density"><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select>
+<label for="preference-sendKey">Send message</label><select id="preference-sendKey"><option value="enter">Enter (Shift+Enter for a new line)</option><option value="modifier">Ctrl / Cmd + Enter (Enter for a new line)</option></select>
+<label for="preference-activity">Activity and reasoning details</label><select id="preference-activity"><option value="auto">Open while working, collapse when finished</option><option value="collapsed">Start collapsed</option><option value="expanded">Start expanded</option></select>
+<p>Individual message choices are kept. These preferences do not change tool permissions.</p>
+<button id="preferences-reset" type="button">Reset presentation preferences</button><p id="preferences-status" role="status"></p>
+</section>
 <section class="settings-checkpoints" aria-label="Restore project checkpoint">
 <button id="chat-checkpoints-toggle" type="button" aria-expanded="false" aria-controls="chat-checkpoints">Restore checkpoint…</button>
 <section id="chat-checkpoints" aria-label="Project checkpoints" hidden>
@@ -319,6 +327,7 @@
 </main>
 
 <script src="chat.js"></script>
+<script src="preferences.js"></script>
 <script src="render.js"></script>
 
 <script src="ui.js"></script>

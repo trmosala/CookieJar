@@ -27,6 +27,7 @@ function fixture(saved = new Map()) {
   const catalog=[{id:'sol',providerID:'test',name:'Sol',provider:'Test',variants:['low','high']},{id:'fast',providerID:'test',name:'Fast',provider:'Test',variants:[]}]
   const context={window:{addEventListener(){},localStorage:{getItem:key=>saved.get(key),setItem:(key,value)=>saved.set(key,value)}},document:{getElementById:el,createElement:()=>new Element()},setInterval(fn){refresh=fn;},clearInterval(){},
     FileReader:class {readAsDataURL(file){this.file=file;readers.push(this)}}}
+  vm.runInNewContext(readFileSync(new URL('../panel/preferences.js',import.meta.url),'utf8'),context)
   vm.runInNewContext(readFileSync(new URL('../panel/chat.js',import.meta.url),'utf8'),context)
   const chat=context.window.CookieMonsterChat(client,{state:{credential:'test'},save(){}},{requestId:()=> 'a'.repeat(40),async request(d,c,p,b){calls.push(b);if(b.action==='skills')return {result:{skills,directory:skillDirectory,sessionID}};if(b.action==='skillReview')return {result:{token:'review',directory:skillDirectory,destination:'skills/'+b.draft.name+'/SKILL.md'}};if(b.action==='skillSave'){if(failSkillSave)throw {message:'Save not confirmed'};return {result:{name:b.draft.name,destination:'SKILL.md'}};}if(b.action==='checkpoints')return {result:{checkpoints:checkpointList}};if(b.action==='state' && holdState){const prior=model;await new Promise(resolve=>{releaseState=resolve});return {result:{status:'idle',model:prior,messages:[],workspaces:[]}};}if(b.action==='send' && failSend)throw {code:'disconnected',message:'Disconnected'};if(b.action==='models')return {result:{models:catalog}};if(b.action==='model'){if(failModel)throw {message:'Model unavailable'};model=b.model;return {result:{model}};}return {result:b.action==='send'? {delivery:'accepted'}:{status,model,sessionID,directory:skillDirectory,messages,workspaces:[skillDirectory]}}}})
   const tick=()=>new Promise(r=>setImmediate(r))
@@ -175,6 +176,15 @@ test('disclosures preserve manual choices during streaming and reset with the pr
   assert.equal(row().children[1].open,false)
   f.chat.update({...f.client.state,project:{id:'two',path:'two.aep'}});await f.refresh()
   assert.equal(row().children[2].open,false)
+})
+
+test('activity preference sets defaults while preserving manual disclosure choices across reload',async()=>{
+  const saved=new Map([['cookiejar-presentation-v1',JSON.stringify({activity:'expanded'})]])
+  const f=fixture(saved);f.messages.push({id:'pref',role:'assistant',completed:true,parts:[{type:'reasoning',text:'Reported details'}]})
+  await f.tick();await f.refresh();const details=f.el('chat-messages').children[0].children[1]
+  assert.equal(details.open,true);details.children[0].events.click({preventDefault(){}})
+  const again=fixture(saved);again.messages.push(...f.messages);await again.tick();await again.refresh()
+  assert.equal(again.el('chat-messages').children[0].children[1].open,false)
 })
 
 test('activity automatically collapses when streaming ends without a manual choice',async()=>{

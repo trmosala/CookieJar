@@ -266,6 +266,7 @@
         // Port CookieMonster's controlled disclosure state: streaming rerenders
         // must not override a user's choice. Native details replaces Solid/Kobalte.
         function disclosure(key, title, expanded) {
+            if(key.slice(-9)===":activity" && window.CookieJarPreferences){var choice=window.CookieJarPreferences.get().activity;if(choice!=="auto")expanded=choice==="expanded";}
             var box=node("details",undefined,"chat-disclosure"),summary=node("summary",title);
             box.open=Object.prototype.hasOwnProperty.call(collapseState,key) ? collapseState[key] : expanded;
             summary.addEventListener("click",function(e){e.preventDefault();box.open=!box.open;collapseState[key]=box.open;saveCollapse();});
@@ -570,7 +571,11 @@
             }).catch(function(e){if(g===generation){if(!e.code || ["timeout","disconnected","invalid_response","ECONNRESET","ETIMEDOUT"].indexOf(e.code)>=0){deliveryUnknown=true;error({message:"Delivery is uncertain. Check this conversation in CookieMonster before starting a new chat."});}else error(e);}}).then(function(){sending=false;drawAttachments();controls();});
         });
         el("chat-input").addEventListener("input",controls);
-        el("chat-input").addEventListener("keydown",function(e){if(e.key==="Enter" && !e.shiftKey){e.preventDefault();if(!el("chat-send").disabled)el("chat-send").click();}});
+        var composing=false;
+        el("chat-input").addEventListener("compositionstart",function(){composing=true;});
+        el("chat-input").addEventListener("compositionend",function(){composing=false;});
+        el("chat-input").addEventListener("keydown",function(e){if(!composing && (window.CookieJarPreferences ? window.CookieJarPreferences.shouldSend(e) : e.key==="Enter" && !e.shiftKey && !e.isComposing && e.keyCode!==229)){e.preventDefault();if(!el("chat-send").disabled)el("chat-send").click();}});
+        window.addEventListener("cookiejar-preferences",function(){messagesKey="";refresh();});
         el("chat-comp").addEventListener("change",function(){
             var saved=pins(),key=pinKey();
             if(key.length<=256){delete saved[key];saved[key]=el("chat-comp").value;Object.keys(saved).slice(0,-20).forEach(function(k){delete saved[k];});store.save();}

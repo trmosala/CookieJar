@@ -206,3 +206,11 @@ a { color:#b5c6df; overflow-wrap:anywhere; }
 #render-review { border:1px solid var(--border); padding:10px; }
 #render-review-text { white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; }
 #render-job-list section { border-top:1px solid var(--border); padding:8px 0; overflow-wrap:anywhere; }
+#settings-general select { display:block; width:100%; margin:5px 0 12px; min-width:0; }
+:root[data-text-size="small"] { font-size:12px; }
+:root[data-text-size="large"] { font-size:16px; }
+:root[data-text-size="large"] .chat-message,:root[data-text-size="large"] #chat-input { font-size:16px; }
+:root[data-text-size="small"] .chat-message,:root[data-text-size="small"] #chat-input { font-size:12px; }
+:root[data-density="compact"] .chat-message { margin-bottom:12px; padding-top:4px; padding-bottom:4px; }
+:root[data-density="compact"] .settings-card { padding:10px; }
+:root[data-density="compact"] header { padding-top:8px; padding-bottom:8px; }
