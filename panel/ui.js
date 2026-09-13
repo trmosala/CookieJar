@@ -22,6 +22,14 @@
         el("settings-nav-"+item[0]).addEventListener("click",function(){selectSettingsPage(item[0]);});
     });
     el("settings-close").addEventListener("click",function(){el("advanced").open=false;el("settings-toggle").focus();});
+    el("advanced").addEventListener("toggle",function(){if(this.open){el("chat-conversations").hidden=true;el("chat-conversations-open").setAttribute("aria-expanded","false");el("settings-close").focus();}});
+    el("advanced").addEventListener("keydown",function(e){
+        if(e.key!=="Tab" || !this.open)return;
+        var fields=Array.prototype.filter.call(this.querySelectorAll("button,input,select,textarea,a[href],summary"),function(field){return !field.disabled && field.offsetParent!==null && field.id!=="settings-toggle";});
+        if(!fields.length)return;
+        if(e.shiftKey&&document.activeElement===fields[0]){e.preventDefault();fields[fields.length-1].focus();}
+        else if(!e.shiftKey&&document.activeElement===fields[fields.length-1]){e.preventDefault();fields[0].focus();}
+    });
     selectSettingsPage("general");
     window.addEventListener("keydown",function(e){
         if(e.key==="Escape" && el("advanced").open){el("advanced").open=false;el("settings-toggle").focus();}
@@ -265,6 +273,12 @@
     try {
         var cep=window.__adobe_cep__;
         if (!cep || typeof cep.evalScript !== "function" || typeof cep.getHostEnvironment !== "function" || typeof cep.getSystemPath !== "function") throw {code:"cep_required",message:"Open this extension inside After Effects 25 or 26."};
+        // CEP forwards keys from buttons to AE unless the extension registers interest.
+        // OS virtual codes: Escape, Tab, Return and Space (including Shift+Tab).
+        if(typeof cep.registerKeyEventsInterest==="function") {
+            var navigationKeys=/Mac/.test(navigator.platform) ? [53,48,36,49] : [27,9,13,32];
+            cep.registerKeyEventsInterest(JSON.stringify(navigationKeys.map(function(code){return {keyCode:code};})));
+        }
         // Adobe CEP 12 CSInterface: HostEnvironment identifies the application, not a persistent launch.
         // https://github.com/Adobe-CEP/CEP-Resources/blob/master/CEP_12.x/CSInterface.js
         var raw=cep.getHostEnvironment();

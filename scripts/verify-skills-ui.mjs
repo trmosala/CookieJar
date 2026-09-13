@@ -57,6 +57,7 @@ try {
   await page.getByRole('button',{name:'Review save',exact:true}).click()
   await page.getByRole('button',{name:'Save skill',exact:true}).click()
   await page.waitForFunction(()=>document.getElementById('chat-technique').hidden)
+  await page.getByRole('button',{name:'Conversations',exact:true}).click()
   await page.getByRole('button',{name:'New chat',exact:true}).click()
   await page.locator('#chat-skills>summary').click()
   await page.locator('#chat-skill-picker option[value="0"]').waitFor({state:'attached'})

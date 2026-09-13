@@ -23,6 +23,10 @@ jobs:
         with:
           bun-version: 1.3.14
       - run: npm ci --ignore-scripts
+      # Storage fixtures require canonical parents (macOS /var aliases /private/var).
+      - name: Canonical test temporary directory
+        shell: bash
+        run: node -e "const fs=require('node:fs'); const tmp=fs.realpathSync.native(require('node:os').tmpdir()); fs.appendFileSync(process.env.GITHUB_ENV, ['TMPDIR','TMP','TEMP'].map(key=>key+'='+tmp).join('\n')+'\n')"
       - run: npm test
       - run: npm run check
       - run: npm run build

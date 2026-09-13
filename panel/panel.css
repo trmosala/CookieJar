@@ -219,3 +219,54 @@ a { color:#b5c6df; overflow-wrap:anywhere; }
 #target-results button { display:block; width:100%; white-space:normal; text-align:left; margin:6px 0; overflow-wrap:anywhere; }
 #target-scope,#target-search { width:100%; min-width:0; margin-bottom:8px; }
 #chat-references { max-height:120px; overflow:auto; }
+
+/* Selected OpenCode reference: a warm, compact chat panel with overlay navigation. */
+:root { background:#191716; color:#eee9e5; --surface:#242120; --border:#3b3633; --muted:#a09a95; }
+main { padding:0 14px 12px; }
+header { display:grid; grid-template-columns:28px minmax(0,1fr) auto; gap:10px; padding:12px 0 0; border-bottom:1px solid var(--border); }
+.header-menu { padding:0; width:28px; min-height:28px; font-size:19px; background:transparent; border-color:transparent; color:#b5ada7; }
+.brand { min-width:0; gap:8px; }
+.brand-mark { width:18px; height:18px; }
+.brand h1 { font-weight:400; white-space:nowrap; }
+#chat-title { color:#c8c0ba; font-size:12px; font-weight:400; border-left:1px solid var(--border); padding-left:10px; }
+.header-controls { grid-column:3; grid-row:1; margin:0; gap:6px; }
+#connection-status { font-size:10px; }
+.header-composition { grid-column:1 / -1; grid-row:2; display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.2fr); max-width:none; width:100%; gap:4px 10px; padding:10px 0; border-top:1px solid var(--border); }
+.header-project-name { max-width:none; margin:0; align-self:center; font-weight:400; color:#c9c1bb; }
+#chat-comp { background:transparent; border:0; font-size:12px; padding:3px; }
+#chat-target,#chat-selected-layers { grid-column:1 / -1; margin:0; }
+.chat { padding-top:10px; }
+.chat-user-bubble { background:#2b2623; border-radius:5px; padding:10px 12px; }
+.chat-message.from-user { margin-left:10px; }
+.chat-message h3 { color:#9e9690; font-weight:400; }
+.chat-disclosure>summary { color:#a69e98; font-size:12px; }
+.chat-message img { border-radius:5px; border-color:var(--border); }
+.chat-checkpoint { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; padding:9px 12px; border-radius:5px; gap:6px; }
+.chat-checkpoint strong { font-weight:400; }
+.chat-checkpoint p:empty { display:none; }
+.chat-checkpoint button { grid-column:2; grid-row:1; background:transparent; border-color:transparent; }
+.chat-checkpoint p:not(:empty) { grid-column:1 / -1; }
+#chat-form { background:#25211f; border-color:#48403c; border-radius:6px; box-shadow:none; flex:0 0 auto; overflow:visible; padding:10px 10px 8px; }
+#chat-input { background:transparent; min-height:64px; }
+.chat-actions { flex-wrap:wrap; gap:5px; justify-content:flex-start; }
+.chat-model-controls { flex:1 1 110px; }
+.composer-model-mark { display:none; }
+#chat-form .composer-icon { border-radius:4px; }
+#chat-attachments { max-height:100px; overflow:auto; }
+#chat-references { max-height:75px; }
+#chat-skills { margin:0; overflow:visible; max-height:none; flex:0 0 auto; }
+#chat-skills>summary { font-size:12px; padding:4px; list-style:none; cursor:pointer; }
+#chat-skills>summary::-webkit-details-marker { display:none; }
+.skills-popup { position:absolute; left:10px; right:10px; bottom:145px; max-height:55%; overflow:auto; z-index:6; padding:14px; background:var(--surface); border:1px solid var(--border); border-radius:5px; box-shadow:0 8px 20px #0008; }
+#chat-conversations { top:0; bottom:0; left:0; right:auto; width:min(360px,100%); border:0; border-right:1px solid var(--border); border-radius:0; background:#211d1b; box-shadow:15px 0 35px #0008; z-index:8; padding:18px 14px; }
+#chat-new { display:block; width:100%; text-align:left; border:1px solid var(--border); padding:9px 10px; margin:12px 0; color:#e5ddd7; }
+#conversation-project { font-size:11px; color:var(--muted); }
+.chat-conversation-row { padding:14px 2px; }
+.chat-conversation-row strong { font-weight:400; }
+#advanced>.advanced-content { z-index:9; border-color:var(--border); border-radius:5px; background:#211d1b; }
+.settings-content { background:#211d1b; }
+.settings-sidebar { background:#29231f; }
+.settings-page>.settings-card,.settings-page>.settings-checkpoints { background:#292421; border-color:var(--border); border-radius:5px; }
+@media(max-width:420px) { .brand h1 { font-size:12px; } #chat-title { max-width:110px; font-size:11px; padding-left:7px; } #connection-status { font-size:0; gap:0; } .header-controls { gap:6px; } main { padding:0 10px 10px; } .composer-reasoning { max-width:72px; } }
+@media(max-height:460px) { .header-composition { padding:5px 0; } #chat-selected-layers { max-height:1.5em; } #chat-input { min-height:40px; height:40px; } #chat-form { min-height:85px; } }
+@media(max-width:340px) { .chat-model-controls { order:-1; flex-basis:100%; } }

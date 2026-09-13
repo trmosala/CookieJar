@@ -47,6 +47,7 @@
         }
         function conversationControls() {
             var blocked=switchBlocked();
+            el("conversation-switch-status").textContent=blocked ? "Finish active work or recovery before switching conversations." : "";
             conversationRows.forEach(function(row){row.open.disabled=blocked || conversationLoading || row.unavailable;row.rename.disabled=row.open.disabled;});
             el("chat-conversations-prev").disabled=conversationLoading || conversationSwitching || conversationOffset===0 || state.connection!=="connected";
             el("chat-conversations-next").disabled=conversationLoading || conversationSwitching || conversationNext===null || state.connection!=="connected";
@@ -78,7 +79,7 @@
                 el("chat-conversations-status").textContent=data.total ? (offset+1)+"–"+Math.min(offset+10,data.total)+" of "+data.total+(switchBlocked() ? ". Finish work or recovery before switching." : "") : "No conversations found for this project.";
             },function(e){if(g===generation && epoch===conversationEpoch){el("chat-conversations-list").textContent="";conversationRows=[];conversationNext=null;el("chat-conversations-status").textContent=e.message || "Conversations unavailable";}}).then(function(){if(epoch===conversationEpoch){conversationLoading=false;conversationControls();}});
         }
-        function closeConversations() { if(conversationSwitching)return;conversationEpoch++;conversationLoading=false;el("chat-conversations").hidden=true;el("chat-conversations-open").focus(); }
+        function closeConversations() { if(conversationSwitching)return;conversationEpoch++;conversationLoading=false;el("chat-conversations").hidden=true;el("chat-conversations-open").setAttribute("aria-expanded","false");el("chat-conversations-open").focus(); }
         function applyTarget(id) {
             var picker=el("chat-comp"),value=id===null ? "follow" : String(id);
             if(value!=="follow" && !(state.compositions || []).some(function(c){return String(c.id)===value;})){
@@ -95,12 +96,12 @@
                 clearSkills();snapshot={sessionID:data.sessionID,status:"loading"};messagesKey="";approvalsKey="";collapseSession="";historyMessages=[];historyLoaded=false;historyCursor=null;
                 historyLoading=false;catalogLoading=false;checkpointLoading=false;checkpointAt=0;catalogAt=0;checkpointList=[];
                 deliveryUnknown=false;attachments=[];drawAttachments();el("chat-input").value="";el("chat-messages").textContent="";el("chat-approvals").textContent="";
-                el("chat-error").textContent="";el("chat-conversations").hidden=true;applyTarget(data.targetCompId===undefined ? null : data.targetCompId);
+                el("chat-error").textContent="";el("chat-conversations").hidden=true;el("chat-conversations-open").setAttribute("aria-expanded","false");references=[];drawReferences();applyTarget(data.targetCompId===undefined ? null : data.targetCompId);el("chat-input").focus();
             },function(e){if(g===generation){error(e);el("chat-conversations-status").textContent=e.message || "Could not open conversation";}}).then(function(){
                 if(g!==generation)return;conversationSwitching=false;controls();refresh();
             });
         }
-        el("chat-conversations-open").addEventListener("click",function(){el("chat-conversations").hidden=false;el("chat-conversations-search").focus();loadConversations(0);});
+        el("chat-conversations-open").addEventListener("click",function(){el("advanced").open=false;el("chat-conversations").hidden=false;el("conversation-project").textContent=state.project && state.project.path || "Unsaved project";el("chat-conversations-open").setAttribute("aria-expanded","true");el("chat-conversations-search").focus();loadConversations(0);});
         el("chat-conversations-close").addEventListener("click",closeConversations);
         el("chat-conversations-search-button").addEventListener("click",function(){loadConversations(0);});
         el("chat-conversations-search").addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();loadConversations(0);}});
@@ -204,6 +205,7 @@
         el("chat-skill-search").addEventListener("input",drawSkills);
         el("chat-skills-refresh").addEventListener("click",refreshSkills);
         el("chat-skills").addEventListener("toggle",function(){if(this.open)refreshSkills();});
+        el("chat-skills").addEventListener("keydown",function(e){if(e.key==="Escape" && this.open){e.preventDefault();this.open=false;this.querySelector("summary").focus();}});
         el("chat-skill-picker").addEventListener("change",function(){
             skillChoice=this.value==="" ? null : skills[Number(this.value)] || null;
             el("chat-skill-status").textContent=skillChoice ? "Selected: "+skillChoice.name+" (not loaded)" : "No skill selected";
@@ -470,6 +472,7 @@
             if(snapshot && (snapshot.sessionID!==data.sessionID || snapshot.directory!==data.directory))clearSkills();
             snapshot=data;
             el("chat-title").textContent=data.title || "";
+            el("chat-title").title=data.title || "New conversation";
             if(collapseSession!==data.sessionID && data.targetCompId!==undefined)applyTarget(data.targetCompId);
             if(collapseSession!==data.sessionID){if(collapseSession){references=[];drawReferences();closeTargets();}collapseSession=data.sessionID;loadCollapse();messagesKey="";historyMessages=[];historyLoaded=false;historyCursor=null;}
             if(!historyLoaded)historyCursor=data.nextCursor || null;
@@ -515,7 +518,7 @@
                     (message.parts || []).forEach(function(part,partIndex){
                         var partKey=messageKey+":"+(part.id || partIndex);
                         if(part.type==="image" && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(part.url)) {
-                            var imageBox=disclosure(partKey,"Image · "+(part.filename || "Composition frame"),false);
+                            var imageBox=disclosure(partKey,part.compId ? "Composition #"+part.compId+" · "+part.time.toFixed(3)+"s" : "Image · "+(part.filename || "Composition frame"),!!message.completed && messageIndex>=(data.messages || []).length-2);
                             var img=node("img");img.src=part.url;img.alt=part.filename || "Composition frame";imageBox.appendChild(img);content.appendChild(imageBox);
                         } else if(part.type==="skill") {
                             content.appendChild(node("p","Loaded skill: "+part.name,"chat-skill-loaded"));
@@ -525,7 +528,7 @@
                             button.addEventListener("click",function(){if(!button.disabled)reviewRestore(part.id);});
                             checkpointButtons.push({id:part.id,status:status,button:button});card.appendChild(status);card.appendChild(button);row.appendChild(card);
                         } else if(part.type==="tool" || part.type==="reasoning"){
-                            if(!activity){activity=disclosure(messageKey+":activity",!message.completed && data.status!=="idle" ? "Working…" : "Activity",!message.completed && data.status!=="idle");content.appendChild(activity);}
+                            if(!activity){activity=disclosure(messageKey+":activity",!message.completed && data.status!=="idle" ? "Working… · Show steps" : "Show steps",!message.completed && data.status!=="idle");content.appendChild(activity);}
                             if(part.type==="reasoning")activity.appendChild(node("h4","Reasoning"));
                             activity.appendChild(part.type==="tool" ? node("div",part.text,"chat-tool") : formatted(part));
                         } else if(part.type==="text"){
@@ -630,6 +633,7 @@
                 drawCheckpoints();el("chat-checkpoints").hidden=true;el("chat-checkpoints-toggle").setAttribute("aria-expanded","false");
                 el("chat-messages").textContent="";el("chat-approvals").textContent="";el("chat-error").textContent="";el("chat-input").value="";
                 el("chat-project-name").textContent=s.project && s.project.path ? s.project.path.split(/[\\/]/).pop() : "Unsaved project";
+                el("chat-project-name").title=s.project && s.project.path || "Unsaved project";
             }
             var list=JSON.stringify(s.compositions || []);
             if(list!==compKey) {

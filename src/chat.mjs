@@ -563,10 +563,14 @@ function displayMessages(messages) {
         return [{ type: "reasoning", id: part.id, text, markdown: markdown(text) }]
       }
       const files = part.type === "file" ? [part] : part.type === "tool" ? part.state?.attachments || [] : []
+      let frame = {}
+      if (part.type === "tool" && part.tool === "ae_capture" && typeof part.state?.output === "string" && part.state.output.length < 65536) {
+        try { const meta=JSON.parse(part.state.output);if(Number.isSafeInteger(meta.compId)&&meta.compId>0&&Number.isFinite(meta.time)&&meta.time>=0)frame={compId:meta.compId,time:meta.time} } catch {}
+      }
       const images = files.flatMap(file => {
         if (typeof file.url !== "string" || !/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(file.url) || file.url.length > imageBudget) return []
         imageBudget -= file.url.length
-        return [{ type: "image", id: file.id, url: file.url, filename: file.filename || "Composition frame" }]
+        return [{ type: "image", id: file.id, url: file.url, filename: file.filename || "Composition frame", ...frame }]
       })
       if (part.type === "tool") {
         const cards = []
