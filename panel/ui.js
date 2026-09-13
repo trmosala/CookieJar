@@ -273,6 +273,12 @@
     try {
         var cep=window.__adobe_cep__;
         if (!cep || typeof cep.evalScript !== "function" || typeof cep.getHostEnvironment !== "function" || typeof cep.getSystemPath !== "function") throw {code:"cep_required",message:"Open this extension inside After Effects 25 or 26."};
+        // CEP forwards keys from buttons to AE unless the extension registers interest.
+        // OS virtual codes: Escape, Tab, Return and Space (including Shift+Tab).
+        if(typeof cep.registerKeyEventsInterest==="function") {
+            var navigationKeys=/Mac/.test(navigator.platform) ? [53,48,36,49] : [27,9,13,32];
+            cep.registerKeyEventsInterest(JSON.stringify(navigationKeys.map(function(code){return {keyCode:code};})));
+        }
         // Adobe CEP 12 CSInterface: HostEnvironment identifies the application, not a persistent launch.
         // https://github.com/Adobe-CEP/CEP-Resources/blob/master/CEP_12.x/CSInterface.js
         var raw=cep.getHostEnvironment();
