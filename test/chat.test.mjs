@@ -38,6 +38,104 @@ async function fixture(t) {
 }
 const message = (extra = {}) => ({ action: "send", text: "Make this title blue", compId: 1, requestId: "a".repeat(40), ...extra })
 
+test("workspace defaults require the exact saved project parent, never an ancestor or sole client", async t => {
+  const f = await fixture(t)
+  f.p.state.project = { id: "nested", path: f.p.dataDir + "/Campaign/title.aep", saved: true }
+  await f.p.heartbeat()
+  const directory = f.p.dataDir + "/Campaign"
+  const state = await f.send()
+  assert.equal(state.directory, directory)
+  assert.equal(state.suggestedDirectory, directory)
+  assert.equal(state.needsWorkspace, true)
+  assert.match(state.error, /Open folder .*Campaign.* in CookieMonster/)
+  assert.deepEqual((await f.send({ action: "models" })).models, [])
+  for (const body of [message(), { action: "new" }, { action: "model", model: { id: "sol", providerID: "test" } }])
+    await assert.rejects(f.send(body), { code: "chat_workspace" })
+  assert.equal(f.calls.length, 0)
+  const queries = []
+  f.chat.register({ directory, client: { ...f.client, provider: { async list(options) {
+    queries.push(options.query.directory); return { data: f.catalog }
+  } } } })
+  assert.equal((await f.send()).needsWorkspace, false)
+  assert.equal((await f.send({ action: "models" })).models.length, 2)
+  await f.send({ action: "model", model: { id: "sol", providerID: "test" } })
+  await f.send(message())
+  assert.ok(queries.every(dir => dir === directory))
+  assert.ok(f.calls.filter(c => ["create", "model", "prompt"].includes(c[0])).every(c => c[1].query.directory === directory))
+})
+
+test("unsaved projects require save or explicit selection, which persists for the conversation", async t => {
+  const f = await fixture(t)
+  f.p.state.project = { id: "unsaved", path: null, saved: false }
+  await f.p.heartbeat()
+  const state = await f.send()
+  assert.equal(state.directory, null)
+  assert.match(state.error, /Save.*project or select a workspace/)
+  assert.equal((await f.send({ action: "models" })).needsWorkspace, true)
+  await assert.rejects(f.send(message()), { code: "chat_workspace" })
+  assert.equal(f.calls.length, 0)
+  await f.send(message({ directory: f.p.dataDir }))
+  assert.equal((await f.send()).directory, f.p.dataDir)
+  await f.send({ action: "new" })
+  assert.equal((await f.send()).directory, f.p.dataDir)
+})
+
+test("explicit selection wins over project defaults and survives new chats and reopening", async t => {
+  const f = await fixture(t), directory = f.p.dataDir + "/chosen"
+  f.chat.register({ client: f.client, directory })
+  assert.equal((await f.send({ directory })).directory, directory)
+  await f.send(message({ directory }))
+  assert.equal((await f.send({ directory: f.p.dataDir })).directory, directory)
+  await assert.rejects(f.send({ action: "new", directory: "/not-open" }), { code: "chat_workspace" })
+  assert.equal(f.calls.filter(c => c[0] === "abort").length, 0)
+  await f.send({ action: "new" })
+  const reopened = await createChat(f.runtime)
+  reopened.register({ client: f.client, directory })
+  f.p.bridge.setChatHandler(reopened.handle)
+  assert.equal((await f.send()).directory, directory)
+  assert.equal((await f.send({ action: "models" })).needsWorkspace, false)
+})
+
+test("closed workspaces expose recovery state and do not block switching projects", async t => {
+  const f = await fixture(t), directory = f.p.dataDir + "/chosen"
+  const unregister = f.chat.register({ client: f.client, directory })
+  const sent = await f.send(message({ directory }))
+  unregister()
+  const state = await f.send()
+  assert.equal(state.sessionID, sent.sessionID)
+  assert.equal(state.directory, directory)
+  assert.equal(state.needsWorkspace, true)
+  assert.deepEqual((await f.send({ action: "models" })).models, [])
+  await assert.rejects(f.send(message({ requestId: "b".repeat(40) })), { code: "chat_workspace" })
+  f.p.state.project = { id: "other", path: f.p.dataDir + "/other.aep", saved: true }
+  await f.p.heartbeat()
+  assert.equal((await f.send()).directory, f.p.dataDir)
+  assert.equal((await f.send(message())).delivery, "accepted")
+})
+
+test("project folders and titles support macOS, Windows drive paths and UNC paths", async t => {
+  const f = await fixture(t)
+  for (const [filename, directory] of [
+    ["/Users/artist/My Project/title.aep", "/Users/artist/My Project"],
+    [String.raw`C:\Projects\My Project\title.aep`, String.raw`C:\Projects\My Project`],
+    ["D:/Projects/My Project/title.aep", "D:/Projects/My Project"],
+    [String.raw`\\server\share\My Project\title.aep`, String.raw`\\server\share\My Project`],
+    ["/title.aep", "/"],
+    [String.raw`C:\title.aep`, "C:\\"],
+  ]) {
+    // Exercise foreign path syntax below the bridge's native-platform validation.
+    const project = { id: filename, path: filename, saved: true }
+    const send = body => f.chat.handle({ body, project, panelId: filename, connectionId: f.p.connectionId, check() {} })
+    f.chat.register({ client: f.client, directory })
+    assert.equal((await send({ action: "state" })).directory, directory)
+    assert.equal((await send({ action: "models" })).needsWorkspace, false)
+    await send({ action: "new" })
+    const create = f.calls.filter(c => c[0] === "create").at(-1)[1]
+    assert.equal(create.query.directory, directory)
+    assert.match(create.body.title, /title\.aep$/)
+  }
+})
+
 test("model selection uses CM session configuration, survives reopening and reaches prompts", async t => {
   const f = await fixture(t)
   assert.equal((await f.send({ action: "models" })).models.length, 2)

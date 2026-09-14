@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
 import {readFileSync} from 'node:fs'
-function fixture() {
+function fixture(options = {}) {
   class Element {
     constructor(){this.children=[];this.events={};this.value='';this.disabled=false}
     set textContent(v){this.text=v;this.children=[]}
@@ -21,13 +21,81 @@ function fixture() {
   const context={window:{addEventListener(){}},document:{getElementById:el,createElement:()=>new Element()},setInterval(fn){refresh=fn;},clearInterval(){},
     FileReader:class {readAsDataURL(file){this.file=file;readers.push(this)}}}
   vm.runInNewContext(readFileSync(new URL('../panel/chat.js',import.meta.url),'utf8'),context)
-  const chat=context.window.CookieMonsterChat(client,{state:{credential:'test'},save(){}},{requestId:()=> 'a'.repeat(40),async request(d,c,p,b){calls.push(b);if(b.action==='state' && holdState){const prior=model;await new Promise(resolve=>{releaseState=resolve});return {result:{status:'idle',model:prior,messages:[],workspaces:[]}};}if(b.action==='send' && failSend)throw {code:'disconnected',message:'Disconnected'};if(b.action==='models')return {result:{models:catalog}};if(b.action==='model'){if(failModel)throw {message:'Model unavailable'};model=b.model;return {result:{model}};}return {result:b.action==='send'? {delivery:'accepted'}:{status,model,messages:[],workspaces:[]}}}})
+  const chat=context.window.CookieMonsterChat(client,{state:{credential:'test'},save(){}},{requestId:()=> 'a'.repeat(40),async request(d,c,p,b){calls.push(b);if(options.request){const result=await options.request(b);if(result)return {result};}if(b.action==='state' && holdState){const prior=model;await new Promise(resolve=>{releaseState=resolve});return {result:{status:'idle',model:prior,messages:[],workspaces:[]}};}if(b.action==='send' && failSend)throw {code:'disconnected',message:'Disconnected'};if(b.action==='models')return {result:{models:catalog}};if(b.action==='model'){if(failModel)throw {message:'Model unavailable'};model=b.model;return {result:{model}};}return {result:b.action==='send'? {delivery:'accepted'}:{status,model,messages:[],workspaces:[]}}}})
   const tick=()=>new Promise(r=>setImmediate(r))
   const drop=(name='ref.png',size=10)=>el('chat-form').events.drop({preventDefault(){},dataTransfer:{files:[{name,size}]}})
   const finish=r=>{r.result='data:image/png;base64,SGVsbG8=';r.onload()}
   el('chat-input').value='Describe this';el('chat-input').events.input()
   return {el,chat,client,readers,calls,tick,drop,finish,refresh:()=>refresh(),releaseState:()=>releaseState(),set holdState(v){holdState=v},set failSend(v){failSend=v},set failModel(v){failModel=v},set status(v){status=v}}
 }
+test('workspace picker shows exact suggestions, preserves choices and resets on project switches',async()=>{
+  let directory='/Projects/one', workspaces=['/unrelated'], sessionID=null
+  const f=fixture({request:async b=>{
+    if(b.action==='state')return {status:'idle',messages:[],directory,workspaces,sessionID}
+  }})
+  await f.tick()
+  const picker=f.el('chat-workspace')
+  assert.equal(picker.value,directory)
+  assert.equal(picker.hidden,false)
+  assert.match(picker.textContent,/open in CookieMonster/)
+  assert.equal(f.calls.find(c=>c.action==='models').directory,directory)
+  picker.value='/unrelated';picker.events.change.call(picker);await f.tick()
+  await f.refresh()
+  assert.equal(picker.value,'/unrelated')
+  assert.equal(f.calls.filter(c=>c.action==='state').at(-1).directory,'/unrelated')
+  assert.equal(f.calls.filter(c=>c.action==='models').at(-1).directory,'/unrelated')
+  workspaces=['/unrelated','/another'];await f.refresh()
+  assert.equal(picker.value,'/unrelated')
+  f.el('chat-form').events.submit({preventDefault(){}})
+  assert.equal(picker.disabled,true)
+  await f.tick()
+  assert.equal(f.calls.find(c=>c.action==='send').directory,'/unrelated')
+  directory='/Projects/two'
+  f.chat.update({...f.client.state,project:{id:'two',path:'/Projects/two/title.aep'}})
+  assert.equal(picker.value,'')
+  await f.refresh()
+  assert.equal(picker.value,directory)
+  assert.equal(f.calls.filter(c=>c.action==='state').at(-1).directory,undefined)
+  sessionID='saved-chat';directory='/persisted';await f.refresh()
+  assert.equal(picker.value,'/persisted')
+  assert.equal(picker.disabled,true)
+})
+
+test('unsaved picker never silently selects the sole registered workspace',async()=>{
+  const f=fixture({request:async b=>{
+    if(b.action==='state')return {status:'idle',messages:[],directory:null,workspaces:['/unrelated']}
+    if(b.action==='models')return {models:[],needsWorkspace:true,workspaceError:'Save the After Effects project or select a workspace in CookieMonster.'}
+  }})
+  await f.tick()
+  const picker=f.el('chat-workspace')
+  assert.equal(picker.value,'')
+  assert.equal(picker.hidden,false)
+  assert.equal(picker.disabled,false)
+  assert.match(f.el('chat-model-status').textContent,/Save.*select a workspace/)
+  f.el('chat-form').events.submit({preventDefault(){}});await f.tick()
+  assert.equal(f.calls.find(c=>c.action==='send').directory,undefined)
+})
+
+test('workspace changes discard an in-flight catalog and reload for the selected directory',async()=>{
+  let release, hold=true
+  const model=id=>({id,providerID:'test',name:id,provider:'Test',variants:[]})
+  const f=fixture({request:async b=>{
+    if(b.action==='state')return {status:'idle',messages:[],directory:b.directory || '/project',workspaces:['/project','/chosen']}
+    if(b.action==='models'){
+      if(hold){hold=false;await new Promise(resolve=>{release=resolve})}
+      return {models:[model(b.directory)]}
+    }
+  }})
+  await f.tick()
+  const picker=f.el('chat-workspace')
+  picker.value='/chosen';picker.events.change.call(picker)
+  assert.equal(f.el('chat-model').disabled,true)
+  release();await f.tick()
+  assert.equal(f.calls.filter(c=>c.action==='models').at(-1).directory,'/chosen')
+  assert.match(f.el('chat-model').textContent,/chosen/)
+  assert.doesNotMatch(f.el('chat-model').textContent,/project/)
+})
+
 test('model picker saves supported reasoning and clears it when switching models',async()=>{
   const f=fixture();await f.tick()
   assert.equal(f.el('chat-model').disabled,false)

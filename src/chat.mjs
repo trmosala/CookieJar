@@ -49,9 +49,13 @@ export async function createChat(runtime) {
       fail("reasoning_unavailable", "This reasoning level is not supported by the selected model")
     return { id: value.id, providerID: value.providerID, variant: value.variant || "default" }
   }
+  const projectPaths = filename => /^(?:[A-Za-z]:[\\/]|\\\\|\/\/)/.test(filename || "") ? path.win32 : path.posix
+  const workspaceError = directory => directory
+    ? `Open folder "${directory}" in CookieMonster, then retry here. This workspace must be registered before AE can use it.`
+    : "Save the After Effects project or select a workspace in CookieMonster."
   function clientFor(r) {
     const input = clients.get(r.directory)?.values().next().value
-    if (!input) fail("chat_unavailable", "Open this conversation's workspace in CookieMonster")
+    if (!input) fail("chat_workspace", workspaceError(r.directory))
     return input.client
   }
   async function pause(sessionID) {
@@ -69,23 +73,33 @@ export async function createChat(runtime) {
     const key = hash([panelId, project.path || project.id])
     const previous = active.get(panelId)
     if (previous && previous !== key && records[previous]) {
-      await pause(records[previous].sessionID)
+      if (clients.has(records[previous].directory)) await pause(records[previous].sessionID)
       await runtime.bridge.release(records[previous].sessionID)
     }
     active.set(panelId, key)
     let r = records[key]
     const workspaces = [...clients.keys()].sort()
+    const paths = projectPaths(project.path)
+    const suggestedDirectory = project.path && paths.isAbsolute(project.path) ? paths.dirname(project.path) : null
+    // Only registered plugin instances supply lifecycle events and permission policy.
+    const requested = body.action === "new" ? body.directory || r?.directory : r?.directory || body.directory
+    const candidate = requested || suggestedDirectory
+    const directory = candidate && (clients.has(candidate) ? candidate : workspaces.find(dir =>
+      paths === path.win32 && path.win32.normalize(dir) === path.win32.normalize(candidate)) || candidate)
+    const needsWorkspace = !directory || !clients.has(directory)
+    const workspace = { directory, suggestedDirectory, workspaces, needsWorkspace,
+      workspaceError: needsWorkspace ? workspaceError(directory) : null }
     const current = (await runtime.bridge.connections()).find(c => c.id === connectionId)
     const owned = !!current?.binding && current.binding.sessionID !== r?.sessionID
     if (body.action === "models") {
-      const directory = r?.directory || body.directory || (workspaces.length === 1 ? workspaces[0] : null)
-      if (!directory || !clients.has(directory)) return { models: [], needsWorkspace: true }
+      if (needsWorkspace) return { ...workspace, models: [] }
       const catalog = await models({ directory })
       check()
-      return { models: catalog }
+      return { ...workspace, models: catalog }
     }
     if (body.action === "state") {
-      if (!r) return { sessionID: null, messages: [], permissions: [], workspaces, owned, status: "idle" }
+      if (!r || needsWorkspace) return { ...workspace, sessionID: r?.sessionID || null, messages: [], permissions: [],
+        owned, status: "idle", error: workspace.workspaceError }
       const client = clientFor(r)
       const [messages, statuses, model] = await Promise.all([
         result(client.session.messages({ ...options(r), query: { directory: r.directory, limit: 60 } })),
@@ -93,7 +107,7 @@ export async function createChat(runtime) {
         selection(r),
       ])
       check()
-      return { sessionID: r.sessionID, directory: r.directory, workspaces, owned, model,
+      return { ...workspace, sessionID: r.sessionID, owned, model,
         messages: displayMessages(messages), permissions: [...(permissions.get(r.sessionID)?.values() || [])].slice(0, 1),
         status: statuses?.[r.sessionID]?.type || "idle", error: errors.get(r.sessionID) || null,
         delivery: r.requests.at(-1)?.status || null }
@@ -123,20 +137,19 @@ export async function createChat(runtime) {
       }
     }
     // Validate before creating a conversation; rejected choices have no side effects.
+    if (needsWorkspace) fail("chat_workspace", workspace.workspaceError)
     let chosen
     if (body.action === "model") {
-      const directory = r?.directory || body.directory || (workspaces.length === 1 ? workspaces[0] : null)
       chosen = validateModel(body.model, await models({ directory }))
     }
     if (!r || body.action === "new") {
-      if (r) { await pause(r.sessionID); await runtime.bridge.release(r.sessionID) }
-      const matching = workspaces.filter(dir => project.path && (project.path === dir || project.path.startsWith(dir + path.sep)))
-        .sort((a, b) => b.length - a.length)
-      const directory = body.directory || matching[0] || (workspaces.length === 1 ? workspaces[0] : null)
-      if (!directory || !clients.has(directory)) fail("chat_workspace", "Select a CookieMonster workspace for this project")
+      if (r) {
+        if (clients.has(r.directory)) await pause(r.sessionID)
+        await runtime.bridge.release(r.sessionID)
+      }
       const fresh = { directory, requests: [] }
       const session = await result(clientFor(fresh).session.create({ query: { directory }, signal: AbortSignal.timeout(20000),
-        body: { title: "After Effects · " + (project.path ? path.basename(project.path) : "Unsaved project") } }))
+        body: { title: "After Effects · " + (project.path ? paths.basename(project.path) : "Unsaved project") } }))
       check()
       if (!session?.id) fail("chat_backend", "CookieMonster did not return a conversation")
       r = records[key] = { ...fresh, sessionID: session.id, previousSessions: [...(r?.previousSessions || []), ...(r ? [r.sessionID] : [])] }

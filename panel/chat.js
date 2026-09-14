@@ -5,7 +5,7 @@
         function el(id) { return document.getElementById(id); }
         var state=client.state, projectKey="", generation=0, polling=false, sending=false, timer,
             messagesKey="", approvalsKey="", compKey="", snapshot=null, takeover=false, serverError="", attachments=[], deliveryUnknown=false, refreshError="",
-            catalog=[], catalogKey="", catalogAt=0, catalogLoading=false, modelSaving=false, modelError="", modelRevision=0;
+            catalog=[], catalogKey="", catalogAt=0, catalogLoading=false, modelSaving=false, modelError="", modelRevision=0, workspaceChoice=null;
         function projectIdentity(s) { return s.project ? JSON.stringify(s.project) : ""; }
         function pins() { if(!store.state.chatPins)store.state.chatPins={};return store.state.chatPins; }
         function pinKey() { return "project:"+(state.project && state.project.id); }
@@ -26,6 +26,7 @@
             el("chat-input").disabled=!!sending || deliveryUnknown;
             el("chat-stop").disabled=!connected || !busy;
             el("chat-new").disabled=!connected || sending || modelSaving;
+            el("chat-workspace").disabled=!connected || sending || modelSaving || !!(snapshot && snapshot.sessionID);
             el("chat-takeover").hidden=!(snapshot && snapshot.owned);
             el("chat-takeover").textContent=takeover ? "Take control on next message ✓" : "Take control for this chat";
             el("chat-target").textContent=(el("chat-comp").value==="follow" ? "Following: " : "Pinned: ")+label();
@@ -62,10 +63,10 @@
         }
         function refreshModels() {
             if(catalogLoading || state.connection!=="connected" || !state.project)return Promise.resolve();
-            catalogLoading=true;var g=generation;controls();
+            catalogLoading=true;var g=generation,revision=modelRevision;controls();
             return request("models",{directory:el("chat-workspace").value || undefined}).then(function(data){
-                if(g!==generation)return;catalog=data.models || [];catalogAt=Date.now();modelError=data.needsWorkspace ? "Choose a CM workspace to load models" : catalog.length ? "" : "No connected models. Configure a provider in CookieMonster.";drawModels();
-            },function(e){if(g===generation){modelError=e.message || "Models unavailable";catalog=[];catalogKey="";drawModels();catalogAt=Date.now();}}).then(function(){catalogLoading=false;controls();});
+                if(g!==generation || revision!==modelRevision)return;catalog=data.models || [];catalogAt=Date.now();modelError=data.needsWorkspace ? data.workspaceError : catalog.length ? "" : "No connected models. Configure a provider in CookieMonster.";drawModels();
+            },function(e){if(g===generation && revision===modelRevision){modelError=e.message || "Models unavailable";catalog=[];catalogKey="";drawModels();catalogAt=Date.now();}}).then(function(){catalogLoading=false;controls();if(g!==generation || revision!==modelRevision)return refreshModels();});
         }
         function saveModel() {
             var model=catalog.filter(function(m){return modelKey(m)===el("chat-model").value;})[0];
@@ -79,7 +80,9 @@
         }
         el("chat-model").addEventListener("change",function(){drawReasoning("default");saveModel();});
         el("chat-reasoning").addEventListener("change",saveModel);
-        el("chat-workspace").addEventListener("change",function(){catalogAt=0;refreshModels();});
+        el("chat-workspace").addEventListener("change",function(){
+            workspaceChoice=this.value || null;modelRevision++;catalog=[];catalogKey="";catalogAt=0;modelError="";drawModels();controls();refreshModels();refresh();
+        });
         function drawAttachments() {
             var box=el("chat-attachments");box.textContent="";
             attachments.forEach(function(a){
@@ -153,21 +156,26 @@
                     });el("chat-approvals").appendChild(row);
                 });
             }
-            var dirs=data.workspaces || [],select=el("chat-workspace"),old=select.value;
-            if(JSON.stringify(dirs)!==select.workspaceKey) {
-                select.workspaceKey=JSON.stringify(dirs);select.textContent="";
-                if(dirs.length>1){var blank=node("option","Choose a CM workspace");blank.value="";select.appendChild(blank);}
-                dirs.forEach(function(dir){var option=node("option",dir);option.value=dir;select.appendChild(option);});
-                if(data.directory || dirs.indexOf(old)>=0)select.value=data.directory || old;
+            var dirs=(data.workspaces || []).slice(),select=el("chat-workspace"),
+                directory=data.sessionID ? data.directory : workspaceChoice || data.directory || "",
+                workspaceKey=JSON.stringify([dirs,directory]);
+            if(directory && dirs.indexOf(directory)<0)dirs.unshift(directory);
+            if(workspaceKey!==select.workspaceKey) {
+                select.workspaceKey=workspaceKey;select.textContent="";
+                var blank=node("option","Save project or choose a CM workspace");blank.value="";select.appendChild(blank);
+                dirs.forEach(function(dir){var option=node("option",dir+((data.workspaces || []).indexOf(dir)<0 ? " (open in CookieMonster)" : ""));option.value=dir;select.appendChild(option);});
+                select.value=directory;
+                catalogAt=0;
             }
-            select.hidden=!!data.sessionID || dirs.length<=1;
+            select.hidden=false;
+            select.disabled=!!data.sessionID || sending || modelSaving;
             drawModels();
             controls();
         }
         function refresh() {
             if(polling || modelSaving || state.connection!=="connected" || !state.project)return Promise.resolve();
             polling=true;var g=generation, revision=modelRevision;
-            return request("state").then(function(data){if(g===generation && revision===modelRevision){if(el("chat-error").textContent===refreshError)el("chat-error").textContent="";refreshError="";draw(data);if(Date.now()-catalogAt>15000)return refreshModels();}},function(e){if(g===generation){error(e);refreshError=el("chat-error").textContent;}}).then(function(){polling=false;});
+            return request("state",{directory:workspaceChoice || undefined}).then(function(data){if(g===generation && revision===modelRevision){if(el("chat-error").textContent===refreshError)el("chat-error").textContent="";refreshError="";draw(data);if(Date.now()-catalogAt>15000)return refreshModels();}},function(e){if(g===generation){error(e);refreshError=el("chat-error").textContent;}}).then(function(){polling=false;});
         }
         el("chat-form").addEventListener("submit",function(e){
             e.preventDefault();if(el("chat-send").disabled)return;
@@ -198,6 +206,7 @@
             if(s.connection!=="connected")el("chat-progress").textContent="Connecting to CookieMonster…";
             if(key!==projectKey) {
                 projectKey=key;generation++;attachments=[];deliveryUnknown=false;drawAttachments();snapshot=null;takeover=false;messagesKey="";approvalsKey="";compKey="";serverError="";
+                workspaceChoice=null;el("chat-workspace").textContent="";el("chat-workspace").value="";el("chat-workspace").workspaceKey="";
                 catalog=[];catalogKey="";catalogAt=0;modelError="";drawModels();
                 el("chat-messages").textContent="";el("chat-approvals").textContent="";el("chat-error").textContent="";el("chat-input").value="";
                 el("chat-project-name").textContent=s.project && s.project.path ? s.project.path.split(/[\\/]/).pop() : "Unsaved project";
