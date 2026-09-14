@@ -23,7 +23,17 @@ This branch combines `main` at `d653d4c` with all remote feature branches fetche
 
 ## Validation and release boundary
 
-Validation results for this integration are recorded in the pull request. Existing native validation reports describe earlier candidates and do not certify this combined commit.
+Local validation on 14 September 2026:
+
+- Full Windows suite on Node 26.8.2: 429/429 passed, zero failures, 403.96 seconds. Log: `integration-final.log` in the integration worktree.
+- Six focused integration regressions also passed on Node 24.19.0, including workspace selection, conversation reopening and retirement, build publication and a real Windows recovery file lock.
+- All eight browser verification scripts passed: redesign, conversations, skills, retry, render, preferences, targets and skill management. These use browser fixtures rather than an installed CEP/CM pair.
+- Syntax checks parsed 61 scripts. Development and client builds each verified all 16 artifact hashes and reproducibility.
+- A Windows staging-directory `EPERM` also reproduced in the build regression. Bounded publication retries resolved it; persistent failures still stop the build.
+
+GitHub reports the integration branch as mergeable. Its Windows/macOS Node 22/24 matrix did not start because of failed account payments or the account spending limit. Resolve that account setting, rerun the checks, then take PR #29 out of draft and merge it. A merge commit retains the ancestry of the integrated feature branches.
+
+Existing native validation reports describe earlier candidates and do not certify this combined commit.
 
 The original worktrees and their uncommitted files remain intact. Local AE projects, debug scripts, signing scratch files, credentials, builds and test logs are excluded from the integration commit.
 
