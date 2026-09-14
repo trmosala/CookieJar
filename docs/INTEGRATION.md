@@ -16,6 +16,24 @@ Set `CM_AE_ARTIFACT_DIR` to the absolute built `CookieMonster-AE/dist/cm-ae` dir
 
 `src/main/ae-artifact.mjs` validates development/packaged resources without importing them into Electron's main process. `server.ts` supplies the application version as `releaseMetadata.cookieMonsterVersion`; `wpp-bridge/proxy/providerConfig.mjs` adds AE alongside browser configuration. Browser policy remains unchanged. AE defaults are applied by the plugin config hook below user policy, not injected into the desktop's higher-precedence environment config; unsafe AE auto-allow still fails closed.
 
+## Internal installation via CookieMonster
+
+Internal users ask CookieMonster to install from an extracted trusted team release. This is an agent-assisted procedure, not a built-in installer. Use the package locations documented in [the README](../README.md#internal-setup-ask-cookiemonster).
+
+1. Inspect the release instructions, compatibility metadata and package inventory. Verify available hashes and trusted team provenance before executing package code. A bundled checksum alone does not establish authenticity. Confirm `cm-ae/plugin.mjs`, `cm-ae/render-worker.mjs` and the supplied permission policy are present; stop on missing artifacts or incompatibility.
+2. Copy the complete contents of `cm-ae/` directly into the documented per-user `VERSION` directory, without an extra `cm-ae` subdirectory. Use the full release version. Verify an existing installation rather than blindly overwriting it, and preserve previous versions for rollback.
+3. Identify the configuration this CookieMonster/OpenCode instance actually loads, including desktop-generated configuration. Back it up and register the absolute installed `plugin.mjs` path or file URL once. Expand home and environment placeholders before registration. Preserve browser plugins, other plugins, MCP settings and existing user permission rules.
+4. Merge the supplied AE permission defaults using the helper below when available, and review the result before applying it. The helper belongs to this repository and may not be included in the release package. Do not weaken an incompatible permission policy to force startup.
+5. Report the installed path and configuration changed. Ask the user to resolve uncertain operations and account for active renders before fully quitting and restarting CookieMonster/OpenCode. Do not terminate their session without approval. Report verification as pending if a restart interrupts it.
+6. After restart, verify plugin loading and live bridge startup, not just the presence of copied files or a stale `descriptor.json`. Report loader or dependency failures rather than repeatedly restarting.
+7. Have the user install/open the approved matching AE panel, then check connection and complete pairing and explicit saved-project binding through the documented tools. Report backend activation, panel connection, pairing and binding separately.
+
+The backend installation directory is separate from runtime state. The bridge creates `.cookiemonster-ae` under the current user's home directory by default. Both bridge and panel must use the same `CM_AE_DATA_DIR` override if configured. Finder-launched macOS applications may not inherit terminal environment settings.
+
+An `ENOENT` for that runtime directory means the expected location is missing. Check plugin activation, startup logs and data-directory overrides; do not create an empty directory as the fix. Installing the ZXP only installs the panel. Unrelated AE MCP integrations do not start this bridge.
+
+For updates, verify the new package before changing registration. Retain the previous package and configuration backup for a compatibility-reviewed rollback. Do not delete runtime credentials or project state.
+
 ## Consumer Bridge
 
 Other consumers can use the source helper after locating both trusted artifacts:

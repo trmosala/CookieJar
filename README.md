@@ -46,6 +46,31 @@ node scripts/merge-config.mjs existing-config.json dist/cm-ae/plugin.mjs merged-
 
 Read tools default to allow; execution, capture, filesystem grants, restore, template discovery and render control require approval. Auto-allow policies for privileged tools are rejected. Filesystem grants constrain managed operations; they do not sandbox arbitrary ExtendScript.
 
+## Internal setup: ask CookieMonster
+
+Extract the trusted team release, then ask CookieMonster:
+
+> Install the CookieJar AE plugin from this release folder: [absolute folder path]. Follow the internal installation instructions in docs/INTEGRATION.md. Copy the complete cm-ae package to the documented location and register it in the configuration this CookieMonster instance actually loads. Preserve my existing plugins and permissions. Tell me when to restart, then verify bridge startup and report AE connection and pairing status separately.
+
+Supply this README and [the installation instructions](docs/INTEGRATION.md#internal-installation-via-cookiemonster) if CookieMonster does not have this repository open. This is agent-assisted setup for internal use, not a built-in installer or an automatic action on extraction.
+
+Install the contents of `cm-ae/` directly inside the appropriate version directory:
+
+| Platform | Backend package location |
+| --- | --- |
+| macOS | `~/Library/Application Support/CookieMonster/plugins/cookiejar-ae/VERSION/` |
+| Windows | `%LOCALAPPDATA%\CookieMonster\plugins\cookiejar-ae\VERSION\` |
+
+Replace `VERSION` with the full release version, including any prerelease identifier. For example, macOS version `0.2.3` loads `~/Library/Application Support/CookieMonster/plugins/cookiejar-ae/0.2.3/plugin.mjs`, alongside `render-worker.mjs` and the rest of the package. These paths define our internal installation convention; the current desktop app does not automatically manage them. Do not register a plugin path in Downloads.
+
+The bridge creates separate runtime data at `~/.cookiemonster-ae/` under the current user's home directory. Both bridge and panel must agree on any `CM_AE_DATA_DIR` override. Do not create an empty runtime directory to work around `ENOENT`; check plugin activation and startup errors instead.
+
+### AE panel and pairing
+
+The ZXP installs only the AE panel. The OpenCode plugin starts the local bridge, which is not a third application to install or launch. Both panel installation and backend setup are required.
+
+There is no approved production installation yet. After release gates pass, install the signed ZXP with the qualified extension manager and open the panel under AE's **Window > Extensions** menu (wording varies by qualified host). Do not bypass signature verification for a pilot.
+
 ## Release status
 
 The 264-test baseline and September 9 packaged desktop smoke belong to the previous `0.1.0` source, not this refactor. Current development evidence is recorded in [FIRST_TEST.md](docs/FIRST_TEST.md). The [issue ledger](docs/ISSUE_STATUS.md) records the replacement product roadmap and preserves historical release gaps. Closing the earlier issues does not establish certification or pilot completion.
