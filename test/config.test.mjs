@@ -2,8 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { copyFile, cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import fsp from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { createRequire } from "node:module";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { build, files } from "../scripts/build.mjs";
 import { verifyBuild } from "../scripts/verify-build.mjs";
 import { tmpdir } from "node:os";
@@ -214,7 +215,20 @@ test("build bundles dependencies but preserves the real worker URL and reproduci
   await writeFile(join(fixture, "panel", "ui.js"), '"use strict";\n');
   await writeFile(join(fixture, "panel", "host.jsx"), 'var host = {};\n');
   await writeFile(join(fixture, "panel", "CSXS", "manifest.xml"), '<ExtensionManifest />\n');
+  // Reproduce the Windows sharing violation observed during staged publication.
+  let publicationFailures = 0;
+  if (process.platform === "win32") {
+    const rename = fsp.rename;
+    const fault = t.mock.method(fsp, "rename", async (source, destination) => {
+      if (destination === join(fixture, "dist", "cm-ae") && publicationFailures++ === 0)
+        throw Object.assign(new Error("staging directory temporarily locked"), { code: "EPERM" });
+      return rename(source, destination);
+    });
+    syncBuiltinESMExports();
+    t.after(() => { fault.mock.restore(); syncBuiltinESMExports(); });
+  }
   await build(fixture);
+  if (process.platform === "win32") assert.ok(publicationFailures >= 2);
   const before = await verifyBuild(fixture);
   assert.deepEqual(JSON.parse(await readFile(join(fixture, "dist", "cm-ae", "permissions.json"), "utf8")), AE_PERMISSIONS);
   assert.ok(before.artifacts.some((item) => item.path === "cm-ae/render-worker.mjs"));

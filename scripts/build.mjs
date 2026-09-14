@@ -6,6 +6,7 @@ import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { AE_PERMISSIONS } from "../src/config.mjs";
 import { Script } from "node:vm";
+import { setTimeout as sleep } from "node:timers/promises";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const allowedPanelTypes = new Set([".html", ".css", ".js", ".cjs", ".mjs", ".jsx", ".xml", ".json", ".png", ".jpg", ".svg", ".woff", ".woff2", ".txt"]);
@@ -97,7 +98,17 @@ export async function build(directory = root, profile = "development") {
     // ponytail: single-writer build; CI uses isolated workspaces, not concurrent builds.
     for (const name of ["cm-ae", "panel", "compatibility.json", "manifest.json"]) {
       await rm(join(dist, name), { force: true, recursive: true });
-      await rename(join(stage, name), join(dist, name));
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await rename(join(stage, name), join(dist, name));
+          break;
+        } catch (error) {
+          // Windows readers can briefly prevent moving our completed staging directory.
+          // Retry publication only; persistent errors still fail the build.
+          if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(error.code) || attempt === 9) throw error;
+          await sleep(20 * (attempt + 1));
+        }
+      }
     }
     console.log(`Built ${artifacts.length} hashed files in dist (unsigned, not certified).`);
   } finally {
