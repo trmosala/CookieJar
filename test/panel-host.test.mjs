@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createBridge } from "../src/bridge.mjs";
@@ -502,19 +502,26 @@ test("panel pins project identity through evalScript and refuses a switch before
     await assert.rejects(host.call("raw",{source:"app.project.revision = 999"},expected),{code:"stale_project"});
     assert.equal(f.project.revision,1);assert.equal(f.begins,0);
 });
-test("manual restore host close requires exact owner, saved snapshot, clean state and verified backup", t => {
-    for(const mode of ["success","owner","snapshot","dirty","unknown","proof","mode","callback","close_refused","open_edit"]){
+test("manual restore host close requires exact owner, compact receipt, clean state and verified backup", t => {
+    for(const mode of ["success","save_revision","owner","snapshot","dirty","unknown","proof","mode","callback","close_refused","open_edit","reopen","open_return","open_same"]){
         const base=process.platform==="win32" ? path.join(os.tmpdir(),"opencode") : os.tmpdir();
         const dir=mkdtempSync(path.join(base,"cm-manual-host-"));
         t.after(()=>rmSync(dir,{recursive:true,force:true}));
         const canonical=path.join(dir,"original.aep"),h=hostDouble(canonical);
         h.props[0].setValue(42);
+        if(mode==="save_revision"){const save=h.project.save.bind(h.project);h.project.save=file=>{save(file);h.project.revision++;};}
+        const originalBytes=readFileSync(canonical);
         const transaction={id:"restore",sessionID:"session",bindingID:"binding"};
         const saved=h.call("execute",{phase:"restore_prepare",transaction,recoveryId:"restore",
-            expected:h.call("inspect").result,path:path.join(dir,"emergency.aep")});
+            expected:h.call("inspect",{restore:"compact-restore-v2"}).result,path:path.join(dir,"emergency.aep")});
+        if(mode==="save_revision"){
+            assert.equal(saved.error.code,"uncertain_outcome");
+            assert.equal(h.closes,0);
+            continue;
+        }
         assert.ok(saved.result,JSON.stringify(saved));
         assert.equal(saved.result.status,"recovery_saved");
-        const finish={phase:"restore_finish",transaction,recoveryId:"restore",expected:saved.result.snapshot,
+        const finish={phase:"restore_finish",transaction,recoveryId:"restore",expected:saved.result.receipt,
             path:canonical,verifiedCheckpoint:{id:"backup",hash:"a".repeat(64),size:100}};
         if(mode==="owner")finish.transaction={...transaction,sessionID:"other"};
         if(mode==="snapshot")h.props[0].setValue(19);
@@ -524,10 +531,24 @@ test("manual restore host close requires exact owner, saved snapshot, clean stat
         if(mode==="mode"){finish.phase="recovery_finish";delete finish.path;}
         if(mode==="callback")h.app.onError="artistCallback";
         if(mode==="close_refused")h.project.close=()=>false;
+        if(mode==="reopen"){
+            const revision=h.project.revision;
+            h.app.open(h.project.file);h.project.revision=revision;h.project.dirty=false;
+        }
+        if(mode==="open_return"){
+            const open=h.app.open.bind(h.app);
+            h.app.open=file=>{open(file);return {};};
+        }
+        if(mode==="open_same"){
+            const prior=h.project;
+            h.context.isValid=value=>Boolean(value);
+            h.app.open=file=>{prior.file=file;h.app.project=prior;return prior;};
+        }
         if(mode==="open_edit"){
             const open=h.app.open.bind(h.app);
             h.app.open=file=>{const result=open(file);h.props[0].setValue(19);return result;};
         }
+        writeFileSync(canonical,originalBytes); // Storage publishes the selected checkpoint before finish.
         const result=h.call("execute",finish);
         if(mode==="success"){
             assert.equal(result.result.status,"recovered");
@@ -537,10 +558,55 @@ test("manual restore host close requires exact owner, saved snapshot, clean stat
             assert.ok(h.call("execute",finish).error,"finish cannot replay");
         }else{
             assert.equal(result.error.code,"uncertain_outcome",mode);
-            assert.equal(h.closes,mode==="open_edit" ? 1 : 0,mode);
-            assert.equal(h.props[0].value,mode==="snapshot" || mode==="open_edit" ? 19 : 42);
+            assert.equal(h.closes,["open_edit","open_return","open_same"].includes(mode) ? 1 : 0,mode);
+            assert.equal(h.props[0].value,mode==="snapshot" || mode==="open_edit" ? 19 : mode==="open_return" ? 100 : 42);
             assert.equal(h.call("status").result.uncertain,true);
         }
+    }
+});
+
+test("compact host guards reject unsupported native reads and protocol mismatches before save", t => {
+    for(const mode of ["dirty","revision","callback","rendering","throw","protocol","full"]){
+        const dir=mkdtempSync(path.join(os.tmpdir(),"cm-compact-guard-"));
+        t.after(()=>rmSync(dir,{recursive:true,force:true}));
+        const h=hostDouble(path.join(dir,"original.aep"));
+        const expected=h.call("inspect",{restore:"compact-restore-v2"}).result;
+        let saves=0;h.project.save=()=>{saves++;};
+        if(mode==="dirty")delete h.project.dirty;
+        if(mode==="revision")h.project.revision=undefined;
+        if(mode==="callback")h.app.onError={unsupported:true};
+        if(mode==="rendering")h.project.renderQueue.rendering=undefined;
+        if(mode==="throw")Object.defineProperty(h.project,"dirty",{get(){throw Error("unsupported");}});
+        if(mode==="protocol")expected.protocol="compact-restore-v0";
+        if(mode==="full"){delete expected.protocol;expected.items=[];}
+        const result=h.call("execute",{phase:"restore_prepare",transaction:{id:"r",sessionID:"s",bindingID:"b"},
+            recoveryId:"r",expected,path:path.join(dir,"emergency.aep")});
+        assert.equal(result.error.code,mode==="rendering" ? "unsafe_state" : "restore_unsupported",mode);
+        assert.equal(saves,0);assert.equal(h.closes,0);
+    }
+});
+
+test("compact Save As rejects replaced native objects extra revision and post-save dirty edits without closing", t => {
+    for(const mode of ["object","revision","serialized_edit","dirty","callback"]){
+        const dir=mkdtempSync(path.join(os.tmpdir(),"cm-compact-save-"));
+        t.after(()=>rmSync(dir,{recursive:true,force:true}));
+        const h=hostDouble(path.join(dir,"original.aep"));
+        h.props[0].setValue(42);
+        const expected=h.call("inspect",{restore:"compact-restore-v2"}).result;
+        const save=h.project.save.bind(h.project);
+        h.project.save=file=>{
+            if(mode==="serialized_edit")h.props[0].setValue(19);
+            save(file);
+            if(mode==="object")h.app.project={...h.project};
+            if(mode==="revision")h.project.revision+=2;
+            if(mode==="dirty")h.props[0].setValue(19);
+            if(mode==="callback")h.app.onError="newCallback";
+        };
+        const request={phase:"restore_prepare",transaction:{id:"r",sessionID:"s",bindingID:"b"},
+            recoveryId:"r",expected,path:path.join(dir,"emergency.aep")};
+        assert.equal(h.call("execute",request).error.code,"uncertain_outcome",mode);
+        assert.equal(h.closes,0);
+        assert.equal(h.call("execute",request).error.code,"uncertain_outcome","no retry");
     }
 });
 
@@ -803,6 +869,15 @@ test("invalidated native project handle starts a new inspection epoch",()=>{
     assert.equal(checked,true);
     assert.deepEqual(after.project,before.project);
     assert.notEqual(after.projectEpoch,before.projectEpoch);
+});
+
+test("inspection does not query spatial tangents on a nonspatial value type",()=>{
+    const f=fixture(), p=new f.Property("ADBE Text Position 3D",[0,0,0],f.context.PropertyValueType.ThreeD);
+    p.isSpatial=true;p.setValueAtTime(0,[0,0,0]);
+    p.keyInSpatialTangent=()=>{throw new Error("This property does not have a spatial PropertyValueType");};
+    f.lyr.effects.children.push(p);
+    const result=f.call("inspect");
+    assert.equal(result.error,undefined,JSON.stringify(result)); assert.ok(result.result);
 });
 
 test("preference is read-only and disabled files leave inspection available; oversized snapshot refuses",()=>{

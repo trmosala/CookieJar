@@ -226,14 +226,14 @@ Store.prototype.close = function () {
 function request(descriptor, credential, endpoint, body, timeout) {
     return new Promise(function (resolve, reject) {
         var data = body === undefined ? null : Buffer.from(JSON.stringify(body), "utf8"), finished = false, timer;
-        if (data && data.length > MAX) { reject(error("payload_too_large", "Reply exceeds bridge JSON limit")); return; }
+        if (data && data.length > (endpoint==="/chat" ? 16*1024*1024 : MAX)) { reject(error("payload_too_large", "Reply exceeds bridge JSON limit")); return; }
         var headers = {"Content-Type":"application/json"};
         if (credential) headers.Authorization = "Bearer " + credential;
         if (data) headers["Content-Length"] = data.length;
         function done(err, result) { if (finished) return; finished = true; clearTimeout(timer); if (err) reject(err); else resolve(result); }
         var req = http.request({hostname:"127.0.0.1", port:descriptor.port, path:endpoint, method:endpoint === "/poll" ? "GET" : "POST", headers:headers, agent:false}, function (res) {
             var chunks = [], size = 0;
-            res.on("data", function (chunk) { size += chunk.length; if (size > (endpoint==="/chat" ? 8*1024*1024 : MAX)) { req.destroy(); done(error("invalid_response", "Oversized bridge response")); } else chunks.push(chunk); });
+            res.on("data", function (chunk) { size += chunk.length; if (size > (endpoint==="/chat" ? 16*1024*1024 : MAX)) { req.destroy(); done(error("invalid_response", "Oversized bridge response")); } else chunks.push(chunk); });
             res.on("error", function () { done(error("disconnected", "Bridge response interrupted")); });
             res.on("end", function () {
                 try {
@@ -257,7 +257,7 @@ function request(descriptor, credential, endpoint, body, timeout) {
         if (data) req.write(data); req.end();
     });
 }
-function HostRPC(cep, timeout, onLate) { this.cep = cep; this.timeout = timeout || 25000; this.pending = false; this.uncertain = false; this.onLate = onLate || function () {}; }
+function HostRPC(cep, timeout, onLate, restoreTimeout) { this.cep = cep; this.timeout = timeout || 25000; this.restoreTimeout = restoreTimeout || this.timeout; this.pending = false; this.uncertain = false; this.onLate = onLate || function () {}; }
 HostRPC.prototype.call = function (method, params, expectedProject) {
     var self = this;
     if (self.pending || self.uncertain) return Promise.reject(error("outcome_uncertain", "Host is locked pending explicit reconciliation"));
@@ -271,7 +271,7 @@ HostRPC.prototype.call = function (method, params, expectedProject) {
             if(method==="status") { reject(error("host_busy", "Close the AE dialog to reconnect")); return; }
             self.uncertain = true;
             reject(error("outcome_uncertain", "evalScript timed out; it was not cancelled and must not be retried"));
-        }, self.timeout);
+        }, method==="execute" && params && (params.phase==="restore_prepare" || params.phase==="restore_finish") ? self.restoreTimeout : self.timeout);
         var envelope={method:method,params:params};
         if(expectedProject)envelope.expectedProject=expectedProject;
         var payload = JSON.stringify(JSON.stringify(envelope)).replace(/\u2028/g,"\\u2028").replace(/\u2029/g,"\\u2029");
@@ -415,15 +415,18 @@ Client.prototype.emit=function(){
 Client.prototype.panel=function(action,args){
     var self=this,allowed={
         "checkpoints":[],"checkpoint.pin":["id","pinned"],"checkpoint.delete":["id"],
-        "checkpoint.restore.propose":["id"],"checkpoint.restore.confirm":["token"],"diagnostics":[],"renders":[]
-    },payload={action:action},context=self.context(),mutating=typeof action==="string" && action.indexOf("checkpoint.")===0;
+        "checkpoint.restore.propose":["id"],"checkpoint.restore.confirm":["token"],"diagnostics":[],"renders":[],"frame.capture":["compId","time"],
+        "render.start":["tool","args"],"render.poll":["token"],"render.reply":["token","approvalID","allow"]
+    },payload={action:action},context=self.context(),mutating=typeof action==="string" && (action.indexOf("checkpoint.")===0 || action==="frame.capture");
     args=args || {};
     if(!Object.prototype.hasOwnProperty.call(allowed,action) || !record(args) || Object.keys(args).sort().join(",")!==allowed[action].slice().sort().join(","))return Promise.reject(error("invalid_payload","Unknown panel action or fields"));
     if(self.panelPending)return Promise.reject(error("panel_busy","Panel request already outstanding"));
+    if(action==="render.start" && (self.state.busy || self.state.uncertain || self.state.lock))return Promise.reject(error("target_locked","Wait for AE or resolve recovery before rendering"));
     if(self.state.connection!=="connected" || !self.store.state.credential)return Promise.reject(error("disconnected","Connect before requesting bridge services"));
     if(mutating && (self.state.busy || self.state.uncertain || self.state.lock || !self.state.binding || self.state.binding.state!=="active"))return Promise.reject(error("target_locked","Checkpoint changes require an active unlocked binding"));
     if(Object.prototype.hasOwnProperty.call(args,"id") && !text(args.id,256))return Promise.reject(error("invalid_payload","Invalid checkpoint ID"));
     if(action==="checkpoint.pin" && typeof args.pinned!=="boolean")return Promise.reject(error("invalid_payload","pinned must be boolean"));
+    if(action==="frame.capture" && (!Number.isSafeInteger(args.compId) || args.compId<1 || !Number.isFinite(args.time) || args.time<0))return Promise.reject(error("invalid_payload","Choose an explicit composition and time"));
     var confirming=action==="checkpoint.restore.confirm",proposing=action==="checkpoint.restore.propose",approval=self.restoreApproval;
     if(confirming){
         self.restoreApproval=null;
@@ -442,7 +445,7 @@ Client.prototype.panel=function(action,args){
     return Promise.resolve().then(function(){
         if(guard.stale || guard.scope!==self.scope() || guard.credential!==self.store.state.credential || context!==self.context())
             throw error("stale_binding","Panel scope changed before dispatch");
-        return self.request(descriptor,guard.credential,"/panel",payload,confirming ? 300000 : 15000);
+        return self.request(descriptor,guard.credential,"/panel",payload,(confirming || proposing) ? 300000 : action==="frame.capture" ? 60000 : 15000);
     }).then(function(response){
         if(!record(response) || Object.keys(response).length!==1 || !Object.prototype.hasOwnProperty.call(response,"result"))throw error("invalid_response","Panel service must return {result}");
         if(guard.stale || guard.scope!==self.scope() || guard.credential!==self.store.state.credential)throw error("stale_binding","Connection or binding changed during panel request");
@@ -471,11 +474,17 @@ Client.prototype.panel=function(action,args){
                 throw error("stale_binding","Project changed during panel request");
         }
         if(confirming){
-            r={checkpointId:r.checkpointId,currentCheckpointId:r.currentCheckpointId,path:r.path,canonicalPath:r.canonicalPath,
+            if(r.previousCheckpointId !== undefined && !text(r.previousCheckpointId,256))throw error("invalid_host_result","Invalid previous disk checkpoint");
+            r={checkpointId:r.checkpointId,currentCheckpointId:r.currentCheckpointId,previousCheckpointId:r.previousCheckpointId || null,path:r.path,canonicalPath:r.canonicalPath,
                 emergencyPath:r.emergencyPath,originalPath:r.originalPath || null,recoveryCopy:r.recoveryCopy,canonicalReplaced:r.canonicalReplaced,
                 rebindRequired:r.rebindRequired,automationSuspended:r.automationSuspended,fingerprint:r.fingerprint,cleanup:r.cleanup,warning:r.warning};
         }
-        if(action==="checkpoints"){
+        if(action==="frame.capture"){
+            var image=r && r.attachment;
+            if(!record(r) || r.compId!==args.compId || r.time!==args.time || !Number.isSafeInteger(r.width) || r.width<1 || r.width>1200 || !Number.isSafeInteger(r.height) || r.height<1 || r.height>2000 ||
+                !record(image) || image.type!=="file" || image.mime!=="image/png" || !text(image.filename,255) || !text(image.url,2800000) || !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(image.url))
+                throw error("invalid_response","Capture did not confirm the requested frame");
+        } else if(action==="checkpoints"){
             if(!Array.isArray(r) || r.length>10000)throw error("invalid_response","Expected bounded checkpoint list");
             r=r.map(function(c){
                 if(!record(c) || !text(c.id,256) || !Number.isFinite(c.createdAt) || typeof c.pinned!=="boolean" || !text(c.storageMode,64) || !Number.isFinite(c.size) || c.size<0)throw error("invalid_response","Invalid checkpoint metadata");
@@ -496,7 +505,7 @@ Client.prototype.panel=function(action,args){
     }).then(function(r){self.panelPending=false;self.panelGuard=null;self.emit();return r;},function(e){
         self.panelPending=false;self.panelGuard=null;
         if(proposing)self.restoreApproval=null;
-        if(action==="checkpoint.restore.confirm" && ["disconnected","invalid_response","stale_binding","outcome_uncertain","uncertain_outcome"].indexOf(e.code)>=0){
+        if((action==="checkpoint.restore.confirm" || action==="frame.capture") && ["disconnected","invalid_response","stale_binding","outcome_uncertain","uncertain_outcome","capture_timeout","timeout","ETIMEDOUT","ECONNRESET"].indexOf(e.code)>=0){
             self.state.busy=true;self.mark(true);
         }
         self.emit();throw e;
@@ -639,22 +648,25 @@ Client.prototype.management=function(endpoint){
 };
 Client.prototype.status=function(){
     var self=this;
+    if(self.fileDialogOpen)return Promise.reject(error("host_busy","Close the attachment picker before host access"));
     if(self.recovering)return Promise.reject(error("host_busy","Credential recovery is outstanding"));
     if(self.state.connection==="incompatible")return Promise.reject(error("incompatible_version","Host access is stopped until versions match"));
     return self.host.call("status",{}).then(function(s){
         if(!record(s) || !record(s.project) || !record(s.capabilities) || typeof s.capabilities.fileNetwork!=="boolean" || !text(s.aeVersion,128) ||
             !(s.activeCompId === null || (Number.isSafeInteger(s.activeCompId) && s.activeCompId>0)))throw error("invalid_host_result","Host status incomplete");
         self.state.project=s.project;self.state.activeCompId=s.activeCompId;self.state.capabilities=s.capabilities;self.state.aeVersion=s.aeVersion;
-        if(s.compositions!==undefined && (!Array.isArray(s.compositions) || s.compositions.length>2000 || s.compositions.some(function(c){return !record(c) || !Number.isSafeInteger(c.id) || c.id<1 || typeof c.name!=="string" || c.name.length>32768;})))
+        if(s.compositions!==undefined && (!Array.isArray(s.compositions) || s.compositions.length>2000 || s.compositions.some(function(c){return !record(c) || !Number.isSafeInteger(c.id) || c.id<1 || typeof c.name!=="string" || c.name.length>32768 || c.time!==undefined && (!Number.isFinite(c.time) || c.time<0);})))
             throw error("invalid_host_result","Invalid composition list");
         self.state.compositions=s.compositions || [];
+        if(s.selectedLayers!==undefined && (!Array.isArray(s.selectedLayers) || s.selectedLayers.length>100 || s.selectedLayers.some(function(l){return !record(l) || !Number.isSafeInteger(l.compId) || l.compId<1 || !Number.isSafeInteger(l.layerId) || l.layerId<1 || typeof l.name!=="string" || l.name.length>4096;})))throw error("invalid_host_result","Invalid selected layer context");
+        self.state.selectedLayers=s.selectedLayers || [];
         if(s.uncertain) { self.mark(true); throw error("outcome_uncertain","Host requires recovery"); }
         self.emit();return s;
     });
 };
 Client.prototype.heartbeat=function(){
     var self=this;
-    return self.send("/heartbeat",{project:self.state.project,activeCompId:self.state.activeCompId,capabilities:self.state.capabilities,busy:self.state.busy || self.state.uncertain}).then(function(r){
+    return self.send("/heartbeat",{project:self.state.project,activeCompId:self.state.activeCompId,capabilities:self.state.capabilities,busy:self.state.busy || self.state.uncertain || !!self.fileDialogOpen}).then(function(r){
         if(!record(r) || !Object.prototype.hasOwnProperty.call(r,"binding") || !Object.prototype.hasOwnProperty.call(r,"lock") || !(r.binding=== null || record(r.binding)) || !(r.lock=== null || record(r.lock)))throw error("invalid_response","Malformed heartbeat");
         self.state.binding=r.binding;self.state.lock=r.lock;self.emit();return r;
     });
@@ -738,8 +750,27 @@ Client.prototype.command=function(cmd){
         throw e;
     });
 };
+Client.prototype.beginFileDialog=function(){
+    var self=this;
+    if(self.fileDialogPending || self.fileDialogOpen || self.state.busy || self.state.uncertain || self.panelPending)return Promise.reject(error("host_busy","Wait for active work before browsing files"));
+    self.fileDialogPending=true;
+    return new Promise(function(resolve,reject){
+        var started=Date.now();
+        function ready(){
+            if(self.inFlight || self.host.pending){
+                if(Date.now()-started>30000){self.fileDialogPending=false;reject(error("host_busy","Host work is still pending. Try browsing again when AE is ready."));return;}
+                setTimeout(ready,50);return;
+            }
+            self.fileDialogPending=false;self.fileDialogOpen=true;resolve();
+        }
+        ready();
+    });
+};
+Client.prototype.endFileDialog=function(){this.fileDialogOpen=false;};
 Client.prototype.tick=function(){
     var self=this;
+    if(self.fileDialogPending)return Promise.resolve();
+    if(self.fileDialogOpen)return self.state.connection==="connected" ? self.heartbeat().catch(function(){}) : Promise.resolve();
     if(self.inFlight || self.host.pending || self.state.uncertain || self.state.connection==="incompatible")return Promise.resolve();
     self.inFlight=true;
     return Promise.resolve().then(function(){
@@ -771,4 +802,31 @@ Client.prototype.reconcile=function(){
     self.host.uncertain=false;
     return self.host.call("reconcile",{}).then(function(){self.mark(false);self.state.busy=false;self.state.capture=null;self.state.binding=null;self.state.connection="paired";self.emit();self.start();},function(e){self.host.uncertain=true;throw e;});
 };
-module.exports={Store:Store,automaticStore:automaticStore,Client:Client,HostRPC:HostRPC,request:request,requestId:function(){return crypto.randomBytes(20).toString("hex");},compatibilityMetadata:compatibilityMetadata,normalizeCapture:normalizeCapture,cleanupCapture:cleanupCapture,secure:secure,VERSION:VERSION,PROTOCOL:PROTOCOL};
+function renderDirectory(value){
+    if(!text(value,32767) || !path.isAbsolute(value) || /[\0\r\n]/.test(value) || value.split(/[\\/]/).indexOf("..")>=0)throw error("invalid_path","Choose an absolute output path");
+    return path.dirname(value);
+}
+function revealRenderOutput(file){
+    return Promise.resolve().then(function(){
+        renderDirectory(file.path);
+        if(!/^[a-f0-9]{64}$/.test(file.hash) || !Number.isSafeInteger(file.size) || file.size<1)throw error("invalid_output","Output verification is missing");
+        var info=fs.lstatSync(file.path);
+        if(!info.isFile() || info.isSymbolicLink() || info.size!==file.size)throw error("output_changed","Output changed since verification");
+        return new Promise(function(resolve,reject){
+            var sum=crypto.createHash("sha256"),stream=fs.createReadStream(file.path);
+            stream.on("data",function(data){sum.update(data);});stream.on("error",reject);
+            stream.on("end",function(){
+                if(sum.digest("hex")!==file.hash){reject(error("output_changed","Output hash changed"));return;}
+                if(process.platform==="win32"){
+                    // Explorer hands off to an existing shell and may exit 1 after success.
+                    // A successful spawn acknowledges the reveal request, not file validation.
+                    try{
+                        var reveal=child.spawn("explorer.exe",["/select,"+file.path],{windowsHide:true,stdio:"ignore",shell:false});
+                        reveal.once("error",reject);reveal.once("spawn",function(){reveal.unref();resolve();});
+                    }catch(e){reject(e);}
+                }else child.execFile("open",["-R",file.path],function(e){if(e)reject(e);else resolve();});
+            });
+        });
+    });
+}
+module.exports={renderDirectory:renderDirectory,revealRenderOutput:revealRenderOutput,Store:Store,automaticStore:automaticStore,Client:Client,HostRPC:HostRPC,request:request,requestId:function(){return crypto.randomBytes(20).toString("hex");},compatibilityMetadata:compatibilityMetadata,normalizeCapture:normalizeCapture,cleanupCapture:cleanupCapture,secure:secure,VERSION:VERSION,PROTOCOL:PROTOCOL};

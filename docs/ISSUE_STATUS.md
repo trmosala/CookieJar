@@ -8,8 +8,13 @@ Implementation order:
 2. [#19 Select model and reasoning inside AE](https://github.com/trmosala/CookieJar/issues/19)
 3. [#20 Restore project state from chat checkpoints](https://github.com/trmosala/CookieJar/issues/20)
 4. [#21 Reuse brand and animation skills in AE](https://github.com/trmosala/CookieJar/issues/21)
+5. [#22 Browse and manage project conversations inside AE](https://github.com/trmosala/CookieJar/issues/22)
 
 Image generation/import is excluded because its current limitation belongs in CookieMonster. Current live-test evidence is in [FIRST_TEST.md](FIRST_TEST.md).
+
+Issue #21 implementation and automated verification are documented in [SKILLS.md](SKILLS.md), including the separate compaction timing failure and the boundary between real API testing and simulated model/AE execution.
+
+Issue #22 behavior and repeatable checks are documented in [CONVERSATIONS.md](CONVERSATIONS.md).
 
 ## Historical issue ledger (statuses below are from the earlier milestone)
 

@@ -5,7 +5,292 @@
         function el(id) { return document.getElementById(id); }
         var state=client.state, projectKey="", generation=0, polling=false, sending=false, timer,
             messagesKey="", approvalsKey="", compKey="", snapshot=null, takeover=false, serverError="", attachments=[], deliveryUnknown=false, refreshError="",
-            catalog=[], catalogKey="", catalogAt=0, catalogLoading=false, modelSaving=false, modelError="", modelRevision=0, workspaceChoice=null;
+            catalog=[], catalogKey="", catalogAt=0, catalogLoading=false, modelSaving=false, modelError="", modelRevision=0, workspaceChoice=null,
+            checkpointList=[], checkpointButtons=[], checkpointAt=0, checkpointLoading=false, restoreWorking=false, restoreReview=null,
+            collapseState={}, collapseSession="", historyMessages=[], historyCursor=null, historyLoaded=false, historyLoading=false;
+        var skills=[], skillChoice=null, skillContext=null, skillLoading=false, skillEpoch=0,
+            technique=null, techniqueReview=null, techniqueBusy=false;
+        var conversationLoading=false, conversationSwitching=false, conversationEpoch=0, conversationOffset=0,
+            conversationNext=null, conversationRows=[], renameConversation=null;
+        var manager=null,managerBusy=false,managerReview=null;
+        function closeManager(){if(managerBusy)return;manager=null;managerReview=null;el("skill-manager").hidden=true;el("chat-skills").open=true;controls();el("chat-skill-manage").focus();}
+        function managerDraft(){return {name:el("skill-manager-name").value,description:el("skill-manager-description").value,instructions:el("skill-manager-content").value,scope:manager.scope};}
+        function manage(input){return request("skillManage",{sessionID:manager.sessionID,directory:manager.directory,management:Object.assign({selected:manager.selected},input)});}
+        el("chat-skill-manage").addEventListener("click",function(){
+            if(switchBlocked() || !skillChoice || !snapshot || !snapshot.sessionID)return;
+            var g=generation;el("chat-skills").open=false;
+            manager={selected:{name:skillChoice.name,source:skillChoice.source,revision:skillChoice.revision},sessionID:snapshot.sessionID,directory:snapshot.directory};
+            managerBusy=true;managerReview=null;el("skill-manager-status").textContent="Loading skill...";el("skill-manager-review").textContent="";
+            el("skill-manager").hidden=false;controls();
+            manage({action:"read"}).then(function(value){
+                if(g!==generation || !manager)return;
+                manager.scope=value.scope;manager.editable=value.editable;manager.location=value.location;manager.content=value.content;manager.document=value.document;
+                el("skill-manager-name").value=value.name;el("skill-manager-description").value=value.description || "";el("skill-manager-content").value=value.content;
+                el("skill-manager-location").textContent=value.location+" ("+value.scope+")";
+                el("skill-manager-status").textContent=value.editable ? "Changes keep a backup. Other conversations using this skill will see the update." : "Read-only skill. You can copy its content.";
+                el("skill-manager-name").focus();
+            }).catch(function(e){if(g===generation)el("skill-manager-status").textContent=e.message;}).then(function(){managerBusy=false;controls();});
+        });
+        function reviewManager(operation){
+            if(!manager || !manager.editable || managerBusy)return;
+            var g=generation,input={action:"review",operation:operation};if(operation==="edit")input.draft=managerDraft();
+            managerBusy=true;managerReview=null;controls();
+            manage(input).then(function(value){
+                if(g!==generation || !manager)return;
+                managerReview={operation:operation,draft:input.draft,token:value.token};
+                el("skill-manager-review").textContent=(operation==="delete" ? "Delete this skill definition. Bundled files remain.\n" : "Save these changes to the existing skill.\n")+value.location+"\nA backup of the previous definition will be retained."+(input.draft ? "\n\n"+input.draft.name+"\n"+input.draft.description+"\n\n"+input.draft.instructions : "");
+                el("skill-manager-status").textContent="Review the operation, then confirm.";
+            }).catch(function(e){if(g===generation)el("skill-manager-status").textContent=e.message;}).then(function(){managerBusy=false;controls();});
+        }
+        el("skill-manager-edit").addEventListener("click",function(){reviewManager("edit");});
+        el("skill-manager-delete").addEventListener("click",function(){reviewManager("delete");});
+        ["skill-manager-name","skill-manager-description","skill-manager-content"].forEach(function(id){el(id).addEventListener("input",function(){managerReview=null;el("skill-manager-review").textContent="";controls();});});
+        el("skill-manager-confirm").addEventListener("click",function(){
+            if(!manager || !managerReview || managerBusy)return;
+            var g=generation,review=managerReview;managerReview=null;managerBusy=true;controls();
+            manage({action:"apply",operation:review.operation,draft:review.draft,token:review.token}).then(function(value){
+                if(g!==generation || !manager)return;
+                el("skill-manager-status").textContent=(value.deleted ? "Deleted." : "Saved.")+" Backup: "+value.backup;
+                manager.editable=false;manager.content=value.content;manager.document=value.document;skillChoice=null;refreshSkills();
+            }).catch(function(e){if(g===generation && manager){manager.editable=false;el("skill-manager-status").textContent=e.message+" Close and refresh before trying again.";}}).then(function(){managerBusy=false;controls();if(g===generation && manager)el("skill-manager-close").focus();});
+        });
+        el("skill-manager-copy").addEventListener("click",function(){
+            if(!manager || managerBusy || manager.content===undefined)return;
+            var text=manager.document || manager.content;
+            var area=node("textarea",text);document.body.appendChild(area);area.select();
+            try{if(!document.execCommand("copy"))throw new Error("Copy failed");el("skill-manager-status").textContent="Copied skill to clipboard.";}
+            catch(e){el("skill-manager-status").textContent="Copy unavailable. Select the instructions and copy them manually.";}
+            document.body.removeChild(area);el("skill-manager-copy").focus();
+        });
+        el("skill-manager-close").addEventListener("click",closeManager);
+        el("skill-manager").addEventListener("keydown",function(e){
+            if(e.key==="Escape"){e.preventDefault();closeManager();}
+            if(e.key==="Tab"){
+                var fields=["skill-manager-name","skill-manager-description","skill-manager-content","skill-manager-copy","skill-manager-edit","skill-manager-delete","skill-manager-confirm","skill-manager-close"].map(el).filter(function(f){return !f.disabled&&!f.hidden;});
+                if(fields.length&&e.shiftKey&&document.activeElement===fields[0]){e.preventDefault();fields[fields.length-1].focus();}
+                else if(fields.length&&!e.shiftKey&&document.activeElement===fields[fields.length-1]){e.preventDefault();fields[0].focus();}
+            }
+        });
+        var capturing=false, retryLoading=false, retrySource=null, retryPrevious=null, retryButtons=[];
+        function clearRetry(){retrySource=null;retryPrevious=null;el("chat-retry-note").hidden=true;}
+        function retryDraft(message){
+            if(switchBlocked() || retryLoading || retrySource)return;
+            var g=generation,session=snapshot.sessionID;
+            retryPrevious={text:el("chat-input").value,attachments:attachments,references:references,skill:skillChoice,skillContext:skillContext};
+            retryLoading=true;controls();
+            request("retryDraft",{messageID:message.id,expectedSessionID:session}).then(function(data){
+                if(g!==generation || !snapshot || snapshot.sessionID!==session)return;
+                if(data.sessionID!==session || data.messageID!==message.id)throw {message:"Conversation changed. Select the request again."};
+                retrySource={sessionID:session,messageID:message.id};
+                el("chat-input").value=data.text;
+                attachments=data.attachments.map(function(a){return Object.assign({},a,{size:Math.floor(a.url.split(",")[1].length*3/4)});});
+                references=[];skillChoice=null;drawSkills();
+                drawReferences();drawAttachments();el("chat-retry-note").hidden=false;el("chat-input").focus();
+            }).catch(function(e){if(g===generation){retryPrevious=null;error(e);}}).then(function(){retryLoading=false;controls();});
+        }
+        el("chat-retry-cancel").addEventListener("click",function(){
+            if(sending || deliveryUnknown || !retryPrevious)return;
+            el("chat-input").value=retryPrevious.text;attachments=retryPrevious.attachments;references=retryPrevious.references;
+            skillChoice=retryPrevious.skill;skillContext=retryPrevious.skillContext;
+            clearRetry();drawSkills();drawReferences();drawAttachments();controls();
+        });
+        var references=[],targetEpoch=0,targetCursor=null,targetLoading=false;
+        function drawReferences(){var box=el("chat-references");box.textContent="";references.forEach(function(ref){var row=node("div",ref.compName+" (#"+ref.compId+")"+(ref.layerId===null?"":" / "+ref.name+" (#"+ref.layerId+")"),"chat-reference");var remove=node("button","×");remove.type="button";remove.setAttribute("aria-label","Remove reference "+ref.name);remove.disabled=sending || deliveryUnknown;remove.addEventListener("click",function(){references=references.filter(function(r){return r!==ref;});drawReferences();});row.appendChild(remove);box.appendChild(row);});}
+        function closeTargets(){targetEpoch++;targetLoading=false;el("chat-target-picker").hidden=true;el("chat-mention").focus();}
+        function findTargets(cursor){
+            if(targetLoading)return;
+            var g=generation,turn=++targetEpoch,scope=el("target-scope").value;
+            targetLoading=true;el("target-status").textContent="Searching…";el("target-next").disabled=true;
+            request("targets",{compId:scope==="comps"?null:Number(scope),search:el("target-search").value,cursor:cursor || null,directory:el("chat-workspace").value || undefined}).then(function(data){
+                if(g!==generation || turn!==targetEpoch)return;
+                if(data.sessionID){if(!snapshot)snapshot={status:"idle"};snapshot.sessionID=data.sessionID;}
+                targetCursor=data.nextCursor;var box=el("target-results");box.textContent="";
+                data.targets.forEach(function(ref){var b=node("button",ref.name+" (#"+(ref.layerId || ref.compId)+")"+(ref.layerId?" in "+ref.compName+" (#"+ref.compId+")":"")+(ref.selected?" · Selected in AE":""));b.type="button";b.addEventListener("click",function(){
+                    if(references.length>=8){el("target-status").textContent="Up to eight references. Remove one first.";return;}
+                    if(!references.some(function(r){return r.compId===ref.compId&&r.layerId===ref.layerId;}))references.push({compId:ref.compId,layerId:ref.layerId,compName:ref.compName,name:ref.name,projectEpoch:ref.projectEpoch});drawReferences();closeTargets();el("chat-input").focus();
+                });box.appendChild(b);});
+                el("target-status").textContent=(data.targets.length ? data.targets.length+" matches. " : "No matches on this page. ")+data.note;
+                el("target-next").disabled=!targetCursor;
+            }).catch(function(e){if(g===generation&&turn===targetEpoch)el("target-status").textContent=(e.code || "search_failed")+": "+e.message;}).then(function(){if(turn===targetEpoch)targetLoading=false;});
+        }
+        el("target-find").addEventListener("click",function(){findTargets(null);});
+        function invalidateTargets(){targetEpoch++;targetLoading=false;targetCursor=null;el("target-results").textContent="";el("target-next").disabled=true;el("target-status").textContent="Search to refresh this scope.";}
+        el("target-scope").addEventListener("change",invalidateTargets);
+        el("target-search").addEventListener("input",invalidateTargets);
+        el("target-next").addEventListener("click",function(){findTargets(targetCursor);});
+        el("target-close").addEventListener("click",closeTargets);
+        el("target-search").addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();findTargets(null);}});
+        el("chat-target-picker").addEventListener("keydown",function(e){if(e.key==="Escape"){e.preventDefault();closeTargets();}if(e.key==="Tab" && this.querySelectorAll){var focus=Array.prototype.slice.call(this.querySelectorAll('button:not(:disabled),input,select'));if(focus.length && e.shiftKey && document.activeElement===focus[0]){e.preventDefault();focus[focus.length-1].focus();}else if(focus.length&&!e.shiftKey&&document.activeElement===focus[focus.length-1]){e.preventDefault();focus[0].focus();}}});
+        function switchBlocked() {
+            return !!manager || managerBusy || retryLoading || state.connection!=="connected" || client.renderWorking || capturing || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview ||
+                conversationSwitching || deliveryUnknown || !!client.panelPending || state.busy || state.uncertain || !!state.lock ||
+                !!(snapshot && (snapshot.status!=="idle" || snapshot.owned || snapshot.restore && ["pending","unconfirmed"].indexOf(snapshot.restore.status)>=0));
+        }
+        function conversationControls() {
+            var blocked=switchBlocked();
+            el("conversation-switch-status").textContent=blocked ? "Finish active work or recovery before switching conversations." : "";
+            conversationRows.forEach(function(row){row.open.disabled=blocked || conversationLoading || row.unavailable;row.rename.disabled=row.open.disabled;});
+            el("chat-conversations-prev").disabled=conversationLoading || conversationSwitching || conversationOffset===0 || state.connection!=="connected";
+            el("chat-conversations-next").disabled=conversationLoading || conversationSwitching || conversationNext===null || state.connection!=="connected";
+            el("chat-conversation-save").disabled=blocked || conversationLoading;
+            el("chat-conversations-search-button").disabled=conversationSwitching || state.connection!=="connected";
+            el("chat-conversations-close").disabled=conversationSwitching;
+            if(state.connection!=="connected" && !el("chat-conversations").hidden)el("chat-conversations-status").textContent="Connect to CookieMonster to browse conversations.";
+        }
+        function loadConversations(offset) {
+            var epoch=++conversationEpoch,g=generation;
+            conversationOffset=offset;conversationLoading=true;renameConversation=null;el("chat-conversation-rename").hidden=true;
+            el("chat-conversations-status").textContent="Loading conversations...";conversationControls();
+            request("conversations",{search:el("chat-conversations-search").value,offset:offset}).then(function(data){
+                if(g!==generation || epoch!==conversationEpoch)return;
+                if(data.total && offset>=data.total){loadConversations(Math.floor((data.total-1)/10)*10);return;}
+                conversationNext=data.nextOffset===undefined ? null : data.nextOffset;conversationRows=[];
+                var list=el("chat-conversations-list");list.textContent="";
+                (data.conversations || []).forEach(function(item){
+                    var row=node("div",undefined,"chat-conversation-row"),buttons=node("div",undefined,"buttons"),open=node("button","Open"),rename=node("button","Rename");
+                    open.type=rename.type="button";row.appendChild(node("strong",item.title));
+                    row.appendChild(node("p",item.missing ? "Deleted in CookieMonster" : item.unavailable ? item.unavailableReason || "Open this workspace in CookieMonster" : "Last activity: "+new Date(item.updatedAt).toLocaleString()));
+                    row.appendChild(node("p",item.directory));
+                    if(snapshot && snapshot.sessionID===item.sessionID)row.appendChild(node("p","Current conversation"));
+                    open.addEventListener("click",function(){if(!open.disabled)changeConversation("reopen",item);});
+                    rename.addEventListener("click",function(){if(rename.disabled)return;renameConversation=item;el("chat-conversation-title").value=item.title;el("chat-conversation-rename").hidden=false;el("chat-conversation-title").focus();});
+                    buttons.appendChild(open);buttons.appendChild(rename);row.appendChild(buttons);list.appendChild(row);
+                    conversationRows.push({open:open,rename:rename,unavailable:item.missing || item.unavailable});
+                });
+                el("chat-conversations-status").textContent=data.total ? (offset+1)+"–"+Math.min(offset+10,data.total)+" of "+data.total+(switchBlocked() ? ". Finish work or recovery before switching." : "") : "No conversations found for this project.";
+            },function(e){if(g===generation && epoch===conversationEpoch){el("chat-conversations-list").textContent="";conversationRows=[];conversationNext=null;el("chat-conversations-status").textContent=e.message || "Conversations unavailable";}}).then(function(){if(epoch===conversationEpoch){conversationLoading=false;conversationControls();}});
+        }
+        function closeConversations() { if(conversationSwitching)return;conversationEpoch++;conversationLoading=false;el("chat-conversations").hidden=true;el("chat-conversations-open").setAttribute("aria-expanded","false");el("chat-conversations-open").focus(); }
+        function applyTarget(id) {
+            var picker=el("chat-comp"),value=id===null ? "follow" : String(id);
+            if(value!=="follow" && !(state.compositions || []).some(function(c){return String(c.id)===value;})){
+                var option=node("option","Missing composition #"+value);option.value=value;picker.appendChild(option);
+            }
+            picker.value=value;pins()[pinKey()]=value;store.save();
+        }
+        function changeConversation(action,item) {
+            if(switchBlocked())return;
+            conversationSwitching=true;generation++;conversationEpoch++;polling=false;controls();
+            var g=generation;
+            request(action,item ? {sessionID:item.sessionID,directory:item.directory} : {directory:el("chat-workspace").value || undefined}).then(function(data){
+                if(g!==generation)return;
+                clearSkills();snapshot={sessionID:data.sessionID,status:"loading"};messagesKey="";approvalsKey="";collapseSession="";historyMessages=[];historyLoaded=false;historyCursor=null;
+                historyLoading=false;catalogLoading=false;checkpointLoading=false;checkpointAt=0;catalogAt=0;checkpointList=[];
+                clearRetry();deliveryUnknown=false;attachments=[];drawAttachments();el("chat-input").value="";el("chat-messages").textContent="";el("chat-approvals").textContent="";
+                el("chat-error").textContent="";el("chat-conversations").hidden=true;el("chat-conversations-open").setAttribute("aria-expanded","false");references=[];drawReferences();applyTarget(data.targetCompId===undefined ? null : data.targetCompId);el("chat-input").focus();
+            },function(e){if(g===generation){error(e);el("chat-conversations-status").textContent=e.message || "Could not open conversation";}}).then(function(){
+                if(g!==generation)return;conversationSwitching=false;controls();refresh();
+            });
+        }
+        el("chat-conversations-open").addEventListener("click",function(){el("advanced").open=false;el("chat-conversations").hidden=false;el("conversation-project").textContent=state.project && state.project.path || "Unsaved project";el("chat-conversations-open").setAttribute("aria-expanded","true");el("chat-conversations-search").focus();loadConversations(0);});
+        el("chat-conversations-close").addEventListener("click",closeConversations);
+        el("chat-conversations-search-button").addEventListener("click",function(){loadConversations(0);});
+        el("chat-conversations-search").addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();loadConversations(0);}});
+        el("chat-conversations-prev").addEventListener("click",function(){loadConversations(Math.max(0,conversationOffset-10));});
+        el("chat-conversations-next").addEventListener("click",function(){if(conversationNext!==null)loadConversations(conversationNext);});
+        el("chat-conversation-cancel").addEventListener("click",function(){renameConversation=null;el("chat-conversation-rename").hidden=true;el("chat-conversations-search").focus();});
+        el("chat-conversation-rename").addEventListener("submit",function(e){
+            e.preventDefault();if(!renameConversation || switchBlocked() || conversationLoading)return;
+            var item=renameConversation,g=generation;conversationSwitching=true;controls();
+            request("rename",{sessionID:item.sessionID,directory:item.directory,title:el("chat-conversation-title").value}).then(function(){
+                if(g===generation){renameConversation=null;el("chat-conversation-rename").hidden=true;el("chat-conversations-search").focus();}
+            },function(e){if(g===generation)el("chat-conversations-status").textContent=(e.message || "Rename not confirmed")+". Refresh the list before trying again.";}).then(function(){
+                if(g===generation){conversationSwitching=false;controls();if(!renameConversation)loadConversations(conversationOffset);refresh();}
+            });
+        });
+        el("chat-conversations").addEventListener("keydown",function(e){
+            if(e.key==="Escape"){e.preventDefault();closeConversations();return;}
+            if(e.key!=="Tab")return;
+            var fields=Array.prototype.filter.call(el("chat-conversations").querySelectorAll("button,input"),function(field){return !field.disabled && field.offsetParent!==null;});
+            if(!fields.length){e.preventDefault();return;}
+            if(e.shiftKey && document.activeElement===fields[0]){e.preventDefault();fields[fields.length-1].focus();}
+            else if(!e.shiftKey && document.activeElement===fields[fields.length-1]){e.preventDefault();fields[0].focus();}
+        });
+        function clearSkills() {
+            skillEpoch++;skills=[];skillChoice=null;skillContext=null;skillLoading=false;
+            technique=null;techniqueReview=null;el("chat-technique").hidden=true;
+            el("chat-skill-status").textContent="";el("chat-skill-workspace").textContent="";
+            el("chat-skill-search").value="";drawSkills();
+        }
+        function drawSkills() {
+            var picker=el("chat-skill-picker"),query=el("chat-skill-search").value.toLowerCase();picker.textContent="";
+            var blank=node("option","No skill selected");blank.value="";picker.appendChild(blank);
+            skills.forEach(function(s,i){
+                if(s!==skillChoice && (s.name+" "+(s.description || "")).toLowerCase().indexOf(query)<0)return;
+                var option=node("option",s.name+(s.description ? " - "+s.description : ""));option.value=String(i);picker.appendChild(option);
+            });
+            picker.value=skillChoice ? String(skills.indexOf(skillChoice)) : "";
+        }
+        function refreshSkills() {
+            if(skillLoading || !state.project || state.connection!=="connected")return;
+            var g=generation,epoch=++skillEpoch;skillLoading=true;
+            el("chat-skill-status").textContent="Loading fresh skill metadata...";
+            request("skills",{directory:el("chat-workspace").value || undefined}).then(function(data){
+                if(g!==generation || epoch!==skillEpoch)return;
+                skills=data.skills || [];skillContext={directory:data.directory,sessionID:data.sessionID};
+                if(skillChoice){
+                    var found=skills.filter(function(s){return s.name===skillChoice.name && s.source===skillChoice.source && s.revision===skillChoice.revision;})[0];
+                    skillChoice=found || null;el("chat-skill-status").textContent=found ? "Selected: "+found.name+" (not loaded)" : "Selected skill is missing or changed. Select it again.";
+                }else el("chat-skill-status").textContent=skills.length ? "Select a skill for the next message." : "No skills available.";
+                el("chat-skill-workspace").textContent="CM workspace: "+data.directory+". Skills are not isolated per .aep.";
+                drawSkills();
+            },function(e){if(g===generation && epoch===skillEpoch){skills=[];skillChoice=null;skillContext=null;drawSkills();el("chat-skill-status").textContent=e.message || "Skills unavailable";}}).then(function(){if(epoch===skillEpoch)skillLoading=false;controls();});
+        }
+        function draftTechnique(message) {
+            if(techniqueBusy || !snapshot || !snapshot.sessionID || !message.completed || message.error)return;
+            var text=(message.parts || []).filter(function(p){return p.type==="text";}).map(function(p){return p.text;}).join("\n\n");
+            if(!text.trim() || text.length>64000){error({message:"Choose a completed reply with at most 64000 characters."});return;}
+            technique={sessionID:snapshot.sessionID,directory:snapshot.directory};techniqueReview=null;
+            el("technique-name").value="";el("technique-description").value="";el("technique-instructions").value=text;
+            el("technique-scope").value="workspace";el("technique-workspace").textContent="This CM workspace: "+(snapshot.directory || "Choose a workspace");
+            el("technique-status").textContent="Draft only. Review all fields before saving.";
+            el("technique-review").textContent="";el("technique-confirm").hidden=true;el("chat-technique").hidden=false;
+            el("technique-name").focus();controls();
+        }
+        function techniqueDraft() { return {name:el("technique-name").value,description:el("technique-description").value,
+            instructions:el("technique-instructions").value,scope:el("technique-scope").value}; }
+        ["technique-name","technique-description","technique-instructions","technique-scope"].forEach(function(id){
+            el(id).addEventListener(id==="technique-scope" ? "change" : "input",function(){techniqueReview=null;el("technique-confirm").hidden=true;el("technique-review").textContent="";});
+        });
+        el("technique-cancel").addEventListener("click",function(){if(techniqueBusy)return;technique=null;techniqueReview=null;el("chat-technique").hidden=true;controls();el("chat-input").focus();});
+        el("chat-technique").addEventListener("keydown",function(e){
+            if(e.key==="Escape"){e.preventDefault();if(!techniqueBusy)el("technique-cancel").click();return;}
+            if(e.key!=="Tab")return;
+            var fields=["technique-name","technique-description","technique-instructions","technique-scope","technique-review-button","technique-confirm","technique-cancel"].map(el).filter(function(field){return !field.disabled && !field.hidden;});
+            if(!fields.length){e.preventDefault();return;}
+            if(e.shiftKey && document.activeElement===fields[0]){e.preventDefault();fields[fields.length-1].focus();}
+            else if(!e.shiftKey && document.activeElement===fields[fields.length-1]){e.preventDefault();fields[0].focus();}
+        });
+        el("technique-review-button").addEventListener("click",function(){
+            if(!technique || techniqueBusy)return;
+            var current=technique,draft=techniqueDraft(),g=generation;techniqueBusy=true;controls();
+            request("skillReview",{draft:draft,sessionID:current.sessionID,directory:el("chat-workspace").value || current.directory}).then(function(review){
+                if(g!==generation || current!==technique || JSON.stringify(draft)!==JSON.stringify(techniqueDraft()))return;
+                techniqueReview={token:review.token,draft:draft,directory:review.directory};
+                el("technique-review").textContent="Create "+review.destination+"\nScope: "+(draft.scope==="workspace" ? "This CM workspace" : "Global CM skills")+"\nName: "+draft.name+"\nDescription: "+draft.description+"\n\n"+draft.instructions;
+                el("technique-status").textContent="Confirm this exact content and destination. Existing files will not be overwritten.";
+                el("technique-confirm").hidden=false;
+            },function(e){if(g===generation)el("technique-status").textContent=e.message || "Review failed";}).then(function(){techniqueBusy=false;controls();});
+        });
+        el("technique-confirm").addEventListener("click",function(){
+            if(!technique || !techniqueReview || techniqueBusy)return;
+            var current=technique,review=techniqueReview,g=generation;
+            if(JSON.stringify(review.draft)!==JSON.stringify(techniqueDraft()))return;
+            techniqueReview=null;techniqueBusy=true;el("technique-confirm").hidden=true;controls();
+            request("skillSave",{draft:review.draft,token:review.token,sessionID:current.sessionID,directory:review.directory}).then(function(receipt){
+                if(g!==generation || technique!==current)return;
+                el("technique-status").textContent="Saved: "+receipt.destination;technique=null;
+                el("chat-technique").hidden=true;el("chat-skill-status").textContent="Saved: "+receipt.name;refreshSkills();el("chat-input").focus();
+            },function(e){if(g===generation)el("technique-status").textContent=(e.message || "Save not confirmed")+". No automatic retry.";}).then(function(){techniqueBusy=false;controls();});
+        });
+        el("chat-skill-search").addEventListener("input",drawSkills);
+        el("chat-skills-refresh").addEventListener("click",refreshSkills);
+        el("chat-skills").addEventListener("toggle",function(){if(this.open)refreshSkills();});
+        el("chat-skills").addEventListener("keydown",function(e){if(e.key==="Escape" && this.open){e.preventDefault();this.open=false;this.querySelector("summary").focus();}});
+        el("chat-skill-picker").addEventListener("change",function(){
+            skillChoice=this.value==="" ? null : skills[Number(this.value)] || null;
+            el("chat-skill-status").textContent=skillChoice ? "Selected: "+skillChoice.name+" (not loaded)" : "No skill selected";controls();
+        });
         function projectIdentity(s) { return s.project ? JSON.stringify(s.project) : ""; }
         function pins() { if(!store.state.chatPins)store.state.chatPins={};return store.state.chatPins; }
         function pinKey() { return "project:"+(state.project && state.project.id); }
@@ -17,15 +302,49 @@
         }
         function error(e) { el("chat-error").textContent=(e.code ? e.code+": " : "")+(e.message || String(e)); }
         function controls() {
-            var connected=state.connection==="connected", busy=sending || modelSaving || snapshot && snapshot.status!=="idle";
+            var selectedLayers=state.selectedLayers || [];
+            el("chat-selected-layers").hidden=!selectedLayers.length;
+            el("chat-selected-layers").textContent=selectedLayers.length ? "Selected in AE: "+selectedLayers.slice(0,3).map(function(l){return l.name+" (#"+l.layerId+")";}).join(", ")+(selectedLayers.length>3?" +"+(selectedLayers.length-3):"")+" · Use @ to reference" : "";
+            var connected=state.connection==="connected", busy=!!manager || managerBusy || retryLoading || client.renderWorking || capturing || conversationSwitching || sending || modelSaving || techniqueBusy || !!technique || restoreWorking || !!restoreReview || snapshot && snapshot.status!=="idle";
+            el("chat-skill-manage").disabled=!!switchBlocked() || !skillChoice || !snapshot || !snapshot.sessionID;
+            ["skill-manager-name","skill-manager-description","skill-manager-content"].forEach(function(id){el(id).readOnly=!manager || !manager.editable;el(id).disabled=managerBusy;});
+            el("skill-manager-copy").disabled=managerBusy || !manager || manager.content===undefined;
+            el("skill-manager-edit").disabled=el("skill-manager-delete").disabled=managerBusy || !connected || !manager || !manager.editable;
+            el("skill-manager-confirm").hidden=!managerReview;el("skill-manager-confirm").disabled=managerBusy || !connected;
+            el("skill-manager-close").disabled=managerBusy;
+            retryButtons.forEach(function(button){button.disabled=!!switchBlocked() || !!retrySource;});
+            el("chat-retry-cancel").disabled=sending || deliveryUnknown;
+            var frame=(state.compositions || []).filter(function(c){return c.id===selected();})[0];
+            el("chat-capture").disabled=!!switchBlocked() || attachments.length>=4 || attachments.some(function(a){return !a.url;}) || !state.project || !state.project.saved || !frame || typeof frame.time!=="number" || !isFinite(frame.time) || frame.time<0;
+            el("chat-capture").title=capturing ? "Capturing. Keep this panel visible; no automatic retry." : frame && typeof frame.time==="number" ? "Attach "+frame.name+" (#"+frame.id+") at "+frame.time.toFixed(3)+"s with alpha" : "Waiting for an explicit composition time from After Effects";
+            var restoring=snapshot && snapshot.restore && ["pending","unconfirmed"].indexOf(snapshot.restore.status)>=0;
+            var restoreBlocked=!connected || !!busy || !!restoring || !!client.panelPending || state.busy || state.uncertain || !!state.lock || deliveryUnknown || !!(snapshot && snapshot.owned) || !!(state.binding && state.binding.sessionID!==(snapshot && snapshot.sessionID));
+            el("chat-skill-picker").disabled=!connected || !!busy || skillLoading;
+            el("chat-skills-refresh").disabled=!connected || !!busy || skillLoading;
+            el("technique-review-button").disabled=techniqueBusy || !connected;
+            el("technique-confirm").disabled=techniqueBusy || !connected;
+            el("technique-cancel").disabled=techniqueBusy;
+            ["technique-name","technique-description","technique-instructions","technique-scope"].forEach(function(id){el(id).disabled=techniqueBusy;});
+            el("chat-checkpoints-toggle").disabled=restoreWorking || !!restoreReview;
+            el("chat-checkpoint-picker").disabled=checkpointLoading || !checkpointList.length || restoreBlocked;
+            el("chat-checkpoint-review").disabled=checkpointLoading || restoreBlocked || !checkpointList.some(function(c){return c.id===el("chat-checkpoint-picker").value;});
+            el("chat-checkpoint-help").textContent=checkpointLoading ? "Loading checkpoints…" : !connected ? "Connect to load this project's checkpoints." : !snapshot || !snapshot.sessionID ? "Start a conversation to see this project's checkpoints." : !checkpointList.length ? "No checkpoints yet. A checkpoint is saved before an edit runs." : restoreBlocked ? "Restoring is unavailable while work or recovery is in progress. Finish or stop the current task first." : "Restores the whole project. You can review and cancel before anything changes.";
+            checkpointButtons.forEach(function(item){
+                var available=checkpointList.some(function(c){return c.id===item.id;});
+                item.button.disabled=!available || !connected || !!busy || !!restoring || !!client.panelPending || state.busy || state.uncertain || !!state.lock || !!(snapshot && snapshot.owned) || !!(state.binding && state.binding.sessionID!==(snapshot && snapshot.sessionID));
+                item.status.textContent=available ? "Saved state before this edit. Verified again when you review Restore." : "Checkpoint unavailable or not loaded for this project.";
+                item.button.title=available ? "Restore project to before this request" : "No checkpoint available for this request";
+            });
             el("chat-model").disabled=!connected || !!busy || deliveryUnknown || !catalog.length;
             el("chat-reasoning").disabled=el("chat-model").disabled || !el("chat-model").value || el("chat-reasoning").children.length<=1;
             el("chat-model-status").textContent=!connected ? "Connect to CookieMonster to choose a model" : modelSaving ? "Saving model…" : modelError;
-            el("chat-send").disabled=!connected || !!busy || state.uncertain || deliveryUnknown || attachments.some(function(a){return !a.url;}) || !el("chat-input").value.trim();
+            el("chat-send").disabled=!connected || !!busy || !!restoring || !!(snapshot && snapshot.missing) || state.uncertain || deliveryUnknown || attachments.some(function(a){return !a.url;}) || !el("chat-input").value.trim();
             el("chat-attach").disabled=!!busy || deliveryUnknown;
-            el("chat-input").disabled=!!sending || deliveryUnknown;
-            el("chat-stop").disabled=!connected || !busy;
-            el("chat-new").disabled=!connected || sending || modelSaving;
+            el("chat-input").disabled=retryLoading || !!sending || deliveryUnknown;
+            el("chat-stop").disabled=!connected || capturing || restoreWorking || !!restoreReview || !busy;
+            el("chat-new").disabled=!!switchBlocked();
+            el("chat-conversations-open").disabled=conversationSwitching || !!technique || restoreWorking || !!restoreReview;
+            conversationControls();
             el("chat-workspace").disabled=!connected || sending || modelSaving || !!(snapshot && snapshot.sessionID);
             el("chat-takeover").hidden=!(snapshot && snapshot.owned);
             el("chat-takeover").textContent=takeover ? "Take control on next message ✓" : "Take control for this chat";
@@ -33,7 +352,8 @@
         }
         function request(action, extra) {
             var g=generation, project=JSON.parse(projectIdentity(state)),descriptor=client.descriptor, credential=store.state.credential;
-            return api.request(descriptor,credential,"/chat",Object.assign({action:action,project:project},extra || {}),30000).then(function(r){
+            var expected=["send","new","reopen","rename","model","bind","captureBind","targets","history","stop","permission"].indexOf(action)>=0 ? {expectedSessionID:snapshot && snapshot.sessionID || null} : {};
+            return api.request(descriptor,credential,"/chat",Object.assign({action:action,project:project},expected,extra || {}),30000).then(function(r){
                 if(g!==generation || descriptor!==client.descriptor || credential!==store.state.credential)throw {code:"stale_project",message:"Project changed; response belongs to the previous conversation"};
                 if(!r || !r.result || typeof r.result!=="object")throw {code:"invalid_response",message:"Invalid chat response"};
                 return r.result;
@@ -42,6 +362,101 @@
         function node(tag, text, className) {
             var e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(className)e.className=className;return e;
         }
+        function restoreNotice(text) { el("chat-restore-status").textContent=text;el("chat-restore-status").hidden=!text; }
+        function cancelRestore() { restoreReview=null;client.restoreApproval=null;el("chat-restore-review").hidden=true;controls(); }
+        function reviewRestore(id) {
+            el("advanced").open=false;
+            var g=generation;restoreWorking=true;controls();
+            request("bind").then(function(){return client.heartbeat();}).then(function(){
+                if(g!==generation)throw {message:"Project changed; review the restore again"};
+                return client.panel("checkpoint.restore.propose",{id:id});
+            }).then(function(result){
+                if(g!==generation || !client.restoreApproval)return;
+                restoreReview=client.restoreApproval;el("chat-restore-operation").textContent=result.operation;
+                el("chat-restore-review").hidden=false;el("chat-restore-cancel").focus();
+            },function(e){
+                if(g===generation)error(e.code==="restore_unsupported" ?
+                    {message:"Chat restore requires matching compact-restore support in the bridge and AE host. Nothing was changed. Update the matching integration before reviewing again; no full-scene fallback will run."} :
+                    e.code==="response_too_large" || e.code==="payload_too_large" ? {message:"Restore review exceeded its response limit. Nothing was changed. Your checkpoint is still available; use After Effects to open a copy manually."} : e);
+            }).then(function(){restoreWorking=false;controls();});
+        }
+        function refreshCheckpoints() {
+            if(checkpointLoading || restoreWorking || restoreReview || !snapshot || !snapshot.sessionID)return Promise.resolve();
+            var g=generation;checkpointLoading=true;controls();
+            return request("checkpoints").then(function(data){if(g===generation){checkpointList=data.checkpoints || [];checkpointAt=Date.now();drawCheckpoints();}},function(e){if(g===generation){checkpointList=[];checkpointAt=Date.now();drawCheckpoints();error({message:"Could not load checkpoints. Close and reopen Restore checkpoint to try again. "+(e.message || "")});}}).then(function(){checkpointLoading=false;controls();});
+        }
+        // Port CookieMonster's controlled disclosure state: streaming rerenders
+        // must not override a user's choice. Native details replaces Solid/Kobalte.
+        function disclosure(key, title, expanded) {
+            if(key.slice(-9)===":activity" && window.CookieJarPreferences){var choice=window.CookieJarPreferences.get().activity;if(choice!=="auto")expanded=choice==="expanded";}
+            var box=node("details",undefined,"chat-disclosure"),summary=node("summary",title);
+            box.open=Object.prototype.hasOwnProperty.call(collapseState,key) ? collapseState[key] : expanded;
+            summary.addEventListener("click",function(e){e.preventDefault();box.open=!box.open;collapseState[key]=box.open;saveCollapse();});
+            box.appendChild(summary);return box;
+        }
+        function saveCollapse() {
+            try {
+                var keys=Object.keys(collapseState);keys.slice(0,Math.max(0,keys.length-500)).forEach(function(k){delete collapseState[k];});
+                window.localStorage.setItem("cookiejar-collapse:"+projectKey+":"+collapseSession,JSON.stringify(collapseState));
+            }catch(e){/* Disclosure state is optional; storage errors must not block editing. */}
+        }
+        function loadCollapse() {
+            collapseState={};
+            try { var raw=window.localStorage.getItem("cookiejar-collapse:"+projectKey+":"+collapseSession),saved=raw && raw.length<64000 ? JSON.parse(raw) : {};
+                Object.keys(saved || {}).slice(-500).forEach(function(k){if(typeof saved[k]==="boolean")collapseState[k]=saved[k];});
+            }catch(e){}
+        }
+        function formatted(part) {
+            var box=node("div",undefined,"chat-text chat-markdown"),count=0;
+            function append(parent,items,depth){
+                (items || []).forEach(function(item){
+                    if(++count>6000 || depth>20 || !item || typeof item!=="object")return;
+                    var allowed=["p","h1","h2","h3","h4","h5","h6","strong","em","del","code","pre","blockquote","ol","ul","li","br","hr","span","table","thead","tbody","tr","th","td"];
+                    var child=node(allowed.indexOf(item.tag)>=0 ? item.tag : "span",typeof item.text==="string" ? item.text : undefined);
+                    if(Array.isArray(item.children))append(child,item.children,depth+1);parent.appendChild(child);
+                });
+            }
+            if(Array.isArray(part.markdown))append(box,part.markdown,0);else box.textContent=part.text;
+            return box;
+        }
+        el("chat-history").addEventListener("click",function(){
+            if(historyLoading || !historyCursor || !snapshot)return;
+            var g=generation,session=snapshot.sessionID,box=el("chat-messages"),height=box.scrollHeight,top=box.scrollTop;
+            historyLoading=true;this.disabled=true;this.textContent="Loading history…";
+            request("history",{before:historyCursor}).then(function(page){
+                if(g!==generation || session!==page.sessionID || !snapshot || snapshot.sessionID!==session)return;
+                historyMessages=(page.messages || []).concat(historyMessages);historyCursor=page.nextCursor;historyLoaded=true;
+                draw(snapshot);box.scrollTop=top+box.scrollHeight-height;
+            },function(e){if(g===generation)error(e);}).then(function(){historyLoading=false;el("chat-history").disabled=false;el("chat-history").textContent="Load earlier messages";});
+        });
+        function drawCheckpoints() {
+            var picker=el("chat-checkpoint-picker"),previous=picker.value;picker.textContent="";
+            var list=checkpointList.slice().sort(function(a,b){return String(b.createdAt || "").localeCompare(String(a.createdAt || ""));});
+            if(!list.length){var empty=node("option","No checkpoints available");empty.value="";picker.appendChild(empty);}
+            list.forEach(function(c,index){
+                var date=new Date(c.createdAt),label=isNaN(date.getTime()) ? "Checkpoint "+c.id : date.toLocaleString()+" · "+c.id.slice(0,8);
+                var option=node("option",(index===0 ? "Latest · " : "")+label);option.value=c.id;picker.appendChild(option);
+            });
+            picker.value=list.some(function(c){return c.id===previous;}) ? previous : list.length ? list[0].id : "";
+        }
+        el("chat-checkpoints-toggle").addEventListener("click",function(){
+            if(this.disabled)return;
+            var open=el("chat-checkpoints").hidden;el("chat-checkpoints").hidden=!open;
+            this.setAttribute("aria-expanded",String(open));
+            if(open){drawCheckpoints();controls();refreshCheckpoints();}
+        });
+        el("chat-checkpoint-picker").addEventListener("change",controls);
+        el("chat-checkpoint-review").addEventListener("click",function(){if(!this.disabled)reviewRestore(el("chat-checkpoint-picker").value);});
+        el("chat-restore-cancel").addEventListener("click",cancelRestore);
+        el("chat-restore-confirm").addEventListener("click",function(){
+            if(restoreWorking || !restoreReview || restoreReview!==client.restoreApproval)return;
+            restoreWorking=true;restoreReview=null;el("chat-restore-review").hidden=true;
+            restoreNotice("Saving your current work and restoring the project…");controls();client.start();
+            client.confirmRestore().then(function(r){
+                restoreNotice((r.recoveryCopy ? "A recovery copy was opened. Review it in AE and save it to the intended location before continuing. " : "Project restored. Earlier chat messages describe historical states. ")+
+                    "Your previous work is preserved in checkpoint "+r.currentCheckpointId+". Backup: "+r.emergencyPath+". "+r.warning);
+            },function(e){restoreNotice("Restore was not confirmed. Check After Effects and retain the backup files. It will not retry automatically. "+(e.message || ""));}).then(function(){restoreWorking=false;checkpointAt=0;controls();refresh();});
+        });
         function modelKey(m) { return JSON.stringify([m.providerID,m.id]); }
         function drawModels() {
             if(modelSaving)return;
@@ -49,7 +464,7 @@
             if(key===catalogKey)return;catalogKey=key;
             var picker=el("chat-model");picker.textContent="";
             var blank=node("option","CookieMonster default");blank.value="";blank.disabled=true;picker.appendChild(blank);
-            catalog.forEach(function(m){var option=node("option",m.name+" · "+m.provider);option.value=modelKey(m);picker.appendChild(option);});
+            catalog.forEach(function(m){var option=node("option",m.name);option.title=m.provider;option.value=modelKey(m);picker.appendChild(option);});
             if(current && !catalog.some(function(m){return modelKey(m)===modelKey(current);})){var missing=node("option",current.id+" · Unavailable");missing.value=modelKey(current);missing.disabled=true;picker.appendChild(missing);}
             picker.value=current ? modelKey(current) : "";
             drawReasoning(current && current.variant || "default");
@@ -81,26 +496,27 @@
         el("chat-model").addEventListener("change",function(){drawReasoning("default");saveModel();});
         el("chat-reasoning").addEventListener("change",saveModel);
         el("chat-workspace").addEventListener("change",function(){
-            workspaceChoice=this.value || null;modelRevision++;catalog=[];catalogKey="";catalogAt=0;modelError="";drawModels();controls();refreshModels();refresh();
+            clearSkills();workspaceChoice=this.value || null;modelRevision++;catalog=[];catalogKey="";catalogAt=0;modelError="";drawModels();controls();refreshModels();refresh();if(el("chat-skills").open)refreshSkills();
         });
         function drawAttachments() {
             var box=el("chat-attachments");box.textContent="";
             attachments.forEach(function(a){
                 var row=node("div",undefined,"chat-reference");
                 if(a.url && a.mime.indexOf("image/")===0){var img=node("img");img.src=a.url;img.alt=a.filename;row.appendChild(img);}
-                row.appendChild(node("span",a.filename+(a.url ? "" : " · Reading…")));
+                row.appendChild(node("span",a.caption || a.filename+(a.url ? "" : " · Reading…")));
                 var remove=node("button","×");remove.type="button";remove.setAttribute("aria-label","Remove "+a.filename);remove.disabled=sending || deliveryUnknown;
                 remove.addEventListener("click",function(){attachments=attachments.filter(function(item){return item!==a;});drawAttachments();controls();});
                 row.appendChild(remove);box.appendChild(row);
             });
         }
         function addFiles(files) {
-            if(sending || deliveryUnknown || !state.project)return;
+            if(retryLoading || capturing || sending || deliveryUnknown || !state.project)return;
             var g=generation;
             Array.prototype.forEach.call(files,function(file){
-                var extension=file.name.split(".").pop().toLowerCase(),mime={png:"image/png",jpg:"image/jpeg",jpeg:"image/jpeg",webp:"image/webp",pdf:"application/pdf",txt:"text/plain",md:"text/plain"}[extension];
-                if(!mime){error({message:"Use PNG, JPEG, WebP, PDF, TXT or Markdown references."});return;}
-                if(attachments.length>=4 || !file.size || file.size+attachments.reduce(function(n,a){return n+a.size;},0)>2*1024*1024){error({message:"Attach up to four non-empty files, 2 MB total."});return;}
+                var extension=file.name.split(".").pop().toLowerCase(),mime={png:"image/png",jpg:"image/jpeg",jpeg:"image/jpeg",gif:"image/gif",webp:"image/webp",pdf:"application/pdf",txt:"text/plain",md:"text/plain"}[extension];
+                if(!mime && "c cc cjs conf cpp css csv cts env go gql graphql h hh hpp htm html ini java js json jsonld jsx log md mdx mjs mts py rb rs sass scss sh sql toml ts tsx txt xml yaml yml zsh".split(" ").indexOf(extension)>=0)mime="text/plain";
+                if(!mime){error({message:"Use images, PDF or text/code files. Audio, video and Office documents are not supported by CookieMonster's attachment path."});return;}
+                if(attachments.length>=4 || !file.size || file.size+attachments.reduce(function(n,a){return n+a.size;},0)>10*1024*1024){error({message:"Attach up to four non-empty files, 10 MB total."});return;}
                 var a={filename:file.name,mime:mime,size:file.size},reader=new FileReader();attachments.push(a);
                 reader.onload=function(){if(g!==generation || attachments.indexOf(a)<0)return;a.url="data:"+mime+";base64,"+String(reader.result).split(",")[1];drawAttachments();controls();};
                 reader.onerror=function(){if(g!==generation || attachments.indexOf(a)<0)return;attachments=attachments.filter(function(item){return item!==a;});error({message:"Could not read "+file.name});drawAttachments();controls();};
@@ -108,8 +524,52 @@
             });
             drawAttachments();controls();
         }
-        el("chat-attach").addEventListener("click",function(){el("chat-files").click();});
-        el("chat-files").addEventListener("change",function(){addFiles(this.files);this.value="";});
+        var browsingFiles=false;
+        function endBrowse(){if(!browsingFiles)return;browsingFiles=false;if(client.endFileDialog)client.endFileDialog();controls();}
+        el("chat-attach").addEventListener("click",function(){
+            if(browsingFiles || el("chat-attach").disabled)return;
+            browsingFiles=true;
+            var ready=client.beginFileDialog ? client.beginFileDialog() : Promise.resolve();
+            ready.then(function(){el("chat-files").click();}).catch(function(e){endBrowse();error(e);});
+        });
+        // Chromium 99 does not emit the file-input cancel event. Window focus is
+        // the fallback for cancellation; defer until the modal has finished closing.
+        window.addEventListener("focus",function(){if(browsingFiles)setTimeout(endBrowse,300);});
+        // CEP may keep its window focused when Cancel closes the native picker.
+        // Input delivered to the panel proves that the blocking dialog has closed.
+        window.addEventListener("pointerdown",endBrowse);
+        window.addEventListener("keydown",endBrowse);
+        el("chat-files").addEventListener("cancel",endBrowse);
+        el("chat-capture").addEventListener("click",function(){
+            if(el("chat-capture").disabled)return;
+            var comp=(state.compositions || []).filter(function(c){return c.id===selected();})[0];
+            if(!comp)return;
+            var target={compId:comp.id,time:comp.time},name=comp.name,g=generation;
+            capturing=true;el("chat-error").textContent="Capturing frame. Keep this panel visible...";controls();
+            request("captureBind",{directory:el("chat-workspace").value || undefined}).then(function(data){
+                if(g!==generation)throw {code:"stale_project",message:"Project changed; frame discarded"};
+                if(!snapshot)snapshot={status:"idle"};snapshot.sessionID=data.sessionID;
+                return client.heartbeat();
+            }).then(function(){
+                if(g!==generation)throw {code:"stale_project",message:"Project changed; frame discarded"};
+                return client.panel("frame.capture",target);
+            }).then(function(result){
+                if(g!==generation)return;
+                if(result.compId!==target.compId || result.time!==target.time || !result.attachment || result.attachment.mime!=="image/png")throw {code:"invalid_response",message:"Capture did not confirm this frame"};
+                var file=result.attachment,data=file.url.split(",")[1],size=data.length*3/4-(data.slice(-2)==="==" ? 2 : data.slice(-1)==="=" ? 1 : 0);
+                if(attachments.length>=4 || size+attachments.reduce(function(n,a){return n+a.size;},0)>10*1024*1024)throw {code:"payload_too_large",message:"Captured frame exceeds the remaining attachment limit. Nothing was attached."};
+                attachments.push({filename:"ae-comp-"+target.compId+"-at-"+target.time+"s.png",mime:file.mime,url:file.url,size:size,
+                    caption:name+" (#"+target.compId+") · "+target.time.toFixed(3)+"s · PNG with alpha"});
+                el("chat-error").textContent="";drawAttachments();
+            }).catch(function(e){
+                if(g!==generation)return;
+                if(!e.code || ["timeout","disconnected","invalid_response","ECONNRESET","ETIMEDOUT","capture_timeout","outcome_uncertain","uncertain_outcome"].indexOf(e.code)>=0){
+                    client.state.uncertain=true;if(client.mark)client.mark(true);
+                    error({message:"Capture was not confirmed. Wait for AE, then use recovery settings. No automatic retry. "+(e.message || "")});
+                }else error(e);
+            }).then(function(){capturing=false;controls();refresh();});
+        });
+        el("chat-files").addEventListener("change",function(){endBrowse();addFiles(this.files);this.value="";});
         el("chat-form").addEventListener("dragover",function(e){e.preventDefault();});
         el("chat-form").addEventListener("drop",function(e){e.preventDefault();if(e.dataTransfer)addFiles(e.dataTransfer.files);});
         el("chat-input").addEventListener("paste",function(e){
@@ -117,25 +577,93 @@
             if(files && files.length){e.preventDefault();addFiles(files);}
         });
         function draw(data) {
+            if(retrySource && retrySource.sessionID!==data.sessionID){clearRetry();el("chat-input").value="";attachments=[];drawAttachments();}
+            if(snapshot && (snapshot.sessionID!==data.sessionID || snapshot.directory!==data.directory))clearSkills();
             snapshot=data;
+            el("chat-title").textContent=data.title || "";
+            el("chat-title").title=data.title || "New conversation";
+            if(collapseSession!==data.sessionID && data.targetCompId!==undefined)applyTarget(data.targetCompId);
+            if(collapseSession!==data.sessionID){if(collapseSession){references=[];drawReferences();closeTargets();}collapseSession=data.sessionID;loadCollapse();messagesKey="";historyMessages=[];historyLoaded=false;historyCursor=null;}
+            if(!historyLoaded)historyCursor=data.nextCursor || null;
+            var combined=historyMessages.concat(data.messages || []),seen={},merged=[];
+            for(var mi=combined.length-1;mi>=0;mi--){var msg=combined[mi];if(msg.id && seen["id:"+msg.id])continue;if(msg.id)seen["id:"+msg.id]=true;merged.unshift(msg);}
+            if(historyLoaded){historyMessages=merged.filter(function(m){return !!m.id;});data=Object.assign({},data,{messages:merged});}
+            el("chat-history").hidden=!historyCursor;
+            if(!restoreWorking && data.restore)restoreNotice(data.restore.status==="completed" ?
+                (data.restore.recoveryCopy ? "Recovery copy opened. " : "Project restored. ")+"Earlier messages are history. Your previous work is preserved in checkpoint "+data.restore.currentCheckpointId+". "+(data.restore.warning || "") :
+                data.restore.status==="reconciled" ? "Recovery was reviewed. A restore was not confirmed; earlier messages remain history. You can continue from the inspected project state." :
+                data.restore.status==="pending" ? "Restore is in progress or was interrupted. Wait for After Effects; it will not retry automatically." :
+                "The last restore was not confirmed. Inspect AE and retain its backups before starting a new chat. No edits will replay automatically."+(data.restore.emergencyPath ? " Backup: "+data.restore.emergencyPath : ""));
             if(!sending && (data.delivery==="unknown" || data.delivery==="sending"))deliveryUnknown=true;
             el("chat-progress").textContent=data.status==="idle" ? "Ready" : "CookieMonster is working…";
             if(data.error || el("chat-error").textContent===serverError)el("chat-error").textContent=data.error || "";
             serverError=data.error || "";
-            var key=JSON.stringify(data.messages || []);
+            var key=JSON.stringify([data.messages || [],data.status]);
             if(key!==messagesKey) {
                 messagesKey=key;var box=el("chat-messages"),nearBottom=box.scrollHeight-box.scrollTop-box.clientHeight<80;
-                box.textContent="";
+                box.textContent="";checkpointButtons=[];retryButtons=[];
+                var users=(data.messages || []).filter(function(m){return m.role==="user";}),oldUsers=users.slice(0,-2).map(function(m){return m.id;}),turnBox=null;
+                var requestCheckpoints={};
                 (data.messages || []).forEach(function(message){
+                    if(message.role!=="assistant" || !message.parentID)return;
+                    (message.parts || []).forEach(function(part){
+                        var key="request:"+message.parentID;
+                        if(part.type==="checkpoint" && !requestCheckpoints[key])requestCheckpoints[key]=part.id;
+                    });
+                });
+                (data.messages || []).forEach(function(message,messageIndex){
+                    if(message.role==="user"){
+                        turnBox=null;
+                        if(message.id && oldUsers.indexOf(message.id)>=0){
+                            var title=(message.parts || []).filter(function(p){return p.type==="text";}).map(function(p){return p.text;}).join(" ").slice(0,100);
+                            turnBox=disclosure("turn:"+message.id,title || "Earlier exchange",false);turnBox.className+=" chat-turn";box.appendChild(turnBox);
+                        }
+                    }
                     var row=node("article",undefined,"chat-message "+(message.role==="user" ? "from-user" : "from-assistant"));
                     row.appendChild(node("h3",message.role==="user" ? "You" : "CookieMonster"));
-                    (message.parts || []).forEach(function(part){
-                        if(part.type==="image" && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(part.url)) {
-                            var img=node("img");img.src=part.url;img.alt=part.filename || "Composition frame";row.appendChild(img);
-                        } else if(part.type==="text" || part.type==="tool")row.appendChild(node("div",part.text,part.type==="tool" ? "chat-tool" : "chat-text"));
+                    var content=row;
+                    if(message.role==="user"){content=node("div",undefined,"chat-user-bubble");row.appendChild(content);}
+                    var messageKey="message:"+(message.id || messageIndex),activity=null;
+                    (message.parts || []).forEach(function(part,partIndex){
+                        var partKey=messageKey+":"+(part.id || partIndex);
+                        if(part.type==="image" && /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(part.url)) {
+                            var imageBox=disclosure(partKey,part.compId ? "Composition #"+part.compId+" · "+part.time.toFixed(3)+"s" : "Image · "+(part.filename || "Composition frame"),!!message.completed && messageIndex>=(data.messages || []).length-2);
+                            var img=node("img");img.src=part.url;img.alt=part.filename || "Composition frame";imageBox.appendChild(img);content.appendChild(imageBox);
+                        } else if(part.type==="skill") {
+                            content.appendChild(node("p","Loaded skill: "+part.name,"chat-skill-loaded"));
+                        } else if(part.type==="checkpoint") {
+                            var card=node("section",undefined,"chat-checkpoint");card.appendChild(node("strong",part.label));
+                            var status=node("p"),button=node("button","Restore…");button.type="button";
+                            button.addEventListener("click",function(){if(!button.disabled)reviewRestore(part.id);});
+                            checkpointButtons.push({id:part.id,status:status,button:button});card.appendChild(status);card.appendChild(button);row.appendChild(card);
+                        } else if(part.type==="tool" || part.type==="reasoning"){
+                            if(!activity){activity=disclosure(messageKey+":activity",!message.completed && data.status!=="idle" ? "Working… · Show steps" : "Show steps",!message.completed && data.status!=="idle");content.appendChild(activity);}
+                            if(part.type==="reasoning")activity.appendChild(node("h4","Reasoning"));
+                            activity.appendChild(part.type==="tool" ? node("div",part.text,"chat-tool") : formatted(part));
+                        } else if(part.type==="text"){
+                            var text=formatted(part);
+                            if(part.text.length>1200 || part.text.split("\n").length>12){
+                                var longText=disclosure(partKey,part.text.slice(0,180).replace(/\s+/g," ")+"…",false);longText.appendChild(text);content.appendChild(longText);
+                            }else content.appendChild(text);
+                        }
                     });
+                    if(message.role==="user"){
+                        var checkpointId=requestCheckpoints["request:"+message.id] || "";
+                        var footer=node("div",undefined,"chat-message-actions"),restore=node("button","↶","chat-message-restore"),hint=node("span",undefined,"sr-only");
+                        restore.type="button";restore.setAttribute("aria-label","Restore project to before this request");
+                        restore.addEventListener("click",function(){if(!restore.disabled && checkpointId)reviewRestore(checkpointId);});
+                        checkpointButtons.push({id:checkpointId,status:hint,button:restore});
+                        var retry=node("button","Edit and retry","chat-message-retry");retry.type="button";
+                        retry.title="Review this request in the composer before sending a new attempt";
+                        retry.addEventListener("click",function(){if(!retry.disabled)retryDraft(message);});retryButtons.push(retry);
+                        footer.appendChild(retry);footer.appendChild(hint);footer.appendChild(restore);row.appendChild(footer);
+                    }
+                    if(message.role==="assistant" && message.completed && !message.error && (message.parts || []).some(function(p){return p.type==="text" && p.text.trim();})){
+                        var saveTechnique=node("button","Save technique...");saveTechnique.type="button";
+                        saveTechnique.addEventListener("click",function(){draftTechnique(message);});row.appendChild(saveTechnique);
+                    }
                     if(message.error)row.appendChild(node("p",message.error,"chat-failure"));
-                    box.appendChild(row);
+                    (turnBox || box).appendChild(row);
                 });
                 if(!data.messages || !data.messages.length)box.appendChild(node("p","Ask about this composition, or choose another comp above. Your conversation stays with the project.","chat-empty"));
                 if(nearBottom)box.scrollTop=box.scrollHeight;
@@ -173,43 +701,55 @@
             controls();
         }
         function refresh() {
-            if(polling || modelSaving || state.connection!=="connected" || !state.project)return Promise.resolve();
+            if(polling || browsingFiles || capturing || conversationSwitching || modelSaving || restoreWorking || state.connection!=="connected" || !state.project)return Promise.resolve();
             polling=true;var g=generation, revision=modelRevision;
-            return request("state",{directory:workspaceChoice || undefined}).then(function(data){if(g===generation && revision===modelRevision){if(el("chat-error").textContent===refreshError)el("chat-error").textContent="";refreshError="";draw(data);if(Date.now()-catalogAt>15000)return refreshModels();}},function(e){if(g===generation){error(e);refreshError=el("chat-error").textContent;}}).then(function(){polling=false;});
+            return request("state",{directory:workspaceChoice || undefined}).then(function(data){if(g===generation && revision===modelRevision){if(el("chat-error").textContent===refreshError)el("chat-error").textContent="";refreshError="";draw(data);return Promise.all([Date.now()-catalogAt>15000 ? refreshModels() : null,Date.now()-checkpointAt>10000 ? refreshCheckpoints() : null]);}}).catch(function(e){if(g===generation){messagesKey="";error(e);refreshError=el("chat-error").textContent;}}).then(function(){polling=false;});
         }
         el("chat-form").addEventListener("submit",function(e){
             e.preventDefault();if(el("chat-send").disabled)return;
             var text=el("chat-input").value.trim(),g=generation;
-            sending=true;drawAttachments();el("chat-error").textContent="";controls();
-            request("send",{text:text,attachments:attachments.map(function(a){return {filename:a.filename,mime:a.mime,url:a.url};}),requestId:api.requestId(),compId:selected(),directory:el("chat-workspace").value || undefined,takeover:takeover}).then(function(data){
+            sending=true;drawReferences();drawAttachments();el("chat-error").textContent="";controls();
+            request("send",{text:text,retryMessageID:retrySource ? retrySource.messageID : undefined,references:references.map(function(r){return Object.assign({},r);}),skill:skillChoice && skillContext ? {name:skillChoice.name,source:skillChoice.source,revision:skillChoice.revision,directory:skillContext.directory,sessionID:skillContext.sessionID} : undefined,attachments:attachments.map(function(a){return {filename:a.filename,mime:a.mime,url:a.url};}),requestId:api.requestId(),compId:selected(),directory:el("chat-workspace").value || undefined,takeover:takeover}).then(function(data){
                 if(g!==generation)return;
                 if(data.delivery!=="accepted"){deliveryUnknown=true;throw {code:"delivery_unknown",message:"Delivery is uncertain. Check the conversation before resending."};}
-                el("chat-input").value="";attachments=[];drawAttachments();takeover=false;
+                clearRetry();el("chat-input").value="";references=[];drawReferences();attachments=[];drawAttachments();takeover=false;
                 return refresh();
-            }).catch(function(e){if(g===generation){if(!e.code || ["timeout","disconnected","invalid_response","ECONNRESET","ETIMEDOUT"].indexOf(e.code)>=0){deliveryUnknown=true;error({message:"Delivery is uncertain. Check this conversation in CookieMonster before starting a new chat."});}else error(e);}}).then(function(){sending=false;drawAttachments();controls();});
+            }).catch(function(e){if(g===generation){if(!e.code || ["timeout","disconnected","invalid_response","ECONNRESET","ETIMEDOUT"].indexOf(e.code)>=0){deliveryUnknown=true;error({message:"Delivery is uncertain. Check this conversation in CookieMonster before starting a new chat."});}else error(e);}}).then(function(){sending=false;drawReferences();drawAttachments();controls();});
         });
         el("chat-input").addEventListener("input",controls);
-        el("chat-input").addEventListener("keydown",function(e){if(e.key==="Enter" && !e.shiftKey){e.preventDefault();if(!el("chat-send").disabled)el("chat-send").click();}});
+        var composing=false;
+        el("chat-input").addEventListener("compositionstart",function(){composing=true;});
+        el("chat-input").addEventListener("compositionend",function(){composing=false;});
+        el("chat-input").addEventListener("keydown",function(e){if(!composing && (window.CookieJarPreferences ? window.CookieJarPreferences.shouldSend(e) : e.key==="Enter" && !e.shiftKey && !e.isComposing && e.keyCode!==229)){e.preventDefault();if(!el("chat-send").disabled)el("chat-send").click();}});
+        window.addEventListener("cookiejar-preferences",function(){messagesKey="";refresh();});
         el("chat-comp").addEventListener("change",function(){
             var saved=pins(),key=pinKey();
             if(key.length<=256){delete saved[key];saved[key]=el("chat-comp").value;Object.keys(saved).slice(0,-20).forEach(function(k){delete saved[k];});store.save();}
             controls();
         });
-        el("chat-mention").addEventListener("click",function(){if(selected()){el("chat-input").value+="@"+label()+" ";el("chat-input").focus();controls();}});
+        el("chat-mention").addEventListener("click",function(){if(switchBlocked())return;var select=el("target-scope");select.textContent="";var all=node("option","Compositions");all.value="comps";select.appendChild(all);(state.compositions || []).forEach(function(c){var o=node("option","Layers in "+c.name+" (#"+c.id+")");o.value=String(c.id);select.appendChild(o);});el("chat-target-picker").hidden=false;el("target-search").focus();findTargets(null);});
         el("chat-takeover").addEventListener("click",function(){takeover=!takeover;controls();});
         el("chat-stop").addEventListener("click",function(){request("stop").then(refresh,error);});
         el("chat-new").addEventListener("click",function(){
-            request("new",{directory:el("chat-workspace").value || undefined}).then(function(){messagesKey="";approvalsKey="";deliveryUnknown=false;attachments=[];drawAttachments();el("chat-input").value="";return refresh();},error);
+            changeConversation("new");
         });
         function update(s) {
             state=s;var key=projectIdentity(s);
+            if(restoreReview && restoreReview!==client.restoreApproval)cancelRestore();
             if(s.connection!=="connected")el("chat-progress").textContent="Connecting to CookieMonster…";
             if(key!==projectKey) {
-                projectKey=key;generation++;attachments=[];deliveryUnknown=false;drawAttachments();snapshot=null;takeover=false;messagesKey="";approvalsKey="";compKey="";serverError="";
-                workspaceChoice=null;el("chat-workspace").textContent="";el("chat-workspace").value="";el("chat-workspace").workspaceKey="";
+                manager=null;managerReview=null;el("skill-manager").hidden=true;
+                clearRetry();retryButtons=[];
+                references=[];drawReferences();closeTargets();
+                conversationEpoch++;conversationLoading=false;conversationSwitching=false;conversationRows=[];el("chat-conversations").hidden=true;el("chat-conversations-list").textContent="";el("chat-title").textContent="";
+                clearSkills();el("chat-workspace").value="";el("chat-workspace").workspaceKey="";projectKey=key;generation++;attachments=[];deliveryUnknown=false;drawAttachments();snapshot=null;takeover=false;messagesKey="";approvalsKey="";compKey="";serverError="";collapseState={};collapseSession="";
+                workspaceChoice=null;el("chat-workspace").textContent="";
                 catalog=[];catalogKey="";catalogAt=0;modelError="";drawModels();
+                checkpointList=[];checkpointButtons=[];checkpointAt=0;cancelRestore();if(!restoreWorking)restoreNotice("");
+                drawCheckpoints();el("chat-checkpoints").hidden=true;el("chat-checkpoints-toggle").setAttribute("aria-expanded","false");
                 el("chat-messages").textContent="";el("chat-approvals").textContent="";el("chat-error").textContent="";el("chat-input").value="";
                 el("chat-project-name").textContent=s.project && s.project.path ? s.project.path.split(/[\\/]/).pop() : "Unsaved project";
+                el("chat-project-name").title=s.project && s.project.path || "Unsaved project";
             }
             var list=JSON.stringify(s.compositions || []);
             if(list!==compKey) {
@@ -225,6 +765,11 @@
         }
         timer=setInterval(refresh,1000);
         window.addEventListener("beforeunload",function(){clearInterval(timer);});
-        update(state);refresh();return {update:update};
+        update(state);refresh();return {update:update,bindForPanel:function(){
+            if(switchBlocked())return Promise.reject({code:"chat_busy",message:"Finish the current reply or recovery first"});
+            return request("captureBind",{directory:el("chat-workspace").value || undefined}).then(function(data){
+                if(!snapshot)snapshot={status:"idle"};snapshot.sessionID=data.sessionID;return client.heartbeat();
+            });
+        }};
     };
 }());

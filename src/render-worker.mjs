@@ -442,6 +442,8 @@ function run(args) {
     async launch(jobDir) {
       const child = spawn(process.execPath, [workerPath, jobDir], {
         detached: true, windowsHide: true, stdio: "ignore", shell: false,
+        // The installed desktop's executable is Electron, not standalone Node.
+        env: { ...process.env, NODE_OPTIONS: "", ELECTRON_RUN_AS_NODE: "1" },
       })
       await new Promise((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject) })
       child.unref()

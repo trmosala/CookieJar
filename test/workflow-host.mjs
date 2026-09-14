@@ -1,5 +1,6 @@
 import vm from "node:vm"
-import { readFileSync, writeFileSync, existsSync } from "node:fs"
+import { readFileSync, writeFileSync, existsSync, copyFileSync, constants } from "node:fs"
+import { RESTORE_PROOF } from "../src/bridge.mjs"
 
 // Proposed parent bridge contract, not production bridge/transport qualification.
 export function manualRestoreBridge(dataDir, host) {
@@ -8,7 +9,7 @@ export function manualRestoreBridge(dataDir, host) {
   const events = []
   const fail = code => { throw Object.assign(new Error(code), { code }) }
   return {
-    canonicalRestore: true, dataDir, state, events, onRelease() {},
+    canonicalRestore: true, compactRestore: RESTORE_PROOF, dataDir, state, events, onRelease() {},
     binding(sessionID, { allowLocked = false } = {}) {
       if (sessionID !== "session") fail("not_bound")
       if (state.lock && !allowLocked) fail("target_locked")
@@ -44,7 +45,7 @@ export function manualRestoreBridge(dataDir, host) {
       if (params.phase === "restore_prepare" || params.phase === "restore_finish") {
         state.project = structuredClone(reply.result.project)
         state.lock.project = structuredClone(state.project)
-        if (state.lock.recoveryOriginal.path === state.project.path) delete state.lock.recoveryOriginal
+        if (params.phase === "restore_finish" && state.lock.recoveryOriginal.path === state.project.path) delete state.lock.recoveryOriginal
       }
       return reply.result
     },
@@ -103,6 +104,7 @@ export function hostDouble(projectPath) {
   class File {
     constructor(name) { this.fsName = name; this.alias = false }
     get exists() { return existsSync(this.fsName) }
+    copy(destination) { copyFileSync(this.fsName, destination, constants.COPYFILE_EXCL); return true }
   }
   const props = [new Property("ADBE Opacity", 100, VT.OneD), new Property("ADBE Position", [0, 0], VT.TwoD)]
   const transform = new Group("ADBE Transform Group", props.slice())
@@ -114,7 +116,7 @@ export function hostDouble(projectPath) {
   const comp = Object.assign(new CompItem(), { id: 1, name: "Comp", width: 640, height: 480, pixelAspect: 1,
     duration: 5, frameRate: 25, time: 0, bgColor: [0, 0, 0], parentFolder: null, selected: false,
     numLayers: 1, layer: () => layer })
-  const project = { file: new File(projectPath), numItems: 1, item: () => comp, activeItem: comp,
+  let project = { file: new File(projectPath), numItems: 1, item: () => comp, activeItem: comp,
     revision: 1, dirty: false, renderQueue: { rendering: false },
     save(file) {
       writeFileSync(file.fsName, JSON.stringify({ revision: this.revision,
@@ -125,12 +127,15 @@ export function hostDouble(projectPath) {
     },
     close(option) {
       if (option !== 1) throw new Error("Expected documented CloseOptions.DO_NOT_SAVE_CHANGES")
-      closes++; app.project = null; return true
+      closes++; invalid.add(this); app.project = null; return true
     } }
   let begins = 0, ends = 0, closes = 0
-  const app = { project, version: "26.0", effects: [], preferences: { getPrefAsLong: () => 1 },
+  const invalid = new WeakSet()
+  const app = { project, onError: null, version: "26.0", effects: [], preferences: { getPrefAsLong: () => 1 },
     beginUndoGroup() { begins++ }, endUndoGroup() { ends++ },
     open(file) {
+      invalid.add(project)
+      project = { ...project }
       const data = JSON.parse(readFileSync(file.fsName, "utf8"))
       Object.assign(comp, data.comp)
       data.props.forEach((p, i) => Object.assign(props[i], { value: p.value, keys: p.keys,
@@ -143,11 +148,30 @@ export function hostDouble(projectPath) {
     CloseOptions: { DO_NOT_SAVE_CHANGES: 1 },
     PropertyType: PT, PropertyValueType: VT, KeyframeInterpolationType: { LINEAR: 1, BEZIER: 2, HOLD: 3 },
     KeyframeEase: function(speed, influence) { this.speed = speed; this.influence = influence } })
-  context.isValid = value => value != null
+  context.isValid = value => value != null && !invalid.has(value)
   vm.runInContext(readFileSync(new URL("../panel/host.jsx", import.meta.url), "utf8"), context)
   const call = (method, params = {}) => JSON.parse(context.CookieMonsterAE.dispatch(JSON.stringify({ method, params })))
   project.save(project.file)
-  return { call, context, project, props, transform, app, get closes() { return closes }, get begins() { return begins }, get ends() { return ends },
+  return { call, context, get project() { return project }, props, transform, app, get closes() { return closes }, get begins() { return begins }, get ends() { return ends },
+    largeScene() {
+      const layers = Array.from({ length: 96 }, (_, index) => {
+        const children = Array.from({ length: 300 }, (_, n) => {
+          const p = new Property("Animated Control " + n, n, VT.OneD)
+          p._expression = "// " + "retained expression body ".repeat(8) + "\nvalue"
+          p.expressionEnabled = true
+          p.keys = [{ time: 0, value: n }, { time: 2, value: n + 10 }]
+          props.push(p)
+          return p
+        })
+        const group = new Group("ADBE Transform Group", children)
+        return { ...layer, id: 10 + index, name: "Layer " + index,
+          property: key => key === 1 || key === effects.matchName ? effects : key === group.matchName ? group : null }
+      })
+      comp.numLayers = layers.length
+      comp.layer = index => layers[index - 1]
+      changed()
+      return comp
+    },
     actions() {
       const locators = call("inspect").result.items[0].layers[0].properties.find(p => p.matchName === transform.matchName).properties.map(p => p.locator)
       return [

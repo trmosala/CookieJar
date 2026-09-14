@@ -2,6 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import path from "node:path"
 import os from "node:os"
+import vm from "node:vm"
 import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises"
 import { runWorker, readJob, save, load, exists } from "../src/render-worker.mjs"
 import { execFile } from "node:child_process"
@@ -203,7 +204,6 @@ test("compatibility chat overview works before connection and removes pending re
 test("permission policy fails closed on global, wildcard, pattern and agent auto-allow", () => {
   for (const config of [
     { permission: "allow" }, { permission: { "*": "allow", ae_execute: "ask" } },
-    { permission: { "ae_?xecute": "allow" } }, { permission: { ae_execute: { "*": "ask", "specific*": "allow" } } },
     { permission: "ask", agent: { build: { permission: { "ae_*": "allow" } } } },
     { permission: "ask", mode: { legacy: { permission: "allow" } } },
   ]) assert.throws(() => checkPermissionConfig(config, null, { configure: true }), { code: "unsafe_permission_config" })
@@ -211,8 +211,26 @@ test("permission policy fails closed on global, wildcard, pattern and agent auto
   assert.throws(() => checkPermissionConfig(undefined, "ae_execute"), { code: "permission_policy_required" })
   assert.throws(() => checkPermissionConfig({}, "ae_execute"), { code: "permission_denied" })
   checkPermissionConfig({ permission: AE_PERMISSIONS }, "ae_execute")
+  assert.equal(checkPermissionConfig({ permission: AE_PERMISSIONS }, "ae_execute"), "allow")
+  assert.equal(checkPermissionConfig({ permission: { "ae_?xecute": "allow" } }, "ae_execute"), "allow")
+  assert.equal(checkPermissionConfig({ permission: { ae_execute: { "*": "ask", "specific*": "allow" } } }, "ae_execute"), "ask")
   checkPermissionConfig({ permission: { ...AE_PERMISSIONS, ae_propose: "allow",
     ae_raw_enable: "allow", ae_raw_propose: "allow", ae_raw_execute: "allow" } }, null, { configure: true })
+})
+
+test("checkpoint-backed scripts run without asking and verification failure prevents dispatch", async t => {
+  const { p, r, tools } = await fixture(t, { permissionConfig: { permission: AE_PERMISSIONS } })
+  const args = await scriptArgs(tools)
+  const result = JSON.parse(await tools.ae_execute.execute(args, context(() => assert.fail("checkpoint-backed script must not ask"))))
+  const checkpoint = await r.checkpoints.verify(result.checkpointId)
+  assert.equal(checkpoint.verified, true)
+  assert.equal(checkpoint.pinned, true)
+  assert.equal(JSON.parse(await readFile(checkpoint.path, "utf8")).revision, 1)
+  assert.equal(p.log.filter(c => c.method === "raw").length, 1)
+  const next = await scriptArgs(tools)
+  t.mock.method(r.checkpoints, "verify", async () => { throw Object.assign(new Error("Checkpoint verification failed"), { code: "checkpoint_corrupt" }) })
+  await assert.rejects(tools.ae_execute.execute(next, { sessionID: "session" }))
+  assert.equal(p.log.filter(c => c.method === "raw").length, 1)
 })
 
 test("script adapter enforces exact-source approval, denial, abort, binding and checkpoint checks", async t => {
@@ -319,14 +337,26 @@ test("runtime registers authenticated panel services; scope, token expiry/replay
   assert.equal(exported.storage.checkpointCount, 1)
   assert.equal(exported.storage.pinnedCount, 1)
   assert.equal(JSON.parse(await tools.ae_diagnostics.execute({}, c)).storage.checkpointCount, 1)
+  h.largeScene()
+  r.workflow.inspect = () => assert.fail("Restore must not request a full scene")
+  const command = client.command.bind(client)
+  client.command = cmd => {
+    if (cmd.method === "inspect") assert.deepEqual(cmd.params, { restore: "compact-restore-v2" })
+    return command(cmd)
+  }
+  const restoreAudit = []
+  r.chat = {
+    async assertRestorable(id) { assert.equal(id, sessionID) },
+    async recordRestore(id, update) { assert.equal(id, sessionID); restoreAudit.push(update) },
+  }
   let proposed = await send({ action: "checkpoint.restore.propose", id: checkpoint.id })
-  assert.match(proposed.result.operation, /save current unsaved edits.*private emergency project.*verify a protected checkpoint/i)
+  assert.match(proposed.result.operation, /save current edits in place.*verify a private emergency copy and protected checkpoint/i)
   assert.match(proposed.result.operation, /recovery copy/i)
   assert.equal(commands.some(command => ["save", "open", "execute"].includes(command.method)), false)
   clock += 300001
   await assert.rejects(send({ action: "checkpoint.restore.confirm", token: proposed.result.token }), { code: "invalid_token" })
   proposed = await send({ action: "checkpoint.restore.propose", id: checkpoint.id })
-  h.project.item(1).selected = true
+  h.props[0].setValue(42)
   await assert.rejects(send({ action: "checkpoint.restore.confirm", token: proposed.result.token }), { code: "stale_fingerprint" })
   await assert.rejects(send({ action: "checkpoint.restore.confirm", token: proposed.result.token }), { code: "invalid_token" })
   proposed = await send({ action: "checkpoint.restore.propose", id: checkpoint.id })
@@ -343,7 +373,8 @@ test("runtime registers authenticated panel services; scope, token expiry/replay
   assert.equal(h.project.file.fsName, canonicalPath)
   assert.equal(h.props[0].value, 100)
   assert.deepEqual(await readFile(canonicalPath), source)
-  assert.deepEqual(await readFile(restored.originalPath), original)
+  assert.equal(JSON.parse(await readFile(restored.originalPath)).props[0].value, 42)
+  assert.deepEqual(await readFile((await r.checkpoints.verify(restored.previousCheckpointId)).path), original)
   const backup = await r.checkpoints.verify(restored.currentCheckpointId)
   assert.equal(backup.verified, true)
   assert.equal(backup.pinned, true)
@@ -351,10 +382,79 @@ test("runtime registers authenticated panel services; scope, token expiry/replay
   assert.equal(JSON.parse(await readFile(restored.emergencyPath)).props[0].value, 42)
   assert.equal(r.tokens.size, 0)
   assert.equal(h.closes, 1)
+  assert.deepEqual(restoreAudit.map(update => update.status), ["pending", "completed"])
+  assert.equal(restoreAudit[1].currentCheckpointId, restored.currentCheckpointId)
   assert.deepEqual(commands.filter(command => command.params.phase?.startsWith("restore_")).map(command => command.params.phase),
     ["restore_prepare", "restore_finish"])
   assert.equal(p.bridge.binding(sessionID).lock, null)
   await assert.rejects(client.confirmRestore(), { code: "invalid_token" })
+})
+
+test("compact panel restore rejects malformed receipts and stale guards without fallback or retry", async t => {
+  for (const scenario of ["legacy review", "malformed confirmation", "stale approval", "malformed finish", "stale final read"]) {
+    await t.test(scenario, async t => {
+      const cleanup = []
+      let f, r, armed = false, finished = false, reads = 0
+      t.after(async () => {
+        await f?.stop()
+        try { await r?.close() } finally { for (const close of cleanup.reverse()) await close() }
+      })
+      f = await restoreFixture({ after: close => cleanup.push(close) }, {
+        evalScript(code, cb, h) {
+          const response = JSON.parse(vm.runInContext(code, h.context))
+          if (armed && response.result?.protocol === "compact-restore-v2") {
+            reads++
+            if (scenario === "legacy review") delete response.result.protocol
+            if (scenario === "malformed confirmation") response.result.dirty = "unknown"
+            if (scenario === "stale approval" && reads === 3) response.result.projectEpoch += "-changed"
+            if (scenario === "stale final read" && finished) response.result.revision++
+          }
+          if (response.result?.status === "recovered") {
+            finished = true
+            if (scenario === "malformed finish") response.result.receipt.callbacksClear = false
+          }
+          cb(JSON.stringify(response))
+        },
+      })
+      const { p, h, client, sessionID, commands } = f
+      r = await createRuntime({ factories: { bridge: async () => p.bridge,
+        renderer: async () => ({ list: async () => [], close: async () => {} }) } })
+      r.workflow.inspect = () => assert.fail("Restore must not inspect the full scene")
+      const checkpoint = await r.checkpoints.create({ projectPath: h.project.file.fsName,
+        projectId: p.bridge.binding(sessionID).project.id, planHash: hash(scenario) })
+      h.props[0].setValue(42)
+      const audit = []
+      r.chat = { async assertRestorable() {}, async recordRestore(id, update) { audit.push(update) } }
+      const send = body => transport.request(client.descriptor, f.store.state.credential, "/panel", body, 300000)
+      if (scenario === "legacy review") {
+        armed = true
+        await assert.rejects(send({ action: "checkpoint.restore.propose", id: checkpoint.id }), { code: "restore_unsupported" })
+        assert.equal(r.tokens.size, 0)
+      } else {
+        const proposed = await send({ action: "checkpoint.restore.propose", id: checkpoint.id })
+        armed = true
+        const confirmation = { action: "checkpoint.restore.confirm", token: proposed.result.token }
+        await assert.rejects(send(confirmation), { code: scenario.startsWith("stale") ? "stale_fingerprint" : "outcome_uncertain" })
+        assert.equal(r.tokens.size, 0)
+        await assert.rejects(send(confirmation), error => error.code === "invalid_token" ||
+          scenario === "malformed finish" && error.code === "binding_suspended")
+      }
+      const dispatched = scenario === "malformed finish" || scenario === "stale final read"
+      assert.deepEqual(commands.filter(c => c.method === "execute").map(c => c.params.phase),
+        dispatched ? ["restore_prepare", "restore_finish"] : [])
+      assert.equal(h.closes, dispatched ? 1 : 0)
+      assert.deepEqual(audit.map(update => update.status), dispatched ? ["pending", "unconfirmed"] : [])
+      if (dispatched) {
+        assert.equal(p.bridge.binding(sessionID, { allowLocked: true, allowSuspended: true }).lock.state, "uncertain")
+        assert.ok(audit[1].currentCheckpointId)
+        assert.ok(audit[1].emergencyPath)
+        assert.equal((await r.checkpoints.verify(audit[1].currentCheckpointId)).verified, true)
+      }
+      assert.ok(commands.some(c => c.method === "inspect"))
+      for (const cmd of commands.filter(c => c.method === "inspect"))
+        assert.deepEqual(cmd.params, { restore: "compact-restore-v2" })
+    })
+  }
 })
 
 test("render adapter derives live comp/templates, rejects untrusted submit fields, and scopes recovered access", async t => {

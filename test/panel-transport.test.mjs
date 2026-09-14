@@ -5,7 +5,8 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { once } from "node:events";
+import { once, EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBridge } from "../src/bridge.mjs";
@@ -21,6 +22,25 @@ const { Client, HostRPC, Store, request, normalizeCapture } = transport;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const descriptor = {port:12345,instanceId:"instance",protocol:1,version:"0.2.2",updateUrl:"https://github.com/trmosala/CookieJar/releases"};
 const project = {id:"path:c:/test.aep",path:"c:/test.aep",saved:true};
+test("Windows reveal verifies content and accepts Explorer handoff without trusting its exit code",async t=>{
+    const dir=await fsp.mkdtemp(path.join(os.tmpdir(),"reveal-test-"));t.after(()=>fsp.rm(dir,{recursive:true,force:true}));
+    const filename=path.join(dir,"output with spaces.mp4"),bytes=Buffer.from("verified output");await fsp.writeFile(filename,bytes);
+    const file={path:filename,size:bytes.length,hash:createHash("sha256").update(bytes).digest("hex")};
+    const nativeRequire=createRequire(import.meta.url),exports={exports:{}},calls=[];let launchError=false;
+    vm.runInNewContext(fs.readFileSync(new URL("../panel/transport.cjs",import.meta.url),"utf8"),{
+        module:exports,Buffer,process:{platform:"win32"},setTimeout,clearTimeout,
+        require(name){if(name!=="child_process")return nativeRequire(name);return {spawn(executable,args,options){
+            calls.push({executable,args,options});const child=new EventEmitter();child.unref=()=>{};
+            queueMicrotask(()=>{if(launchError)child.emit("error",Object.assign(new Error("Missing Explorer"),{code:"ENOENT"}));else{child.emit("spawn");child.emit("exit",1);}});return child;
+        }};}
+    });
+    await exports.exports.revealRenderOutput(file);
+    assert.equal(calls[0].executable,"explorer.exe");assert.equal(calls[0].args[0],"/select,"+filename);assert.equal(calls[0].options.shell,false);
+    await fsp.writeFile(filename,Buffer.alloc(bytes.length));
+    await assert.rejects(exports.exports.revealRenderOutput(file),{code:"output_changed"});assert.equal(calls.length,1);
+    await fsp.writeFile(filename,bytes);launchError=true;
+    await assert.rejects(exports.exports.revealRenderOutput(file),{code:"ENOENT"});
+});
 const status = {project,activeCompId:1,capabilities:{fileNetwork:true},aeVersion:"25.3",busy:false,uncertain:false};
 function fixture(overrides={}) {
     const events=[],store={state:{panelId:"panel",credential:"a".repeat(43),uncertain:false},save(){events.push(["save",this.state.uncertain]);},descriptor(){return {...descriptor};}};
@@ -56,8 +76,8 @@ test("a binding established between heartbeat and poll is refreshed before host 
 test("panel management sends exact authenticated schemas and requires an explicit single-use restore token",async()=>{
     const f=fixture();f.client.state.lock=null;
     const rows=[{id:"cp",createdAt:1000,pinned:false,storageMode:"project",size:123,projectPath:"not returned"}];
-    f.client.request=async(d,credential,endpoint,body)=>{
-        assert.equal(endpoint,"/panel");assert.equal(credential,f.store.state.credential);f.events.push([endpoint,structuredClone(body)]);
+    f.client.request=async(d,credential,endpoint,body,timeout)=>{
+        assert.equal(timeout,body.action.startsWith("checkpoint.restore.") ? 300000 : 15000);assert.equal(endpoint,"/panel");assert.equal(credential,f.store.state.credential);f.events.push([endpoint,structuredClone(body)]);
         if(body.action==="checkpoints")return {result:rows};
         if(body.action==="checkpoint.restore.propose")return {result:{token:"opaque-token",sourceTimestamp:1000,destinationTimestamp:2000,operation:"Save edits and restore checkpoint."}};
         if(body.action==="diagnostics")return {result:{version:"0.2.2",counts:{jobs:0}}};
@@ -121,7 +141,7 @@ test("restore completion accepts the same owner's validated fallback without wea
         return {result};
     };
     await f.client.panel("checkpoint.restore.propose",{id:"cp"});
-    assert.deepEqual(await f.client.confirmRestore(),result);
+    assert.deepEqual(await f.client.confirmRestore(),{...result,previousCheckpointId:null});
     assert.equal(f.client.restoreApproval,null);
 });
 test("restore completion refuses stale owners, reconnects, foreign sources and malformed recovery evidence",async()=>{
@@ -198,7 +218,7 @@ test("actual Client.panel restore returns canonical and fallback backups through
             await createRuntime({factories:{bridge:async()=>p.bridge,renderer:async()=>({list:async()=>[],close:async()=>{}})}});
             for(let i=0;!client.state.binding && i<200;i++)await sleep(10);
             const review=await client.panel("checkpoint.restore.propose",{id:checkpoint.id});
-            assert.match(review.operation,/private emergency project/);assert.equal("token" in review,false);
+            assert.match(review.operation,/private emergency copy/);assert.equal("token" in review,false);
             assert.equal(h.project.dirty,true);assert.equal(h.closes,0);
             const rename=fsp.rename.bind(fsp);
             const fault=t.mock.method(fsp,"rename",async(source,destination)=>{
@@ -217,7 +237,9 @@ test("actual Client.panel restore returns canonical and fallback backups through
             assert.deepEqual(f.commands.filter(c=>c.params.phase?.startsWith("restore_")).map(c=>c.params.phase),["restore_prepare","restore_finish"]);
             assert.equal(p.bridge.binding(sessionID,{allowLocked:true}).lock?.state || null,fallback ? "uncertain" : null);
             const list=await client.panel("checkpoints",{});
-            assert.equal(list.some(c=>c.id===result.currentCheckpointId),false,"backup disclosure must not broaden checkpoint scope");
+            assert.equal(list.some(c=>c.id===result.currentCheckpointId),!fallback,"current backup belongs to the canonical project only");
+            const previous=await checkpoints.verify(result.previousCheckpointId);
+            assert.equal(JSON.parse(await fsp.readFile(previous.path,"utf8")).props[0].value,100);
             await assert.rejects(client.confirmRestore(),{code:"invalid_token"});
             await f.stop();
         });
@@ -779,4 +801,10 @@ test("native PNG timeout keeps the panel uncertainty latch and prevents another 
     assert.equal(f.events.find(e=>e[0]==="/reply")[1].error.code,"capture_timeout");
     const calls=f.events.filter(e=>e[0]==="host").length;
     await f.client.tick();assert.equal(f.events.filter(e=>e[0]==="host").length,calls);
+});
+
+test("native restore gets its own bounded timeout without extending ordinary calls", async()=>{
+    const host=new HostRPC({evalScript(code,callback){setTimeout(()=>callback('{"result":{"ok":true}}'),30);}},10,undefined,100);
+    assert.deepEqual(await host.call("execute",{phase:"restore_prepare"}),{ok:true});
+    await assert.rejects(host.call("inspect",{}),{code:"outcome_uncertain"});
 });

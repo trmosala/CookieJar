@@ -3,12 +3,14 @@ import assert from "node:assert/strict"
 import path from "node:path"
 import { createHash } from "node:crypto"
 import { readFile, writeFile, copyFile } from "node:fs/promises"
+import { writeFileSync } from "node:fs"
 import { createWorkflow } from "../src/workflow.mjs"
 import { createRuntime } from "../src/plugin.mjs"
 import { createCheckpoints, createGrants } from "../src/storage.mjs"
 import { hash, PROPOSAL_TTL } from "../src/protocol.mjs"
 import { panelFixture, simulatedHost, restoreFixture } from "./bridge-panel.mjs"
 import { hostDouble, manualRestoreBridge } from "./workflow-host.mjs"
+import { RESTORE_PROOF, restoreFingerprint } from "../src/bridge.mjs"
 import fs from "node:fs/promises"
 import vm from "node:vm"
 import { setTimeout as delay } from "node:timers/promises"
@@ -72,7 +74,10 @@ async function fixture(t, options = {}) {
     p.state.project = status.project
     if (reply.error) throw Object.assign(new Error(reply.error.message), { code: reply.error.code })
     return reply.result
-  } : simulatedHost
+  } : async (command, p) => command.method === "inspect" && command.params.restore === RESTORE_PROOF
+    ? { protocol: RESTORE_PROOF, project: structuredClone(p.state.project), projectEpoch: "simulated-native",
+      revision: p.state.revision || 1, dirty: false, busy: false, callbacksClear: true, capabilities: { fileNetwork: true } }
+    : simulatedHost(command, p)
   const workflow = createWorkflow({ bridge: p.bridge, checkpoints, grants, now: () => clock })
   await p.start(async command => {
     events.push(command.method)
@@ -81,6 +86,32 @@ async function fixture(t, options = {}) {
   })
   return { p, workflow, checkpoints, grants, events, manifests, actual, advance(ms) { clock += ms } }
 }
+
+test("native Save As revision behavior restores unsaved work through the production bridge without Save As", async t => {
+  const f = await restoreFixture(t)
+  const { p, h, sessionID } = f
+  const checkpoints = createCheckpoints({ dataDir: p.dataDir })
+  const canonical = h.project.file.fsName
+  const checkpoint = await checkpoints.create({ projectPath: canonical,
+    projectId: h.call("inspect").result.project.id, planHash: "native-save-regression", pinned: true })
+  const original = await readFile(canonical)
+  h.props[0].setValue(42)
+  const save = h.project.save.bind(h.project), saves = []
+  h.project.save = file => {
+    const saveAs = file.fsName !== h.project.file.fsName
+    saves.push({ path: file.fsName, saveAs })
+    save(file)
+    if (saveAs) h.project.revision++
+  }
+  const workflow = createWorkflow({ bridge: p.bridge, checkpoints, grants: createGrants() })
+  const result = await workflow.restore(sessionID, checkpoint.id, async () => {})
+  assert.deepEqual(saves, [{ path: canonical, saveAs: false }])
+  assert.deepEqual(await readFile(canonical), original)
+  assert.equal(h.props[0].value, 100)
+  const backup = await checkpoints.verify(result.currentCheckpointId)
+  assert.equal(JSON.parse(await readFile(backup.path)).props[0].value, 42)
+  assert.equal(p.bridge.binding(sessionID).lock, null)
+})
 
 test("production manual restore traverses bridge transport host source and real storage for canonical and fallback", async t => {
   for (const fallback of [false, true]) {
@@ -119,7 +150,9 @@ test("production manual restore traverses bridge transport host source and real 
     assert.equal(h.project.file.fsName, result.path)
     assert.equal(h.props[0].value, 100)
     assert.equal(h.closes, 1)
-    assert.deepEqual(await readFile(canonical), fallback ? original : source)
+    if (fallback) assert.equal(JSON.parse(await readFile(canonical)).props[0].value, 42)
+    else assert.deepEqual(await readFile(canonical), source)
+    assert.deepEqual(await readFile((await checkpoints.verify(result.previousCheckpointId)).path), original)
     const backup = await checkpoints.verify(result.currentCheckpointId)
     assert.equal(JSON.parse(await readFile(backup.path)).props[0].value, 42)
     assert.equal(backup.pinned, true)
@@ -146,7 +179,7 @@ test("production manual restore traverses bridge transport host source and real 
       await assert.rejects(p.bridge.lock("session", { kind: "other" }), { code: "target_locked" })
     } else {
       assert.equal(lock, null)
-      assert.deepEqual(await readFile(result.originalPath), original)
+      assert.equal(JSON.parse(await readFile(result.originalPath)).props[0].value, 42)
       assert.equal(backup.inUse, false)
     }
     await f.stop()
@@ -216,7 +249,9 @@ test("production manual restore late prepare and finish preserve locks backups a
     assert.equal(f.host.pending, false)
     assert.equal(f.host.uncertain, true)
     assert.equal(h.closes, phase === "restore_finish" ? 1 : 0)
-    assert.deepEqual(await readFile(canonical), before)
+    if (phase === "restore_prepare") assert.equal(JSON.parse(await readFile(canonical)).props[0].value, 42)
+    else assert.deepEqual(await readFile(canonical), before)
+    assert.deepEqual(await readFile((await checkpoints.verify(failure.details.previousCheckpointId)).path), before)
     if (failure.details.currentCheckpointId) {
       const backup = await checkpoints.verify(failure.details.currentCheckpointId)
       assert.equal(backup.inUse, true)
@@ -244,6 +279,141 @@ async function manualFixture(t, realStorage = false) {
   return { ...f, bridge, workflow, checkpoint, canonical, advance(ms) { clock += ms } }
 }
 
+test("compact restore saves over 4 MiB and 28000 properties without scene traversal through real bridge", async t => {
+  const f = await fixture(t, { actualHost: true, realStorage: true })
+  const h = f.actual, canonical = h.project.file.fsName
+  const comp = h.largeScene()
+  h.project.save(h.project.file)
+  const source = await readFile(canonical)
+  assert.ok(source.length > 4 * 1024 * 1024)
+  assert.ok(h.props.length > 25000)
+  assert.ok(h.call("inspect").error, "full scene exceeds the legacy inspection budget")
+  const checkpoint = await f.checkpoints.create({ projectPath: canonical,
+    projectId: f.p.state.project.id, planHash: "large-source", pinned: true })
+  h.props[0].setValue(42)
+  let traversals = 0
+  comp.layer = () => { traversals++; throw new Error("Restore must not traverse layers or properties") }
+  const start = f.p.log.length
+  const review = await f.workflow.inspectRestore("session")
+  const result = await f.workflow.restore("session", checkpoint.id, async (_, metadata) => {
+    assert.equal(metadata.fingerprint, review.fingerprint)
+    assert.equal((await f.workflow.inspectRestore("session")).fingerprint, review.fingerprint)
+    assert.ok(JSON.stringify(metadata).length < 8192)
+  })
+  assert.equal(traversals, 0)
+  assert.equal(h.closes, 1)
+  assert.deepEqual(await readFile(canonical), source)
+  const backup = await f.checkpoints.verify(result.currentCheckpointId)
+  assert.equal(JSON.parse(await readFile(backup.path)).props[0].value, 42)
+  assert.equal(h.props[0].value, 100)
+  assert.equal(f.p.bridge.binding("session").lock, null)
+  for (const command of f.p.log.slice(start)) {
+    assert.ok(JSON.stringify(command).length < 8192)
+    if (command.method === "inspect") assert.deepEqual(command.params, { restore: RESTORE_PROOF })
+    else assert.ok(["restore_prepare", "restore_finish"].includes(command.params.phase))
+  }
+  assert.equal(result.protocol, RESTORE_PROOF)
+  assert.notEqual(result.receipt.projectEpoch, review.projectEpoch)
+})
+
+test("compact approvals reject same-path same-counter reopen and dirty-only edits before save", async t => {
+  for (const mode of ["reopen", "dirty"]) {
+    const f = await manualFixture(t)
+    const before = await f.workflow.inspectRestore("session")
+    await assert.rejects(f.workflow.restore("session", f.checkpoint.id, async () => {
+      if (mode === "reopen") {
+        f.actual.app.open(f.actual.project.file)
+        f.actual.project.revision = before.revision
+        f.actual.project.dirty = before.dirty
+      } else f.actual.project.dirty = !before.dirty
+    }), { code: "stale_fingerprint" })
+    assert.equal(f.actual.closes, 0)
+    assert.equal(f.bridge.state.lock, null)
+    assert.equal(f.bridge.events.filter(e => e.method === "execute").length, 0)
+  }
+})
+
+test("compact reconciliation expiry during workflow and final unlock inspections retains durable lock without replay", async t => {
+  for (const expireOn of [2, 3]) await t.test(`compact inspection ${expireOn}`, async t => {
+    let inspections = 0, expire = true
+    const f = await fixture(t, { actualHost: true, handler: async (command, p, host) => {
+      const result = await host(command, p)
+      if (command.method === "inspect" && command.params.restore === RESTORE_PROOF &&
+          ++inspections === expireOn && expire) f.advance(PROPOSAL_TTL)
+      return result
+    } })
+    await f.p.bridge.lock("session", { kind: "restore", proof: RESTORE_PROOF })
+    await f.p.bridge.markUncertain("session", "Unconfirmed compact restore")
+    const before = f.p.bridge.binding("session", { allowLocked: true }).lock
+    const durable = await readFile(path.join(f.p.dataDir, "bridge-state.json"))
+    const original = await readFile(f.actual.project.file.fsName)
+    const unlock = t.mock.method(f.p.bridge, "unlock")
+    await assert.rejects(f.workflow.reconcile("session", async () => {}), { code: "proposal_expired" })
+    assert.equal(inspections, expireOn)
+    assert.equal(unlock.mock.callCount(), expireOn === 2 ? 0 : 1)
+    assert.deepEqual(f.p.bridge.binding("session", { allowLocked: true }).lock, before)
+    assert.deepEqual(await readFile(path.join(f.p.dataDir, "bridge-state.json")), durable)
+    expire = false
+    const result = await f.workflow.reconcile("session", async () => {})
+    assert.equal(result.proof, "explicit_review")
+    assert.equal(f.p.bridge.binding("session").lock, null)
+    assert.deepEqual(JSON.parse(await readFile(path.join(f.p.dataDir, "bridge-state.json"))).locks, [])
+    assert.ok(f.p.log.every(c => c.method === "inspect" && c.params.restore === RESTORE_PROOF))
+    assert.equal(f.actual.closes, 0)
+    assert.deepEqual(await readFile(f.actual.project.file.fsName), original)
+  })
+})
+
+test("large-scene compact restore uncertainty retains backups and requires explicit review without traversal", async t => {
+  const f = await fixture(t, { actualHost: true, realStorage: true })
+  const comp = f.actual.largeScene()
+  f.actual.project.save(f.actual.project.file)
+  assert.ok((await readFile(f.actual.project.file.fsName)).length > 4 * 1024 * 1024)
+  assert.ok(f.actual.props.length > 25000)
+  let traversals = 0
+  comp.layer = () => { traversals++; throw new Error("Reconciliation must not traverse layers or properties") }
+  const checkpoint = await f.checkpoints.create({ projectPath: f.actual.project.file.fsName,
+    projectId: f.p.state.project.id, planHash: "freshness-source", pinned: true })
+  f.actual.props[0].setValue(42)
+  const unlock = f.p.bridge.unlock.bind(f.p.bridge)
+  let inject = true
+  f.p.bridge.unlock = async (...args) => {
+    if (inject) { inject = false; f.actual.props[0].setValue(19) }
+    return unlock(...args)
+  }
+  let failure
+  await assert.rejects(f.workflow.restore("session", checkpoint.id, async () => {}), error => {
+    failure = error
+    return error.code === "stale_fingerprint"
+  })
+  assert.equal(f.actual.props[0].value, 19)
+  assert.equal(f.actual.closes, 1)
+  const backup = await f.checkpoints.verify(failure.details.currentCheckpointId)
+  assert.equal(backup.inUse, true)
+  assert.equal(JSON.parse(await readFile(backup.path)).props[0].value, 42)
+  assert.equal(f.p.bridge.binding("session", { allowLocked: true }).lock.state, "uncertain")
+  await assert.rejects(f.p.bridge.unlock("session"), { code: "permission_required" })
+  await assert.rejects(f.workflow.reconcile("session"), { code: "permission_required" })
+  await assert.rejects(f.workflow.reconcile("session", async () => false), { code: "permission_denied" })
+  await assert.rejects(f.workflow.reconcile("session", async () => f.actual.props[0].setValue(20)),
+    { code: "stale_fingerprint" })
+  const result = await f.workflow.reconcile("session", async (summary, metadata) => {
+    assert.match(summary, /NOT full scene proof/)
+    assert.equal(metadata.actualProjectReviewRequired, true)
+    assert.equal(metadata.protocol, RESTORE_PROOF)
+    assert.equal(metadata.snapshot.items, undefined)
+  })
+  assert.equal(result.proof, "explicit_review")
+  assert.equal(f.p.bridge.binding("session").lock, null)
+  assert.equal(f.p.log.filter(c => c.params.phase === "restore_finish").length, 1)
+  assert.equal((await f.checkpoints.verify(backup.id)).inUse, true)
+  assert.equal(traversals, 0)
+  for (const command of f.p.log) {
+    assert.ok(JSON.stringify(command).length < 8192)
+    if (command.method === "inspect") assert.deepEqual(command.params, { restore: RESTORE_PROOF })
+  }
+})
+
 test("manual canonical restore saves dirty state and verifies current backup before replacing original", async t => {
   const f = await manualFixture(t, true)
   const before = await readFile(f.canonical)
@@ -252,8 +422,10 @@ test("manual canonical restore saves dirty state and verifies current backup bef
     permissions++
     assert.match(summary, /Source:/)
     assert.match(summary, /Destination file:/)
+    assert.match(summary, /Preserve the existing disk file first/)
+    assert.match(summary, /Any revision change during saving stops restoration before publication or close/)
     assert.equal(metadata.sourceTimestamp, Date.parse(f.checkpoint.createdAt))
-    assert.equal(metadata.fingerprint, hash(f.actual.call("inspect").result))
+    assert.equal(metadata.fingerprint, restoreFingerprint(f.actual.call("inspect", { restore: RESTORE_PROOF }).result, f.bridge.state.connectionId))
     metadata.checkpoint.hash = "tampered callback metadata"
   })
   assert.equal(permissions, 1)
@@ -263,7 +435,8 @@ test("manual canonical restore saves dirty state and verifies current backup bef
   assert.equal(f.actual.project.file.fsName, f.canonical)
   assert.equal(f.actual.props[0].value, 100)
   assert.deepEqual(await readFile(f.canonical), before)
-  assert.deepEqual(await readFile(result.originalPath), before)
+  assert.equal(JSON.parse(await readFile(result.originalPath)).props[0].value, 42)
+  assert.deepEqual(await readFile((await f.checkpoints.verify(result.previousCheckpointId)).path), before)
   const backup = await f.checkpoints.verify(result.currentCheckpointId)
   assert.equal(backup.pinned, true)
   assert.equal(JSON.parse(await readFile(backup.path)).props[0].value, 42)
@@ -271,6 +444,56 @@ test("manual canonical restore saves dirty state and verifies current backup bef
   assert.equal(f.actual.closes, 1)
   assert.deepEqual(f.bridge.events.filter(e => e.method === "execute").map(e => e.params.phase),
     ["restore_prepare", "restore_finish"])
+})
+
+test("manual restore refuses any in-place save revision change before publication or close", async t => {
+  for (const delta of [0, 1, 2]) {
+    const f = await manualFixture(t)
+    const save = f.actual.project.save.bind(f.actual.project)
+    f.actual.project.save = file => { save(file); f.actual.project.revision += delta }
+    if (delta === 0) {
+      const result = await f.workflow.restore("session", f.checkpoint.id, async () => {})
+      assert.equal(result.canonicalReplaced, true)
+      const backup = await f.checkpoints.verify(result.currentCheckpointId)
+      assert.equal(JSON.parse(await readFile(backup.path)).props[0].value, 42)
+    } else {
+      await assert.rejects(f.workflow.restore("session", f.checkpoint.id, async () => {}), { code: "outcome_uncertain" })
+      assert.equal(f.actual.closes, 0)
+      assert.equal(f.bridge.state.lock.state, "uncertain")
+    }
+  }
+})
+
+test("restore preserves previous disk bytes and current work when save or emergency copy cannot be confirmed", async t => {
+  for (const mode of ["serialized_edit", "save_error", "copy_error", "copy_false", "copy_corrupt", "copy_edit"]) {
+    const f = await manualFixture(t)
+    const original = await readFile(f.canonical)
+    const save = f.actual.project.save.bind(f.actual.project)
+    const file = f.actual.project.file, copy = file.copy.bind(file)
+    f.actual.project.save = target => {
+      if (mode === "serialized_edit") f.actual.props[0].setValue(19)
+      save(target)
+      if (mode === "save_error") throw new Error("Native save reported failure")
+    }
+    file.copy = target => {
+      if (mode === "copy_error") throw new Error("Disk full")
+      if (mode === "copy_false") return false
+      const result = copy(target)
+      if (mode === "copy_corrupt") writeFileSync(target, "partial copy")
+      if (mode === "copy_edit") f.actual.props[0].setValue(19)
+      return result
+    }
+    let failure
+    await assert.rejects(f.workflow.restore("session", f.checkpoint.id, async () => {}), e => { failure = e; return true })
+    assert.equal(f.actual.closes, 0, mode)
+    assert.equal(f.bridge.state.lock.state, "uncertain", mode)
+    assert.equal(f.actual.props[0].value, mode === "serialized_edit" || mode === "copy_edit" ? 19 : 42, mode)
+    const previous = await f.checkpoints.verify(failure.details.previousCheckpointId)
+    assert.deepEqual(await readFile(previous.path), original, mode)
+    assert.equal(previous.inUse, true, mode)
+    assert.equal(f.bridge.events.filter(e => e.params.phase === "restore_prepare").length, 1, mode)
+    assert.equal(f.bridge.events.filter(e => e.params.phase === "restore_finish").length, 0, mode)
+  }
 })
 
 test("manual canonical failure opens recovery copy with original unchanged and current backup protected", async t => {
@@ -287,7 +510,8 @@ test("manual canonical failure opens recovery copy with original unchanged and c
   assert.equal(result.canonicalReplaced, false)
   assert.equal(result.automationSuspended, true)
   assert.match(result.warning, /automation remains locked/)
-  assert.deepEqual(await readFile(f.canonical), before)
+  assert.equal(JSON.parse(await readFile(f.canonical)).props[0].value, 42)
+  assert.deepEqual(await readFile((await f.checkpoints.verify(result.previousCheckpointId)).path), before)
   assert.notEqual(result.path, f.checkpoint.path)
   assert.equal(f.actual.project.file.fsName, result.path)
   assert.equal(f.actual.props[0].value, 100)
@@ -667,7 +891,10 @@ test("workflow uses real checkpoint storage and grants through native HTTP", asy
   const p = await panelFixture(t)
   const checkpoints = createCheckpoints({ dataDir: p.dataDir })
   const w = createWorkflow({ bridge: p.bridge, checkpoints, grants: createGrants() })
-  await p.start(simulatedHost)
+  await p.start((command, panel) => command.method === "inspect" && command.params.restore === RESTORE_PROOF
+    ? { protocol: RESTORE_PROOF, project: structuredClone(panel.state.project), projectEpoch: "simulated-native",
+      revision: 1, dirty: false, busy: false, callbacksClear: true, capabilities: { fileNetwork: true } }
+    : simulatedHost(command, panel))
   const before = structuredClone(p.state)
   const plan = await w.propose("session", [{ type: "layer.create", name: "Stored" }])
   const result = await w.execute("session", plan.token, async () => {})
