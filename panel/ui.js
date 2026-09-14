@@ -2,7 +2,41 @@
 (function () {
     "use strict";
     function el(id) { return document.getElementById(id); }
-    var client, host, store, api, chat, working = false, checkpoints = [], serviceContext = "", diagnosticURL = null, serviceTimer, restoreOperation = null, restoreResult = "";
+    var client, host, store, api, chat, dashboard, working = false, checkpoints = [], serviceContext = "", diagnosticURL = null, serviceTimer, restoreOperation = null, restoreResult = "";
+    var settingsPages=[
+        ["general","settings-general"],
+        ["connection","settings-connection"],
+        ["capture","settings-capture"],
+        ["permissions","settings-permissions"],
+        ["services","settings-services"]
+    ];
+    function selectSettingsPage(selected) {
+        settingsPages.forEach(function(item){
+            var button=el("settings-nav-"+item[0]),page=el(item[1]),active=item[0]===selected;
+            page.hidden=!active;
+            button.className="settings-nav-item"+(active ? " is-active" : "");
+            if(button.setAttribute){if(active)button.setAttribute("aria-current","page");else button.removeAttribute("aria-current");}
+        });
+    }
+    settingsPages.forEach(function(item){
+        el("settings-nav-"+item[0]).addEventListener("click",function(){selectSettingsPage(item[0]);});
+    });
+    el("settings-close").addEventListener("click",function(){el("advanced").open=false;el("settings-toggle").focus();});
+    el("advanced").addEventListener("toggle",function(){if(this.open){el("chat-conversations").hidden=true;el("chat-conversations-open").setAttribute("aria-expanded","false");el("settings-close").focus();}});
+    el("advanced").addEventListener("keydown",function(e){
+        if(e.key!=="Tab" || !this.open)return;
+        var fields=Array.prototype.filter.call(this.querySelectorAll("button,input,select,textarea,a[href],summary"),function(field){return !field.disabled && field.offsetParent!==null && field.id!=="settings-toggle";});
+        if(!fields.length)return;
+        if(e.shiftKey&&document.activeElement===fields[0]){e.preventDefault();fields[fields.length-1].focus();}
+        else if(!e.shiftKey&&document.activeElement===fields[fields.length-1]){e.preventDefault();fields[0].focus();}
+    });
+    selectSettingsPage("general");
+    window.addEventListener("keydown",function(e){
+        if(e.key==="Escape" && el("advanced").open){el("advanced").open=false;el("settings-toggle").focus();}
+    });
+    window.addEventListener("click",function(e){
+        if(el("advanced").open && !el("advanced").contains(e.target))el("advanced").open=false;
+    });
     function serviceStatus(message) {
         // Operation evidence is not current-project metadata; refreshes must not erase backup locations.
         el("services-status").textContent=message+(restoreResult ? "\n\n"+restoreResult : "");
@@ -59,9 +93,11 @@
     }
     function problem(e) { el("error").textContent = (e.code || "panel_error") + ": " + (e.message || "Panel failed");el("connection-notice").hidden=false;el("connection-notice").textContent=e.message || "Connection needs attention. Open Settings & troubleshooting."; }
     function render(s) {
+        if(dashboard)dashboard.update(s);
         if(chat)chat.update(s);
         var recovery=!!(s.uncertain || s.lock);
-        el("connection-status").textContent=recovery ? "Paused" : s.connection==="connected" ? "Connected" : "Connecting…";
+        el("connection-status").className=s.connection==="connected" ? "is-connected" : "is-disconnected";
+        el("connection-status").textContent=s.connection==="connected" ? (recovery ? "Connected · Paused" : "Connected") : s.connection==="connecting" ? "Connecting…" : s.connection==="disconnected" ? "Disconnected" : "Not connected";
         el("recovery-notice").hidden=!recovery;
         el("recovery-message").textContent=s.uncertain ? "An action was interrupted. Wait for AE to finish, then check your project and render queue before continuing. The action will not be repeated." : "The connection is back. Ask CookieMonster to review the interrupted action in chat before making more changes.";
         el("reconcile").hidden=!s.uncertain;
@@ -121,7 +157,7 @@
                 try { api.cleanupCapture(value.result); } catch (e) { problem(e); }
             }
             render(client.state);
-        });
+        },120000);
         client = new api.Client({store:store,host:host,changed:render,normalize:function (r) { return api.normalizeCapture(r,document,Image); },beforeCapture:function(){
             return new Promise(function(resolve,reject){
                 if(document.hidden){reject({code:"unsafe_state",message:"Show the CookieMonster panel before capture"});return;}
@@ -134,6 +170,7 @@
         }});
         render(client.state);
         if(window.CookieMonsterChat)chat=window.CookieMonsterChat(client,store,api);
+        if(window.CookieJarRender)dashboard=window.CookieJarRender(client,api,function(){return chat.bindForPanel();});
         el("pair-form").addEventListener("submit",function(e){
             e.preventDefault();var code=el("code").value.trim();el("code").value="";
             action(function(){client.stop();return client.pair(code).then(function(){client.start();});});
@@ -236,6 +273,12 @@
     try {
         var cep=window.__adobe_cep__;
         if (!cep || typeof cep.evalScript !== "function" || typeof cep.getHostEnvironment !== "function" || typeof cep.getSystemPath !== "function") throw {code:"cep_required",message:"Open this extension inside After Effects 25 or 26."};
+        // CEP forwards keys from buttons to AE unless the extension registers interest.
+        // OS virtual codes: Escape, Tab, Return and Space (including Shift+Tab).
+        if(typeof cep.registerKeyEventsInterest==="function") {
+            var navigationKeys=/Mac/.test(navigator.platform) ? [53,48,36,49] : [27,9,13,32];
+            cep.registerKeyEventsInterest(JSON.stringify(navigationKeys.map(function(code){return {keyCode:code};})));
+        }
         // Adobe CEP 12 CSInterface: HostEnvironment identifies the application, not a persistent launch.
         // https://github.com/Adobe-CEP/CEP-Resources/blob/master/CEP_12.x/CSInterface.js
         var raw=cep.getHostEnvironment();

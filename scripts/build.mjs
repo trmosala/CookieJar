@@ -6,6 +6,7 @@ import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { AE_PERMISSIONS } from "../src/config.mjs";
 import { Script } from "node:vm";
+import { setTimeout as sleep } from "node:timers/promises";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const allowedPanelTypes = new Set([".html", ".css", ".js", ".cjs", ".mjs", ".jsx", ".xml", ".json", ".png", ".jpg", ".svg", ".woff", ".woff2", ".txt"]);
@@ -25,7 +26,8 @@ export async function files(dir, prefix = "") {
   return found;
 }
 
-export async function build(directory = root) {
+export async function build(directory = root, profile = "development") {
+  if (!["development", "client"].includes(profile)) throw new Error("Unknown build profile");
   if (Number(process.versions.node.split(".")[0]) < 22) throw new Error("Node 22+ required");
   const pkg = JSON.parse(await readFile(join(directory, "package.json"), "utf8"));
   if (!pkg || typeof pkg !== "object" || typeof pkg.version !== "string") {
@@ -64,6 +66,7 @@ export async function build(directory = root) {
       execFileSync("bun", [
         "build", `./src/${entry}`, "--target=node", "--format=esm", "--packages=bundle",
         "--env=disable", "--reject-unresolved",
+        "--define", `COOKIEJAR_CLIENT_BUILD=${profile === "client"}`,
         ...(entry === "plugin.mjs" ? ["--external=./render-worker.mjs"] : []),
         "--outfile", join(stage, "cm-ae", entry),
       ], { cwd: directory, stdio: "pipe" });
@@ -76,21 +79,36 @@ export async function build(directory = root) {
     }
     await copyFile(join(directory, "compatibility.json"), join(stage, "compatibility.json"));
     await copyFile(join(dirname(zodPackage), "LICENSE"), join(stage, "cm-ae", "ZOD-LICENSE.txt"));
-    await writeFile(join(stage, "cm-ae", "permissions.json"), JSON.stringify(AE_PERMISSIONS, null, 2) + "\n");
+    if (pkg.dependencies?.marked) {
+      const markedPackage = require.resolve("marked/package.json");
+      await copyFile(join(dirname(markedPackage), "LICENSE.md"), join(stage, "cm-ae", "MARKED-LICENSE.txt"));
+    }
+    const permissions = { ...AE_PERMISSIONS, ...(profile === "client" ? { ae_execute: "ask" } : {}) };
+    await writeFile(join(stage, "cm-ae", "permissions.json"), JSON.stringify(permissions, null, 2) + "\n");
     const artifacts = [];
     for (const path of await files(stage)) {
       const data = await readFile(join(stage, path));
       artifacts.push({ path, bytes: data.length, sha256: createHash("sha256").update(data).digest("hex") });
     }
     await writeFile(join(stage, "manifest.json"), JSON.stringify({
-      schemaVersion: 1, version: pkg.version, signed: false,
+      schemaVersion: 1, version: pkg.version, signed: false, profile,
       build: { bun, target: "node", format: "esm", zod: zod.version },
       artifacts,
     }, null, 2) + "\n");
     // ponytail: single-writer build; CI uses isolated workspaces, not concurrent builds.
     for (const name of ["cm-ae", "panel", "compatibility.json", "manifest.json"]) {
       await rm(join(dist, name), { force: true, recursive: true });
-      await rename(join(stage, name), join(dist, name));
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await rename(join(stage, name), join(dist, name));
+          break;
+        } catch (error) {
+          // Windows readers can briefly prevent moving our completed staging directory.
+          // Retry publication only; persistent errors still fail the build.
+          if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(error.code) || attempt === 9) throw error;
+          await sleep(20 * (attempt + 1));
+        }
+      }
     }
     console.log(`Built ${artifacts.length} hashed files in dist (unsigned, not certified).`);
   } finally {
@@ -99,7 +117,10 @@ export async function build(directory = root) {
 }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
-  try { await build(); }
+  try {
+    if (process.argv.slice(2).some(arg => arg !== "--client")) throw new Error("Usage: node scripts/build.mjs [--client]");
+    await build(root, process.argv.includes("--client") ? "client" : "development");
+  }
   catch (error) {
     console.error(error.stderr?.toString() || error.message);
     process.exitCode = 1;

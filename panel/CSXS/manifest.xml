@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<ExtensionManifest Version="7.0" ExtensionBundleId="com.cookiemonster.ae" ExtensionBundleVersion="0.2.2" ExtensionBundleName="CookieMonster AE">
-  <ExtensionList><Extension Id="com.cookiemonster.ae.panel" Version="0.2.2"/></ExtensionList>
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.cookiemonster.ae" ExtensionBundleVersion="0.2.3" ExtensionBundleName="CookieJar-AE">
+  <ExtensionList><Extension Id="com.cookiemonster.ae.panel" Version="0.2.3"/></ExtensionList>
   <ExecutionEnvironment>
     <HostList><Host Name="AEFT" Version="[25.0,26.99]"/></HostList>
     <LocaleList><Locale Code="All"/></LocaleList>
@@ -12,7 +12,7 @@
       <CEFCommandLine><Parameter>--enable-nodejs</Parameter><Parameter>--mixed-context</Parameter></CEFCommandLine>
     </Resources>
     <Lifecycle><AutoVisible>true</AutoVisible></Lifecycle>
-    <UI><Type>Panel</Type><Menu>CookieMonster AE (Development)</Menu><Geometry>
+    <UI><Type>Panel</Type><Menu>CookieJar-AE (Development)</Menu><Geometry>
       <Size><Width>360</Width><Height>650</Height></Size>
       <MinSize><Width>320</Width><Height>360</Height></MinSize>
     </Geometry></UI>

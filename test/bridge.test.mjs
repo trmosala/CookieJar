@@ -5,11 +5,110 @@ import { readFile, stat } from "node:fs/promises"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { panelFixture, request } from "./bridge-panel.mjs"
-import { createBridge } from "../src/bridge.mjs"
+import { createBridge, RESTORE_PROOF, restoreReceipt, restoreFingerprint } from "../src/bridge.mjs"
 import { hash, releaseMetadata } from "../src/protocol.mjs"
 import { randomUUID } from "node:crypto"
+import fs from "node:fs"
+import http from "node:http"
+import { setTimeout as delay } from "node:timers/promises"
+import { syncBuiltinESMExports } from "node:module"
 
 const exec = promisify(execFile)
+
+test("an unfinished pairing body cannot block authenticated heartbeats", async t => {
+  const p = await panelFixture(t)
+  const slow = http.request({ hostname: "127.0.0.1", port: p.port, path: "/pair", method: "POST",
+    headers: { "Content-Type": "application/json", "Content-Length": "100" } }, res => res.resume())
+  slow.on("error", () => {})
+  slow.write("{")
+  try {
+    await delay(50)
+    const heartbeat = await Promise.race([
+      p.send("/heartbeat", { project: p.state.project, capabilities: p.state.capabilities, busy: false }),
+      delay(1000).then(() => { throw new Error("Heartbeat blocked by incomplete unauthenticated body") }),
+    ])
+    assert.equal(heartbeat.status, 200)
+    assert.equal(p.bridge.binding("session").state, "active")
+  } finally { slow.destroy() }
+})
+
+test("body reception has its own deadline and revalidates credentials after reception", async t => {
+  const p = await panelFixture(t)
+  await new Promise((resolve, reject) => {
+    const slow = http.request({ hostname: "127.0.0.1", port: p.port, path: "/pair", method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": "100" } }, res => res.resume())
+    const deadline = setTimeout(() => { slow.destroy(); reject(new Error("Incomplete body outlived its deadline")) }, 6500)
+    slow.on("error", () => {})
+    slow.on("close", () => { clearTimeout(deadline); resolve() })
+    slow.write("{")
+  })
+  const body = JSON.stringify({ project: p.state.project, capabilities: p.state.capabilities, busy: false })
+  let complete
+  const response = new Promise((resolve, reject) => {
+    const slow = http.request({ hostname: "127.0.0.1", port: p.port, path: "/heartbeat", method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), Authorization: "Bearer " + p.credential } }, res => {
+      res.resume(); res.on("end", () => resolve(res.statusCode))
+    })
+    slow.on("error", reject)
+    slow.write(body.slice(0, 1))
+    complete = () => slow.end(body.slice(1))
+  })
+  await delay(50)
+  try { assert.equal((await p.send("/rotate", {})).status, 200) } finally { complete() }
+  assert.equal(await response, 401, "a credential revoked during body reception cannot mutate connection state")
+})
+const receipt = state => ({ protocol: RESTORE_PROOF, project: structuredClone(state.project),
+  projectEpoch: "native-original", revision: state.revision, dirty: false, busy: false,
+  callbacksClear: true, capabilities: { fileNetwork: true } })
+const restoreReason = p => ({ kind: "restore", proof: RESTORE_PROOF, checkpointId: "source",
+  planHash: hash("plan"), fingerprint: restoreFingerprint(receipt(p.state), p.connectionId) })
+
+for (const permanent of [false, true]) {
+  test(`Windows bridge replacement ${permanent ? "exhausts retries without replacing state" : "recovers from transient sharing errors"}`, { skip: process.platform !== "win32" }, async t => {
+    const p = await panelFixture(t)
+    const file = path.join(p.dataDir, "bridge-state.json")
+    const before = await readFile(file)
+    const rename = fs.promises.rename
+    let attempts = 0
+    fs.promises.rename = async (source, destination) => {
+      if (destination === file && (++attempts <= 2 || permanent))
+        throw Object.assign(new Error("Simulated Windows sharing conflict"), { code: "EPERM" })
+      return rename(source, destination)
+    }
+    syncBuiltinESMExports()
+    try {
+      if (permanent) {
+        await assert.rejects(p.bridge.lock("session", { kind: "test" }), { code: "EPERM" })
+        assert.equal(attempts, 10)
+        assert.deepEqual(await readFile(file), before)
+        assert.throws(() => p.bridge.binding("session"), { code: "storage_failed" })
+      } else {
+        const lock = await p.bridge.lock("session", { kind: "test" })
+        assert.equal(attempts, 3)
+        assert.equal(JSON.parse(await readFile(file)).locks[0].id, lock.id)
+        assert.equal(p.bridge.binding("session", { allowLocked: true }).lock.id, lock.id)
+      }
+    } finally {
+      fs.promises.rename = rename
+      syncBuiltinESMExports()
+    }
+  })
+}
+
+test("compact receipt schemas reject partial full and unknown proofs and fingerprints bind connection epoch and dirty state", () => {
+  const project = { id: "p", path: path.resolve("test.aep"), saved: true }
+  const valid = receipt({ project, revision: 1 })
+  assert.equal(restoreReceipt(valid, project), valid)
+  for (const patch of [{ items: [] }, { dirty: null }, { busy: true }, { callbacksClear: false },
+    { projectEpoch: "" }, { revision: 0 }, { revision: 1.5 }, { capabilities: {} }])
+    assert.throws(() => restoreReceipt({ ...valid, ...patch }, project))
+  for (const protocol of [undefined, "compact-restore-v0"])
+    assert.throws(() => restoreReceipt({ ...valid, protocol }, project), { code: "restore_unsupported" })
+  const fingerprint = restoreFingerprint(valid, "connection-a")
+  for (const changed of [{ ...valid, dirty: true }, { ...valid, projectEpoch: "reopened" }, { ...valid, revision: 2 }])
+    assert.notEqual(restoreFingerprint(changed, "connection-a"), fingerprint)
+  assert.notEqual(restoreFingerprint(valid, "connection-b"), fingerprint)
+})
 
 test("compatibility runtime metadata validates release targets and credential-free HTTPS URLs", () => {
   const defaults = releaseMetadata()
@@ -17,7 +116,7 @@ test("compatibility runtime metadata validates release targets and credential-fr
   assert.equal(defaults.cookieMonsterVersionStatus, "not_configured")
   assert.equal(defaults.releaseSourceUrl, "https://github.com/trmosala/CookieJar/releases")
   assert.ok(Object.values(defaults.updates).every(update => update.status === "not_configured" && update.url === null))
-  const update = { version: "0.2.2", protocol: 1, url: "https://releases.example.test/ae/0.2.2" }
+  const update = { version: "0.2.3", protocol: 1, url: "https://releases.example.test/ae/0.2.3" }
   assert.equal(releaseMetadata({ cookieMonsterVersion: "2.4.1", updates: { panel: update } }).updates.panel.status, "configured")
   for (const url of ["javascript:alert(1)", "http://example.test/a", "file:///C:/secret", "//example.test/a",
     "https://user:secret@example.test/a", "https://example.test/a?token=secret", "https://example.test/a#secret",
@@ -37,12 +136,12 @@ test("compatibility runtime metadata validates release targets and credential-fr
 
 test("compatibility probes retain only authenticated versions, never authorize tools, and preserve pending recovery locks", async t => {
   const configured = { cookieMonsterVersion: "2.4.1",
-    updates: { panel: { version: "0.2.2", protocol: 1, url: "https://releases.example.test/ae/0.2.2" } } }
+    updates: { panel: { version: "0.2.3", protocol: 1, url: "https://releases.example.test/ae/0.2.3" } } }
   const p = await panelFixture(t, { releaseMetadata: configured })
   configured.cookieMonsterVersion = "9.9.9"
-  const peer = { panelId: "test-panel", protocol: 2, version: "0.2.2" }
+  const peer = { panelId: "test-panel", protocol: 2, version: "0.2.3" }
   const initial = (await p.bridge.connections())[0].compatibility
-  assert.equal(initial.panelVersion, "0.2.2")
+  assert.equal(initial.panelVersion, "0.2.3")
   assert.equal(initial.status, "compatible")
   assert.equal(initial.cookieMonsterVersion, "2.4.1")
   assert.equal((await request(p.port, "/compatibility", peer)).status, 401)
@@ -64,8 +163,8 @@ test("compatibility probes retain only authenticated versions, never authorize t
   assert.equal(probe.status, 200)
   assert.equal(probe.body.compatibility.status, "incompatible")
   assert.equal(probe.body.compatibility.panelProtocol, 2)
-  assert.equal(probe.body.compatibility.panelVersion, "0.2.2")
-  assert.equal(probe.body.compatibility.updates.panel.url, "https://releases.example.test/ae/0.2.2")
+  assert.equal(probe.body.compatibility.panelVersion, "0.2.3")
+  assert.equal(probe.body.compatibility.updates.panel.url, "https://releases.example.test/ae/0.2.3")
   const connection = (await p.bridge.connections())[0]
   assert.equal(connection.connected, false)
   assert.equal(connection.lock.state, "uncertain")
@@ -79,9 +178,9 @@ test("compatibility probes retain only authenticated versions, never authorize t
   assert.equal(mismatch.body.error.code, "incompatible_version")
   assert.deepEqual(mismatch.body.error.details.compatibility, probe.body.compatibility)
   const persisted = await readFile(path.join(p.dataDir, "bridge-state.json"), "utf8")
-  for (const excluded of ["panelVersion", "cookieMonsterVersion", "0.2.2", "releases.example.test"])
+  for (const excluded of ["panelVersion", "cookieMonsterVersion", "0.2.3", "releases.example.test"])
     assert.ok(!persisted.includes(excluded), excluded)
-  await p.send("/compatibility", { ...peer, version: "0.2.2", protocol: 1 })
+  await p.send("/compatibility", { ...peer, version: "0.2.3", protocol: 1 })
   assert.equal((await p.bridge.connections())[0].connected, false)
   await p.connect()
   await p.bridge.bind("session", p.connectionId)
@@ -92,7 +191,7 @@ test("compatibility probes retain only authenticated versions, never authorize t
   const fresh = (await p.bridge.connections())[0]
   assert.equal(fresh.project, null)
   assert.equal(fresh.capabilities, null)
-  assert.equal(fresh.compatibility.panelVersion, "0.2.2")
+  assert.equal(fresh.compatibility.panelVersion, "0.2.3")
   assert.equal(fresh.connected, false)
   await p.send("/unpair", {})
   assert.equal((await p.bridge.connections())[0].compatibility.panelVersion, null)
@@ -102,7 +201,7 @@ test("compatibility probes retain only authenticated versions, never authorize t
 test("compatibility pairing mismatch is code-authenticated, session-scoped, volatile and expires without credentials", async t => {
   let clock = Date.now()
   const p = await panelFixture(t, { now: () => clock, pairingTtlMs: 1000 })
-  const peer = { code: "invalid", panelId: "untrusted-panel", protocol: 2, version: "0.2.2" }
+  const peer = { code: "invalid", panelId: "untrusted-panel", protocol: 2, version: "0.2.3" }
   const rejected = await request(p.port, "/pair", peer)
   assert.equal(rejected.body.error.code, "invalid_pairing_code")
   assert.deepEqual(rejected.body.error.details, {})
@@ -110,7 +209,7 @@ test("compatibility pairing mismatch is code-authenticated, session-scoped, vola
   const before = await readFile(path.join(p.dataDir, "bridge-state.json"), "utf8")
   peer.code = p.bridge.pairingCode("other").code
   assert.equal((await request(p.port, "/pair", peer)).body.error.code, "incompatible_version")
-  assert.equal(p.bridge.compatibility("other").pendingPanels[0].panelVersion, "0.2.2")
+  assert.equal(p.bridge.compatibility("other").pendingPanels[0].panelVersion, "0.2.3")
   assert.deepEqual(p.bridge.compatibility("session").pendingPanels, [])
   assert.equal((await p.bridge.connections()).length, 1)
   assert.equal(await readFile(path.join(p.dataDir, "bridge-state.json"), "utf8"), before)
@@ -122,7 +221,7 @@ test("compatibility pairing mismatch is code-authenticated, session-scoped, vola
   assert.deepEqual(p.bridge.compatibility("other").pendingPanels, [])
   peer.code = p.bridge.pairingCode("other").code
   await request(p.port, "/pair", peer)
-  const paired = await request(p.port, "/pair", { ...peer, protocol: 1, version: "0.2.2" })
+  const paired = await request(p.port, "/pair", { ...peer, protocol: 1, version: "0.2.3" })
   assert.equal(paired.status, 200)
   assert.equal(paired.body.compatibility.status, "compatible")
   assert.deepEqual(p.bridge.compatibility("other").pendingPanels, [])
@@ -152,9 +251,9 @@ test("panel services authenticate, derive own session, recheck binding, and awai
   assert.equal((await p.send("/panel", { action: "renders", sessionID: "other" })).body.error.code, "invalid_payload")
   assert.equal((await p.send("/panel", { action: "checkpoint.pin", id: "x", pinned: "yes" })).body.error.code, "invalid_payload")
   const other = await request(p.port, "/pair", { code: p.bridge.pairingCode("other").code,
-    panelId: "second", protocol: 1, version: "0.2.2" })
+    panelId: "second", protocol: 1, version: "0.2.3" })
   const sendOther = (endpoint, body) => request(p.port, endpoint, body, { credential: other.body.credential })
-  await sendOther("/connect", { panelId: "second", protocol: 1, version: "0.2.2",
+  await sendOther("/connect", { panelId: "second", protocol: 1, version: "0.2.3",
     project: p.state.project, capabilities: p.state.capabilities, aeVersion: "26.0" })
   assert.equal((await sendOther("/panel", { action: "renders" })).body.error.code, "not_bound")
   await p.bridge.bind("other", other.body.connectionId)
@@ -230,16 +329,17 @@ test("manual restore protocol validates scope proof phase replay and durable fal
   p.state.revision = 1
   const original = structuredClone(p.state.project)
   const transaction = { id: randomUUID(), sessionID: "session", bindingID: p.bridge.binding("session").id }
-  const prepare = { phase: "restore_prepare", transaction, recoveryId: randomUUID(), expected: structuredClone(p.state),
+  const prepare = { phase: "restore_prepare", transaction, recoveryId: randomUUID(), expected: receipt(p.state),
     path: path.join(p.dataDir, "workflow-emergency-" + randomUUID() + ".aep") }
-  const reason = { kind: "restore", checkpointId: "source", planHash: hash("plan"), fingerprint: hash(p.state) }
+  const reason = restoreReason(p)
   await p.bridge.lock("session", reason)
   for (const [params, code] of [
     [{ ...prepare, transaction: { ...transaction, sessionID: "foreign" } }, "stale_binding"],
     [{ ...prepare, transaction: { ...transaction, bindingID: "foreign" } }, "stale_binding"],
-    [{ ...prepare, expected: { ...p.state, revision: 2 } }, "unsafe_state"],
-    [{ ...prepare, expected: Object.fromEntries(Object.entries(p.state).filter(([key]) => key !== "activeCompId")) }, "invalid_payload"],
-    [{ ...prepare, expected: { ...p.state, project: { ...original, id: "foreign" } } }, "invalid_payload"],
+    [{ ...prepare, expected: { ...receipt(p.state), revision: 2 } }, "unsafe_state"],
+    [{ ...prepare, expected: Object.fromEntries(Object.entries(receipt(p.state)).filter(([key]) => key !== "dirty")) }, "invalid_payload"],
+    [{ ...prepare, expected: { ...receipt(p.state), project: { ...original, id: "foreign" } } }, "invalid_host_result"],
+    [{ ...prepare, expected: structuredClone(p.state) }, "restore_unsupported"],
     [{ ...prepare, path: path.join(p.dataDir, "artist.aep") }, "invalid_path"],
     [{ ...prepare, extra: true }, "invalid_payload"],
     [{ ...prepare, phase: "restore_finish", verifiedCheckpoint: { id: "backup", hash: hash("bytes"), size: 1 } }, "unsafe_state"],
@@ -249,17 +349,19 @@ test("manual restore protocol validates scope proof phase replay and durable fal
     const durable = JSON.parse(await readFile(path.join(p.dataDir, "bridge-state.json"))).locks[0]
     assert.equal(durable.recoveryOriginal.path, original.path)
     assert.equal(durable.restore.phase, command.params.phase === "restore_prepare" ? "preparing" : "finishing")
-    p.state.project = { id: "path:" + hash(command.params.path), path: command.params.path, saved: true }
+    if (command.params.phase === "restore_finish")
+      p.state.project = { id: "path:" + hash(command.params.path), path: command.params.path, saved: true }
     return { status: command.params.phase === "restore_prepare" ? "recovery_saved" : "recovered",
-      project: p.state.project, snapshot: structuredClone(p.state) }
+      project: p.state.project, receipt: { ...receipt(p.state),
+        projectEpoch: command.params.phase === "restore_prepare" ? "native-original" : "native-opened" } }
   })
   const saved = await p.bridge.call("session", "execute", prepare, { allowLocked: true })
-  assert.equal(p.bridge.binding("session", { allowLocked: true }).project.path, prepare.path)
-  await assert.rejects(p.bridge.call("session", "execute", prepare, { allowLocked: true }), { code: "invalid_payload" })
+  assert.equal(p.bridge.binding("session", { allowLocked: true }).project.path, original.path)
+  await assert.rejects(p.bridge.call("session", "execute", prepare, { allowLocked: true }), { code: "unsafe_state" })
   await assert.rejects(p.bridge.call("session", "save", {}, { allowLocked: true }), { code: "restore_in_progress" })
-  await assert.rejects(p.bridge.unlock("session"), { code: "recovery_target_mismatch" })
+  await assert.rejects(p.bridge.unlock("session"), { code: "restore_in_progress" })
   const finish = { phase: "restore_finish", transaction, recoveryId: prepare.recoveryId,
-    expected: saved.snapshot, path: path.join(p.dataDir, "workflow-recovery-" + randomUUID() + ".aep"),
+    expected: saved.receipt, path: path.join(p.dataDir, "workflow-recovery-" + randomUUID() + ".aep"),
     verifiedCheckpoint: { id: "backup", hash: hash("bytes"), size: 1 } }
   await assert.rejects(p.bridge.call("session", "execute", finish, { allowLocked: true }), { code: "unsafe_state" })
   await p.bridge.recordOutcome("session", { outcome: "dispatched", planHash: reason.planHash,
@@ -267,7 +369,7 @@ test("manual restore protocol validates scope proof phase replay and durable fal
   for (const [params, code] of [
     [{ ...finish, transaction: { ...transaction, id: randomUUID() } }, "unsafe_state"],
     [{ ...finish, recoveryId: "foreign" }, "unsafe_state"],
-    [{ ...finish, expected: { ...saved.snapshot, revision: 2 } }, "unsafe_state"],
+    [{ ...finish, expected: { ...saved.receipt, revision: 2 } }, "unsafe_state"],
     [{ ...finish, verifiedCheckpoint: { ...finish.verifiedCheckpoint, id: "other" } }, "unsafe_state"],
     [{ ...finish, verifiedCheckpoint: { ...finish.verifiedCheckpoint, hash: "bad" } }, "invalid_payload"],
     [{ ...finish, path: path.join(p.dataDir, "artist.aep") }, "invalid_path"],
@@ -275,7 +377,7 @@ test("manual restore protocol validates scope proof phase replay and durable fal
   const restored = await p.bridge.call("session", "execute", finish, { allowLocked: true })
   assert.equal(restored.project.path, finish.path)
   assert.equal(p.log.length, 2)
-  await assert.rejects(p.bridge.call("session", "execute", { ...finish, expected: restored.snapshot }, { allowLocked: true }),
+  await assert.rejects(p.bridge.call("session", "execute", { ...finish, expected: restored.receipt }, { allowLocked: true }),
     { code: "unsafe_state" })
   assert.equal((await p.send("/reply", { id: p.log[1].id, result: restored })).body.error.code, "invalid_reply")
   await p.bridge.markUncertain("session", "Recovery copy requires review")
@@ -291,18 +393,20 @@ test("manual restore protocol validates scope proof phase replay and durable fal
 })
 
 test("manual restore rejects forged prepare replies without advancing durable state", async t => {
-  for (const mode of ["path", "snapshot", "status"]) {
+  for (const mode of ["path", "snapshot", "save_increment", "status", "epoch", "dirty", "protocol"]) {
     const p = await panelFixture(t)
     p.state.revision = 1
     const original = structuredClone(p.state.project)
     const params = { phase: "restore_prepare", transaction: { id: randomUUID(), sessionID: "session",
-      bindingID: p.bridge.binding("session").id }, recoveryId: randomUUID(), expected: structuredClone(p.state),
+      bindingID: p.bridge.binding("session").id }, recoveryId: randomUUID(), expected: receipt(p.state),
       path: path.join(p.dataDir, "workflow-emergency-" + randomUUID() + ".aep") }
-    await p.bridge.lock("session", { kind: "restore", checkpointId: "source", planHash: hash("plan"), fingerprint: hash(p.state) })
+    await p.bridge.lock("session", restoreReason(p))
     await p.start(async () => {
-      const project = { id: "saved", path: mode === "path" ? original.path : params.path, saved: true }
+      const project = { ...original, path: mode === "path" ? params.path : original.path }
       return { status: mode === "status" ? "recovered" : "recovery_saved", project,
-        snapshot: { ...p.state, project, revision: mode === "snapshot" ? 2 : 1 } }
+        receipt: { ...receipt(p.state), project, revision: mode === "snapshot" ? 3 : mode === "save_increment" ? 2 : 1,
+          projectEpoch: mode === "epoch" ? "replaced" : "native-original",
+          dirty: mode === "dirty", protocol: mode === "protocol" ? "old" : RESTORE_PROOF } }
     })
     await assert.rejects(p.bridge.call("session", "execute", params, { allowLocked: true }), { code: "outcome_uncertain" })
     const lock = JSON.parse(await readFile(path.join(p.dataDir, "bridge-state.json"))).locks[0]
@@ -315,35 +419,35 @@ test("manual restore rejects forged prepare replies without advancing durable st
 })
 
 test("manual restore forged finish and foreign replies cannot confirm a path transition", async t => {
-  for (const fault of ["path", "snapshot", "identity"]) {
+  for (const fault of ["path", "snapshot", "identity", "epoch", "dirty"]) {
     const p = await panelFixture(t)
     p.state.revision = 1
     const original = structuredClone(p.state.project)
     const transaction = { id: randomUUID(), sessionID: "session", bindingID: p.bridge.binding("session").id }
-    const prepare = { phase: "restore_prepare", transaction, recoveryId: randomUUID(), expected: structuredClone(p.state),
+    const prepare = { phase: "restore_prepare", transaction, recoveryId: randomUUID(), expected: receipt(p.state),
       path: path.join(p.dataDir, "workflow-emergency-" + randomUUID() + ".aep") }
     const planHash = hash("plan")
-    await p.bridge.lock("session", { kind: "restore", checkpointId: "source", planHash, fingerprint: hash(p.state) })
+    await p.bridge.lock("session", restoreReason(p))
     await p.start(async command => {
-      const project = command.params.phase === "restore_prepare"
-        ? { id: "emergency", path: prepare.path, saved: true } : { ...original }
+      const project = { ...original }
       if (command.params.phase === "restore_finish") {
         if (fault === "path") project.path = path.join(p.dataDir, "foreign.aep")
         if (fault === "identity") project.id = "foreign"
       } else p.state.project = project
-      const snapshot = { ...p.state, project }
-      if (command.params.phase === "restore_finish" && fault === "snapshot") delete snapshot.items
-      return { status: command.params.phase === "restore_prepare" ? "recovery_saved" : "recovered", project, snapshot }
+      const proof = { ...receipt(p.state), project }
+      if (command.params.phase === "restore_finish") proof.projectEpoch = "native-opened"
+      if (command.params.phase === "restore_finish" && fault === "snapshot") delete proof.dirty
+      return { status: command.params.phase === "restore_prepare" ? "recovery_saved" : "recovered", project, receipt: proof }
     })
     const saved = await p.bridge.call("session", "execute", prepare, { allowLocked: true })
     await p.stop()
     await p.bridge.recordOutcome("session", { outcome: "dispatched", checkpointId: "source",
       currentCheckpointId: "backup", planHash })
     const finish = { phase: "restore_finish", transaction, recoveryId: prepare.recoveryId,
-      expected: saved.snapshot, path: original.path, verifiedCheckpoint: { id: "backup", hash: hash("bytes"), size: 1 } }
+      expected: saved.receipt, path: original.path, verifiedCheckpoint: { id: "backup", hash: hash("bytes"), size: 1 } }
     const foreign = await request(p.port, "/pair", { code: p.bridge.pairingCode("foreign").code,
-      panelId: "foreign-panel", protocol: 1, version: "0.2.2" })
-    await request(p.port, "/connect", { panelId: "foreign-panel", protocol: 1, version: "0.2.2",
+      panelId: "foreign-panel", protocol: 1, version: "0.2.3" })
+    await request(p.port, "/connect", { panelId: "foreign-panel", protocol: 1, version: "0.2.3",
       project: original, capabilities: p.state.capabilities, aeVersion: "26.0" }, { credential: foreign.body.credential })
     const pending = p.bridge.call("session", "execute", finish, { allowLocked: true })
     const rejected = assert.rejects(pending, { code: "outcome_uncertain" })
@@ -354,14 +458,16 @@ test("manual restore forged finish and foreign replies cannot confirm a path tra
     const project = { ...original }
     if (fault === "path") project.path = path.join(p.dataDir, "foreign.aep")
     if (fault === "identity") project.id = "foreign"
-    const snapshot = { ...p.state, project }
-    if (fault === "snapshot") delete snapshot.items
-    await p.send("/reply", { id: command.id, result: { status: "recovered", project, snapshot } })
+    const proof = { ...receipt(p.state), project, projectEpoch: "native-opened" }
+    if (fault === "snapshot") delete proof.dirty
+    if (fault === "epoch") proof.projectEpoch = saved.receipt.projectEpoch
+    if (fault === "dirty") proof.dirty = true
+    await p.send("/reply", { id: command.id, result: { status: "recovered", project, receipt: proof } })
     await rejected
     const lock = JSON.parse(await readFile(path.join(p.dataDir, "bridge-state.json"))).locks[0]
     assert.equal(lock.state, "uncertain")
     assert.equal(lock.restore.phase, "finishing")
-    assert.equal(lock.project.path, prepare.path)
+    assert.equal(lock.project.path, original.path)
     assert.equal(lock.recoveryOriginal.path, original.path)
   }
 })
@@ -372,9 +478,9 @@ test("manual restore reconnect during dispatched prepare preserves original and 
   const original = structuredClone(p.state.project)
   const prepare = { phase: "restore_prepare",
     transaction: { id: randomUUID(), sessionID: "session", bindingID: p.bridge.binding("session").id },
-    recoveryId: randomUUID(), expected: structuredClone(p.state),
+    recoveryId: randomUUID(), expected: receipt(p.state),
     path: path.join(p.dataDir, "workflow-emergency-" + randomUUID() + ".aep") }
-  await p.bridge.lock("session", { kind: "restore", checkpointId: "source", planHash: hash("plan"), fingerprint: hash(p.state) })
+  await p.bridge.lock("session", restoreReason(p))
   const pending = p.bridge.call("session", "execute", prepare, { allowLocked: true })
   const rejected = assert.rejects(pending, { code: "outcome_uncertain" })
   let command
@@ -435,10 +541,10 @@ test("native loopback authentication, schemas, pairing replay/expiry, rotation a
   assert.equal((await p.send("/heartbeat", {}, { raw: "{" })).body.error.code, "invalid_payload")
   assert.equal((await p.send("/heartbeat", { project: p.state.project, capabilities: {}, busy: false })).status, 400)
   const code = p.bridge.pairingCode("other").code
-  const pair = { code, protocol: 1, version: "0.2.2", panelId: "other-panel" }
+  const pair = { code, protocol: 1, version: "0.2.3", panelId: "other-panel" }
   const mismatch = await request(p.port, "/pair", { ...pair, protocol: 2 })
   assert.equal(mismatch.body.error.code, "incompatible_version")
-  assert.equal(mismatch.body.error.details.version, "0.2.2")
+  assert.equal(mismatch.body.error.details.version, "0.2.3")
   assert.equal((await request(p.port, "/pair", pair)).status, 200)
   assert.equal((await request(p.port, "/pair", pair)).body.error.code, "invalid_pairing_code")
   pair.code = p.bridge.pairingCode("expiry").code
@@ -473,7 +579,7 @@ test("native loopback authentication, schemas, pairing replay/expiry, rotation a
 
 test("discovery accepts validated active composition metadata and clears it across project and connection changes", async t => {
   const p = await panelFixture(t)
-  const connect = activeCompId => p.send("/connect", { protocol: 1, version: "0.2.2", panelId: "test-panel",
+  const connect = activeCompId => p.send("/connect", { protocol: 1, version: "0.2.3", panelId: "test-panel",
     project: p.state.project, aeVersion: "26.0-test", capabilities: p.state.capabilities, activeCompId })
   const heartbeat = activeCompId => p.send("/heartbeat", {
     project: p.state.project, capabilities: p.state.capabilities, busy: false, activeCompId,

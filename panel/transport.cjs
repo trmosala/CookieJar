@@ -1,6 +1,6 @@
 "use strict";
 var fs = require("fs"), path = require("path"), os = require("os"), http = require("http"), crypto = require("crypto"), child = require("child_process");
-var VERSION = "0.2.2", PROTOCOL = 1, MAX = 4 * 1024 * 1024;
+var VERSION = "0.2.3", PROTOCOL = 1, MAX = 4 * 1024 * 1024;
 function error(code, message) { var e = new Error(message); e.code = code; return e; }
 function record(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
 function text(v, max) { return typeof v === "string" && v.length > 0 && v.length <= max; }
@@ -226,14 +226,14 @@ Store.prototype.close = function () {
 function request(descriptor, credential, endpoint, body, timeout) {
     return new Promise(function (resolve, reject) {
         var data = body === undefined ? null : Buffer.from(JSON.stringify(body), "utf8"), finished = false, timer;
-        if (data && data.length > MAX) { reject(error("payload_too_large", "Reply exceeds bridge JSON limit")); return; }
+        if (data && data.length > (endpoint==="/chat" ? 16*1024*1024 : MAX)) { reject(error("payload_too_large", "Reply exceeds bridge JSON limit")); return; }
         var headers = {"Content-Type":"application/json"};
         if (credential) headers.Authorization = "Bearer " + credential;
         if (data) headers["Content-Length"] = data.length;
         function done(err, result) { if (finished) return; finished = true; clearTimeout(timer); if (err) reject(err); else resolve(result); }
         var req = http.request({hostname:"127.0.0.1", port:descriptor.port, path:endpoint, method:endpoint === "/poll" ? "GET" : "POST", headers:headers, agent:false}, function (res) {
             var chunks = [], size = 0;
-            res.on("data", function (chunk) { size += chunk.length; if (size > (endpoint==="/chat" ? 8*1024*1024 : MAX)) { req.destroy(); done(error("invalid_response", "Oversized bridge response")); } else chunks.push(chunk); });
+            res.on("data", function (chunk) { size += chunk.length; if (size > (endpoint==="/chat" ? 16*1024*1024 : MAX)) { req.destroy(); done(error("invalid_response", "Oversized bridge response")); } else chunks.push(chunk); });
             res.on("error", function () { done(error("disconnected", "Bridge response interrupted")); });
             res.on("end", function () {
                 try {
@@ -243,6 +243,8 @@ function request(descriptor, credential, endpoint, body, timeout) {
                     if (res.statusCode !== 200 || value.error) {
                         var code = value.error && value.error.code;
                         var rejected=error(typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? code : "bridge_error", endpoint==="/chat" && typeof value.error.message==="string" ? value.error.message.slice(0,8192) : "Bridge rejected request");
+                        if(code==="storage_space")rejected.message="Not enough free disk space for saving and recovery copies. Free space before continuing.";
+                        if(code==="checkpoint_capacity")rejected.message="Checkpoint storage is full. Review old pins and recovery holds before continuing.";
                         if(["/pair","/connect","/compatibility"].indexOf(endpoint)>=0 && ["incompatible","incompatible_version"].indexOf(code)>=0 &&
                             record(value.error.details) && Object.prototype.hasOwnProperty.call(value.error.details,"compatibility"))
                             rejected.details={compatibility:compatibilityMetadata(value.error.details.compatibility)};
@@ -257,7 +259,7 @@ function request(descriptor, credential, endpoint, body, timeout) {
         if (data) req.write(data); req.end();
     });
 }
-function HostRPC(cep, timeout, onLate) { this.cep = cep; this.timeout = timeout || 25000; this.pending = false; this.uncertain = false; this.onLate = onLate || function () {}; }
+function HostRPC(cep, timeout, onLate, restoreTimeout) { this.cep = cep; this.timeout = timeout || 25000; this.restoreTimeout = restoreTimeout || this.timeout; this.pending = false; this.uncertain = false; this.onLate = onLate || function () {}; }
 HostRPC.prototype.call = function (method, params, expectedProject) {
     var self = this;
     if (self.pending || self.uncertain) return Promise.reject(error("outcome_uncertain", "Host is locked pending explicit reconciliation"));
@@ -271,7 +273,7 @@ HostRPC.prototype.call = function (method, params, expectedProject) {
             if(method==="status") { reject(error("host_busy", "Close the AE dialog to reconnect")); return; }
             self.uncertain = true;
             reject(error("outcome_uncertain", "evalScript timed out; it was not cancelled and must not be retried"));
-        }, self.timeout);
+        }, method==="execute" && params && (params.phase==="restore_prepare" || params.phase==="restore_finish") ? self.restoreTimeout : self.timeout);
         var envelope={method:method,params:params};
         if(expectedProject)envelope.expectedProject=expectedProject;
         var payload = JSON.stringify(JSON.stringify(envelope)).replace(/\u2028/g,"\\u2028").replace(/\u2029/g,"\\u2029");
@@ -395,7 +397,7 @@ function Client(options) {
     this.store=options.store;this.host=options.host;this.normalize=options.normalize;this.changed=options.changed || function(){};
     this.beforeCapture=options.beforeCapture || function(){return Promise.reject(error("unsafe_state","Visible capture indicator could not be confirmed"));};
     this.request=options.request || request;this.descriptor=null;this.running=false;this.timer=null;this.inFlight=false;
-    this.connectionGeneration=0;this.connectionId=null;this.connectionEpoch=null;
+    this.connectionGeneration=0;this.connectionId=null;this.connectionEpoch=null;this.latchGeneration=0;
     this.state={connection:this.store.state.credential ? "paired" : "unpaired",project:null,activeCompId:null,capabilities:{fileNetwork:false},binding:null,lock:null,busy:false,capture:null,uncertain:this.store.state.uncertain,aeVersion:"",bridgeVersion:"",compatibility:null,lastError:""};
 }
 Client.prototype.scope=function(){
@@ -415,15 +417,18 @@ Client.prototype.emit=function(){
 Client.prototype.panel=function(action,args){
     var self=this,allowed={
         "checkpoints":[],"checkpoint.pin":["id","pinned"],"checkpoint.delete":["id"],
-        "checkpoint.restore.propose":["id"],"checkpoint.restore.confirm":["token"],"diagnostics":[],"renders":[]
-    },payload={action:action},context=self.context(),mutating=typeof action==="string" && action.indexOf("checkpoint.")===0;
+        "checkpoint.restore.propose":["id"],"checkpoint.restore.confirm":["token"],"diagnostics":[],"renders":[],"frame.capture":["compId","time"],
+        "render.start":["tool","args"],"render.poll":["token"],"render.reply":["token","approvalID","allow"]
+    },payload={action:action},context=self.context(),mutating=typeof action==="string" && (action.indexOf("checkpoint.")===0 || action==="frame.capture");
     args=args || {};
     if(!Object.prototype.hasOwnProperty.call(allowed,action) || !record(args) || Object.keys(args).sort().join(",")!==allowed[action].slice().sort().join(","))return Promise.reject(error("invalid_payload","Unknown panel action or fields"));
     if(self.panelPending)return Promise.reject(error("panel_busy","Panel request already outstanding"));
+    if(action==="render.start" && (self.state.busy || self.state.uncertain || self.state.lock))return Promise.reject(error("target_locked","Wait for AE or resolve recovery before rendering"));
     if(self.state.connection!=="connected" || !self.store.state.credential)return Promise.reject(error("disconnected","Connect before requesting bridge services"));
     if(mutating && (self.state.busy || self.state.uncertain || self.state.lock || !self.state.binding || self.state.binding.state!=="active"))return Promise.reject(error("target_locked","Checkpoint changes require an active unlocked binding"));
     if(Object.prototype.hasOwnProperty.call(args,"id") && !text(args.id,256))return Promise.reject(error("invalid_payload","Invalid checkpoint ID"));
     if(action==="checkpoint.pin" && typeof args.pinned!=="boolean")return Promise.reject(error("invalid_payload","pinned must be boolean"));
+    if(action==="frame.capture" && (!Number.isSafeInteger(args.compId) || args.compId<1 || !Number.isFinite(args.time) || args.time<0))return Promise.reject(error("invalid_payload","Choose an explicit composition and time"));
     var confirming=action==="checkpoint.restore.confirm",proposing=action==="checkpoint.restore.propose",approval=self.restoreApproval;
     if(confirming){
         self.restoreApproval=null;
@@ -442,7 +447,7 @@ Client.prototype.panel=function(action,args){
     return Promise.resolve().then(function(){
         if(guard.stale || guard.scope!==self.scope() || guard.credential!==self.store.state.credential || context!==self.context())
             throw error("stale_binding","Panel scope changed before dispatch");
-        return self.request(descriptor,guard.credential,"/panel",payload,confirming ? 300000 : 15000);
+        return self.request(descriptor,guard.credential,"/panel",payload,(confirming || proposing) ? 300000 : action==="frame.capture" ? 60000 : 15000);
     }).then(function(response){
         if(!record(response) || Object.keys(response).length!==1 || !Object.prototype.hasOwnProperty.call(response,"result"))throw error("invalid_response","Panel service must return {result}");
         if(guard.stale || guard.scope!==self.scope() || guard.credential!==self.store.state.credential)throw error("stale_binding","Connection or binding changed during panel request");
@@ -471,11 +476,17 @@ Client.prototype.panel=function(action,args){
                 throw error("stale_binding","Project changed during panel request");
         }
         if(confirming){
-            r={checkpointId:r.checkpointId,currentCheckpointId:r.currentCheckpointId,path:r.path,canonicalPath:r.canonicalPath,
+            if(r.previousCheckpointId !== undefined && !text(r.previousCheckpointId,256))throw error("invalid_host_result","Invalid previous disk checkpoint");
+            r={checkpointId:r.checkpointId,currentCheckpointId:r.currentCheckpointId,previousCheckpointId:r.previousCheckpointId || null,path:r.path,canonicalPath:r.canonicalPath,
                 emergencyPath:r.emergencyPath,originalPath:r.originalPath || null,recoveryCopy:r.recoveryCopy,canonicalReplaced:r.canonicalReplaced,
                 rebindRequired:r.rebindRequired,automationSuspended:r.automationSuspended,fingerprint:r.fingerprint,cleanup:r.cleanup,warning:r.warning};
         }
-        if(action==="checkpoints"){
+        if(action==="frame.capture"){
+            var image=r && r.attachment;
+            if(!record(r) || r.compId!==args.compId || r.time!==args.time || !Number.isSafeInteger(r.width) || r.width<1 || r.width>1200 || !Number.isSafeInteger(r.height) || r.height<1 || r.height>2000 ||
+                !record(image) || image.type!=="file" || image.mime!=="image/png" || !text(image.filename,255) || !text(image.url,2800000) || !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(image.url))
+                throw error("invalid_response","Capture did not confirm the requested frame");
+        } else if(action==="checkpoints"){
             if(!Array.isArray(r) || r.length>10000)throw error("invalid_response","Expected bounded checkpoint list");
             r=r.map(function(c){
                 if(!record(c) || !text(c.id,256) || !Number.isFinite(c.createdAt) || typeof c.pinned!=="boolean" || !text(c.storageMode,64) || !Number.isFinite(c.size) || c.size<0)throw error("invalid_response","Invalid checkpoint metadata");
@@ -496,7 +507,7 @@ Client.prototype.panel=function(action,args){
     }).then(function(r){self.panelPending=false;self.panelGuard=null;self.emit();return r;},function(e){
         self.panelPending=false;self.panelGuard=null;
         if(proposing)self.restoreApproval=null;
-        if(action==="checkpoint.restore.confirm" && ["disconnected","invalid_response","stale_binding","outcome_uncertain","uncertain_outcome"].indexOf(e.code)>=0){
+        if((action==="checkpoint.restore.confirm" || action==="frame.capture") && ["disconnected","invalid_response","stale_binding","outcome_uncertain","uncertain_outcome","capture_timeout","timeout","ETIMEDOUT","ECONNRESET"].indexOf(e.code)>=0){
             self.state.busy=true;self.mark(true);
         }
         self.emit();throw e;
@@ -506,7 +517,29 @@ Client.prototype.confirmRestore=function(){
     if(!this.restoreApproval)return Promise.reject(error("invalid_token","Review a checkpoint restore first"));
     return this.panel("checkpoint.restore.confirm",{token:this.restoreApproval.token});
 };
-Client.prototype.mark=function(value){this.store.state.uncertain=value;this.store.save();this.state.uncertain=value;};
+Client.prototype.mark=function(value){
+    this.latchGeneration++;
+    this.store.state.uncertain=value;
+    try { this.store.save(); } catch(e) {
+        // Never advertise a cleared recovery latch before its atomic publication.
+        this.store.state.uncertain=true;this.state.uncertain=true;this.state.busy=true;
+        throw e;
+    }
+    this.state.uncertain=value;
+};
+Client.prototype.persistMark=function(value){
+    var self=this,attempt=0,generation=self.latchGeneration;
+    function save(){
+        if(generation!==self.latchGeneration)return Promise.reject(error("outcome_uncertain","Recovery state changed during metadata publication"));
+        try { self.mark(value); generation=self.latchGeneration; return Promise.resolve(); } catch(e) {
+            generation=self.latchGeneration;
+            // Only repeat local metadata publication, never a host command or reply.
+            if(process.platform!=="win32" || ["EPERM","EACCES","EBUSY"].indexOf(e.code)<0 || attempt===9)return Promise.reject(e);
+            return new Promise(function(resolve){setTimeout(resolve,20*(++attempt));}).then(save);
+        }
+    }
+    return save();
+};
 Client.prototype.discover=function(){
     var d=this.store.descriptor(),prior=this.descriptor;
     if(!prior || prior.instanceId!==d.instanceId || prior.port!==d.port || prior.version!==d.version || prior.protocol!==d.protocol)this.state.compatibility=null;
@@ -639,22 +672,25 @@ Client.prototype.management=function(endpoint){
 };
 Client.prototype.status=function(){
     var self=this;
+    if(self.fileDialogOpen)return Promise.reject(error("host_busy","Close the attachment picker before host access"));
     if(self.recovering)return Promise.reject(error("host_busy","Credential recovery is outstanding"));
     if(self.state.connection==="incompatible")return Promise.reject(error("incompatible_version","Host access is stopped until versions match"));
     return self.host.call("status",{}).then(function(s){
         if(!record(s) || !record(s.project) || !record(s.capabilities) || typeof s.capabilities.fileNetwork!=="boolean" || !text(s.aeVersion,128) ||
             !(s.activeCompId === null || (Number.isSafeInteger(s.activeCompId) && s.activeCompId>0)))throw error("invalid_host_result","Host status incomplete");
         self.state.project=s.project;self.state.activeCompId=s.activeCompId;self.state.capabilities=s.capabilities;self.state.aeVersion=s.aeVersion;
-        if(s.compositions!==undefined && (!Array.isArray(s.compositions) || s.compositions.length>2000 || s.compositions.some(function(c){return !record(c) || !Number.isSafeInteger(c.id) || c.id<1 || typeof c.name!=="string" || c.name.length>32768;})))
+        if(s.compositions!==undefined && (!Array.isArray(s.compositions) || s.compositions.length>2000 || s.compositions.some(function(c){return !record(c) || !Number.isSafeInteger(c.id) || c.id<1 || typeof c.name!=="string" || c.name.length>32768 || c.time!==undefined && (!Number.isFinite(c.time) || c.time<0);})))
             throw error("invalid_host_result","Invalid composition list");
         self.state.compositions=s.compositions || [];
+        if(s.selectedLayers!==undefined && (!Array.isArray(s.selectedLayers) || s.selectedLayers.length>100 || s.selectedLayers.some(function(l){return !record(l) || !Number.isSafeInteger(l.compId) || l.compId<1 || !Number.isSafeInteger(l.layerId) || l.layerId<1 || typeof l.name!=="string" || l.name.length>4096;})))throw error("invalid_host_result","Invalid selected layer context");
+        self.state.selectedLayers=s.selectedLayers || [];
         if(s.uncertain) { self.mark(true); throw error("outcome_uncertain","Host requires recovery"); }
         self.emit();return s;
     });
 };
 Client.prototype.heartbeat=function(){
     var self=this;
-    return self.send("/heartbeat",{project:self.state.project,activeCompId:self.state.activeCompId,capabilities:self.state.capabilities,busy:self.state.busy || self.state.uncertain}).then(function(r){
+    return self.send("/heartbeat",{project:self.state.project,activeCompId:self.state.activeCompId,capabilities:self.state.capabilities,busy:self.state.busy || self.state.uncertain || !!self.fileDialogOpen}).then(function(r){
         if(!record(r) || !Object.prototype.hasOwnProperty.call(r,"binding") || !Object.prototype.hasOwnProperty.call(r,"lock") || !(r.binding=== null || record(r.binding)) || !(r.lock=== null || record(r.lock)))throw error("invalid_response","Malformed heartbeat");
         self.state.binding=r.binding;self.state.lock=r.lock;self.emit();return r;
     });
@@ -691,7 +727,7 @@ Client.prototype.connect=function(){
     });
 };
 Client.prototype.command=function(cmd){
-    var self=this, reply, beatTimer, beat=Promise.resolve(), beatError, finished=false, dispatched=false;
+    var self=this, reply, beatTimer, beat=Promise.resolve(), beatError, finished=false, dispatched=false, persisted=false;
     if(self.state.connection==="incompatible")return Promise.reject(error("incompatible_version","Host automation is stopped until versions match"));
     if(!record(cmd) || Object.keys(cmd).sort().join(",")!=="id,method,params,sessionID" || !text(cmd.id,256) || !text(cmd.sessionID,256) || !record(cmd.params) || ["inspect","preflight","save","execute","open","raw","capture","templates"].indexOf(cmd.method)<0) return Promise.reject(error("invalid_command","Malformed or unsupported command"));
     var b=self.state.binding, writes=["save","execute","open","raw","capture"].indexOf(cmd.method)>=0;
@@ -702,7 +738,7 @@ Client.prototype.command=function(cmd){
     if(!b || !self.state.project || !bound()) return self.send("/reply",{id:cmd.id,error:{code:"binding_suspended",message:"Rebind to the current project"}});
     if(writes && (!self.state.project.saved || !self.state.lock || self.state.lock.state!=="executing")) return self.send("/reply",{id:cmd.id,error:{code:"lock_required",message:"Saved project and executing lock required"}});
     if(self.state.uncertain)return Promise.reject(error("outcome_uncertain","Panel requires reconciliation"));
-    self.mark(true);self.state.busy=true;self.state.capture=cmd.method==="capture" ? cmd.sessionID : null;self.emit();
+    self.state.busy=true;self.state.capture=cmd.method==="capture" ? cmd.sessionID : null;self.emit();
     function keepAlive(){
         beatTimer=setTimeout(function(){
             beat=self.heartbeat().then(function(){if(!bound())throw error("binding_suspended","Binding changed during host call");},function(e){throw e;}).catch(function(e){beatError=e;});
@@ -710,13 +746,14 @@ Client.prototype.command=function(cmd){
         },2000);
     }
     // UI supplies a two-frame paint barrier. A hidden panel must refuse capture, not produce invisible pixels.
-    var painted=cmd.method==="capture" ? self.beforeCapture() : Promise.resolve();
+    var painted=self.persistMark(true).then(function(){persisted=true;return cmd.method==="capture" ? self.beforeCapture() : undefined;});
     return painted.then(function(){return self.heartbeat();}).then(function(){
         if(!bound())throw error("binding_suspended","Binding changed before host dispatch");
         if(writes && (!self.state.lock || self.state.lock.state!=="executing"))throw error("lock_required","Execution lock changed before dispatch");
         keepAlive();dispatched=true;
         return self.host.call(cmd.method,cmd.params,b.project);
     }).then(function(result){return cmd.method==="capture" ? self.normalize(result) : result;}).then(function(result){reply={id:cmd.id,result:result};},function(e){
+        if(!persisted)throw e;
         reply={id:cmd.id,error:{code:e.code || "host_error",message:e.message || "Host failed"}};
     }).then(function(){
         finished=true;clearTimeout(beatTimer);return beat;
@@ -728,7 +765,9 @@ Client.prototype.command=function(cmd){
         // Server must observe idle before it resolves reply and attempts unlock.
         return self.heartbeat();
     }).then(function(){return self.send("/reply",reply);}).then(function(){
-        if(!self.state.uncertain)self.mark(false);
+        if(!self.state.uncertain)return self.persistMark(false);
+    }).then(function(){
+        self.state.busy=self.state.uncertain;
         if(!self.host.pending)self.state.capture=null;
         self.emit();
         if(self.state.uncertain)throw error("outcome_uncertain","Host outcome requires explicit reconciliation");
@@ -738,8 +777,27 @@ Client.prototype.command=function(cmd){
         throw e;
     });
 };
+Client.prototype.beginFileDialog=function(){
+    var self=this;
+    if(self.fileDialogPending || self.fileDialogOpen || self.state.busy || self.state.uncertain || self.panelPending)return Promise.reject(error("host_busy","Wait for active work before browsing files"));
+    self.fileDialogPending=true;
+    return new Promise(function(resolve,reject){
+        var started=Date.now();
+        function ready(){
+            if(self.inFlight || self.host.pending){
+                if(Date.now()-started>30000){self.fileDialogPending=false;reject(error("host_busy","Host work is still pending. Try browsing again when AE is ready."));return;}
+                setTimeout(ready,50);return;
+            }
+            self.fileDialogPending=false;self.fileDialogOpen=true;resolve();
+        }
+        ready();
+    });
+};
+Client.prototype.endFileDialog=function(){this.fileDialogOpen=false;};
 Client.prototype.tick=function(){
     var self=this;
+    if(self.fileDialogPending)return Promise.resolve();
+    if(self.fileDialogOpen)return self.state.connection==="connected" ? self.heartbeat().catch(function(){}) : Promise.resolve();
     if(self.inFlight || self.host.pending || self.state.uncertain || self.state.connection==="incompatible")return Promise.resolve();
     self.inFlight=true;
     return Promise.resolve().then(function(){
@@ -771,4 +829,31 @@ Client.prototype.reconcile=function(){
     self.host.uncertain=false;
     return self.host.call("reconcile",{}).then(function(){self.mark(false);self.state.busy=false;self.state.capture=null;self.state.binding=null;self.state.connection="paired";self.emit();self.start();},function(e){self.host.uncertain=true;throw e;});
 };
-module.exports={Store:Store,automaticStore:automaticStore,Client:Client,HostRPC:HostRPC,request:request,requestId:function(){return crypto.randomBytes(20).toString("hex");},compatibilityMetadata:compatibilityMetadata,normalizeCapture:normalizeCapture,cleanupCapture:cleanupCapture,secure:secure,VERSION:VERSION,PROTOCOL:PROTOCOL};
+function renderDirectory(value){
+    if(!text(value,32767) || !path.isAbsolute(value) || /[\0\r\n]/.test(value) || value.split(/[\\/]/).indexOf("..")>=0)throw error("invalid_path","Choose an absolute output path");
+    return path.dirname(value);
+}
+function revealRenderOutput(file){
+    return Promise.resolve().then(function(){
+        renderDirectory(file.path);
+        if(!/^[a-f0-9]{64}$/.test(file.hash) || !Number.isSafeInteger(file.size) || file.size<1)throw error("invalid_output","Output verification is missing");
+        var info=fs.lstatSync(file.path);
+        if(!info.isFile() || info.isSymbolicLink() || info.size!==file.size)throw error("output_changed","Output changed since verification");
+        return new Promise(function(resolve,reject){
+            var sum=crypto.createHash("sha256"),stream=fs.createReadStream(file.path);
+            stream.on("data",function(data){sum.update(data);});stream.on("error",reject);
+            stream.on("end",function(){
+                if(sum.digest("hex")!==file.hash){reject(error("output_changed","Output hash changed"));return;}
+                if(process.platform==="win32"){
+                    // Explorer hands off to an existing shell and may exit 1 after success.
+                    // A successful spawn acknowledges the reveal request, not file validation.
+                    try{
+                        var reveal=child.spawn("explorer.exe",["/select,"+file.path],{windowsHide:true,stdio:"ignore",shell:false});
+                        reveal.once("error",reject);reveal.once("spawn",function(){reveal.unref();resolve();});
+                    }catch(e){reject(e);}
+                }else child.execFile("open",["-R",file.path],function(e){if(e)reject(e);else resolve();});
+            });
+        });
+    });
+}
+module.exports={renderDirectory:renderDirectory,revealRenderOutput:revealRenderOutput,Store:Store,automaticStore:automaticStore,Client:Client,HostRPC:HostRPC,request:request,requestId:function(){return crypto.randomBytes(20).toString("hex");},compatibilityMetadata:compatibilityMetadata,normalizeCapture:normalizeCapture,cleanupCapture:cleanupCapture,secure:secure,VERSION:VERSION,PROTOCOL:PROTOCOL};

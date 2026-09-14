@@ -11,7 +11,7 @@ import {
 } from "./render-worker.mjs"
 
 const terminal = new Set(["completed", "failed", "cancelled"])
-const jobID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+const jobID = /^(?:g2-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const plain = value => JSON.parse(JSON.stringify(value))
 
 async function progress(job) {
@@ -94,29 +94,41 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
     return await exists(file) ? load(file) : null
   }
   async function release(job) {
-    // Serialize release across renderer instances; never recursively erase a
-    // replacement reservation or foreign entries added to an owned reservation.
-    const lock = path.join(root, "." + job.jobId + ".release-lock")
-    try { await fs.mkdir(lock, { mode: 0o700 }) } catch (error) {
-      if (error.code === "EEXIST") return
-      throw error
-    }
-    try {
-      if (!await exists(job.reservationPath)) return
+    // Every caller holds the kernel-owned job gate. There is no disk latch to
+    // survive a crash. Only the exact owned directory can be resumed or removed.
+    const legacy = path.join(root, "." + job.jobId + ".release-lock")
+    const legacyIdentity = await exists(legacy) ? await directoryIdentity(legacy) : null
+    if (legacyIdentity && (!job.ownership || (await fs.readdir(legacy)).length))
+      fail("render_unknown", "Legacy cleanup ownership is unavailable; preserve it for manual recovery")
+    if (await exists(job.reservationPath)) {
       const identity = await directoryIdentity(job.reservationPath)
       const ownerPath = path.join(job.reservationPath, "owner.json")
-      const before = await signature(ownerPath)
-      const owner = await load(ownerPath)
-      if (owner?.jobId !== job.jobId || owner?.jobDir !== directory(job.jobId)) return
-      if (job.ownership && hash(identity) !== hash(job.ownership.reservation) ||
-          hash((await fs.readdir(job.reservationPath)).sort()) !== hash(["owner.json"]) ||
-          hash(await signature(ownerPath)) !== hash(before) ||
-          hash(await directoryIdentity(job.reservationPath)) !== hash(identity)) {
-        fail("render_unknown", "Reservation changed; left untouched")
+      const names = (await fs.readdir(job.reservationPath)).sort()
+      if (names.length === 0) {
+        // A crash may occur between unlink(owner.json) and rmdir. A durable
+        // directory identity, not absence of a file alone, proves ownership.
+        if (!job.ownership || hash(identity) !== hash(job.ownership.reservation))
+          fail("render_unknown", "Empty reservation has no matching durable owner identity")
+      } else {
+        if (hash(names) !== hash(["owner.json"])) fail("render_unknown", "Reservation contains foreign entries")
+        const before = await signature(ownerPath)
+        const owner = await load(ownerPath)
+        if (owner?.jobId !== job.jobId || owner?.jobDir !== directory(job.jobId)) return
+        if (job.ownership && hash(identity) !== hash(job.ownership.reservation) ||
+            hash(await signature(ownerPath)) !== hash(before) ||
+            hash(await directoryIdentity(job.reservationPath)) !== hash(identity))
+          fail("render_unknown", "Reservation changed; left untouched")
+        await fs.unlink(ownerPath)
       }
-      await fs.unlink(ownerPath)
+      if (hash(await directoryIdentity(job.reservationPath)) !== hash(identity))
+        fail("render_unknown", "Reservation directory was replaced; left untouched")
       await fs.rmdir(job.reservationPath)
-    } finally { await fs.rmdir(lock) }
+    }
+    if (legacyIdentity) {
+      if (hash(await directoryIdentity(legacy)) !== hash(legacyIdentity) || (await fs.readdir(legacy)).length)
+        fail("render_unknown", "Legacy cleanup marker changed; left untouched")
+      await fs.rmdir(legacy)
+    }
   }
   async function releaseCheckpoint(job, worker) {
     // Inspection errors must also block legacy receipt cleanup and reservation release.
@@ -573,7 +585,7 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
     const destinationDir = path.dirname(destination)
     if (await fs.realpath(destinationDir) !== destinationDir) fail("render_grant", "Grant destination is not canonical")
     const expectedOutputs = outputSpec(destination, input.startFrame, input.endFrame)
-    const id = randomUUID()
+    const id = "g2-" + randomUUID()
     const jobDir = directory(id)
     const job = {
       version: 2, jobId: id, state: "starting", createdAt: timestamp(), updatedAt: timestamp(),
@@ -654,7 +666,7 @@ export async function createRenderer({ dataDir, grants, checkpoints, aerenderPat
       } else {
         // No process can exist before a durable manifest.
         if (created) await fs.rm(jobDir, { recursive: true, force: true })
-        await release(job)
+        await withJobLock(jobDir, () => release(job))
       }
       throw error
     }

@@ -8,9 +8,9 @@
 
 <meta name="viewport" content="width=device-width,initial-scale=1">
 
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
 
-<title>CookieMonster AE</title>
+<title>CookieJar-AE</title>
 
 <link rel="stylesheet" href="panel.css">
 
@@ -20,63 +20,60 @@
 
 <main>
 
-<header><div class="brand"><span class="brand-mark" aria-hidden="true">C</span><h1>CookieMonster</h1><span class="host-label">After Effects</span></div><span id="connection-status" role="status">Connecting…</span></header>
-
-<section class="chat" aria-label="Project chat">
-
-<div class="chat-heading"><h2 id="chat-project-name">Opening projectâ€¦</h2><button id="chat-new" type="button">New chat</button></div>
-
+<header><button id="chat-conversations-open" type="button" class="header-menu" aria-label="Conversations" title="Conversations" aria-expanded="false" aria-controls="chat-conversations">☰</button><div class="brand"><img class="brand-mark" src="brand-dev.png" alt="" aria-hidden="true"><h1>CookieJar-AE</h1><span id="chat-title" title="Current conversation">New conversation</span></div>
+<div class="header-composition"><h2 id="chat-project-name" class="header-project-name">Opening project…</h2>
 <label class="sr-only" for="chat-comp">Composition</label>
-
-<select id="chat-comp"><option value="follow">Follow active composition</option></select>
-
+<select id="chat-comp" aria-describedby="chat-target"><option value="follow">Follow active composition</option></select>
 <p id="chat-target">Following active composition</p>
-
-<section id="recovery-notice" class="notice" aria-label="Recovery needed" hidden><h2>Check After Effects before continuing</h2><p id="recovery-message"></p><button id="reconcile" type="button">I checked AE — continue</button></section>
-
-<p id="connection-notice" class="notice" role="status" hidden></p>
-
-<p id="capture" class="capture" role="status" aria-live="assertive" hidden></p>
-
-<select id="chat-workspace" aria-label="CookieMonster workspace" hidden></select>
-
-<button id="chat-takeover" type="button" hidden>Take control for this chat</button>
-
-<div id="chat-messages" role="log" aria-label="Conversation"></div>
-
-<div id="chat-approvals" aria-live="polite"></div>
-
-<p id="chat-error" role="alert"></p>
-
-<form id="chat-form">
-
-<div class="chat-model-controls"><label>Model<select id="chat-model"><option value="">CookieMonster default</option></select></label><label>Reasoning<select id="chat-reasoning"><option value="default">Default</option></select></label></div>
-<p id="chat-model-status" role="status"></p>
-
-<label class="sr-only" for="chat-input">Message CookieMonster</label>
-
-<div id="chat-attachments" aria-live="polite"></div>
-<input id="chat-files" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf,.txt,.md" multiple hidden>
-<textarea id="chat-input" rows="3" maxlength="16000" placeholder="What should we work on?"></textarea>
-
-<p class="attachment-help">Drop or paste references · Up to 4 files, 2 MB total</p>
-<div class="chat-actions"><button id="chat-attach" type="button">Attach</button><button id="chat-mention" type="button">@ Mention comp</button><span id="chat-progress" role="status">Connectingâ€¦</span><button id="chat-stop" type="button" disabled>Stop</button><button id="chat-send" type="submit" disabled>Send</button></div>
-
-</form>
-
+<p id="chat-selected-layers" aria-live="polite"></p>
+</div>
+<div class="header-controls"><span id="connection-status" class="is-disconnected" role="status">Not connected</span><details id="advanced"><summary id="settings-toggle" aria-label="Settings and troubleshooting" title="Settings &amp; troubleshooting">⚙</summary><div class="advanced-content" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+<aside class="settings-sidebar">
+<div class="settings-sidebar-heading"><h2 id="settings-title">Settings</h2><button id="settings-close" class="settings-close" type="button" aria-label="Close settings">×</button></div>
+<p class="settings-nav-label">Preferences</p>
+<nav class="settings-nav" aria-label="Settings sections">
+<button id="settings-nav-general" class="settings-nav-item is-active" type="button" aria-controls="settings-general" aria-current="page">General</button>
+<button id="settings-nav-connection" class="settings-nav-item" type="button" aria-controls="settings-connection">Connection</button>
+<button id="settings-nav-capture" class="settings-nav-item" type="button" aria-controls="settings-capture">Capture &amp; recovery</button>
+<button id="settings-nav-permissions" class="settings-nav-item" type="button" aria-controls="settings-permissions">Permissions</button>
+<button id="settings-nav-services" class="settings-nav-item" type="button" aria-controls="settings-services">Bridge services</button>
+</nav>
+<div class="settings-build"><span>Development build</span><small>Panel 0.2.3</small></div>
+</aside>
+<div class="settings-content">
+<section id="settings-general" class="settings-page" aria-labelledby="settings-general-heading">
+<div class="settings-page-header"><p>Settings</p><h2 id="settings-general-heading">General</h2><span>Project recovery and build information.</span></div>
+<section class="settings-card" aria-label="Presentation preferences">
+<label for="preference-textSize">Text size</label><select id="preference-textSize"><option value="small">Small</option><option value="normal">Normal</option><option value="large">Large</option></select>
+<label for="preference-density">Interface density</label><select id="preference-density"><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select>
+<label for="preference-sendKey">Send message</label><select id="preference-sendKey"><option value="enter">Enter (Shift+Enter for a new line)</option><option value="modifier">Ctrl / Cmd + Enter (Enter for a new line)</option></select>
+<label for="preference-activity">Activity and reasoning details</label><select id="preference-activity"><option value="auto">Open while working, collapse when finished</option><option value="collapsed">Start collapsed</option><option value="expanded">Start expanded</option></select>
+<p>Individual message choices are kept. These preferences do not change tool permissions.</p>
+<button id="preferences-reset" type="button">Reset presentation preferences</button><p id="preferences-status" role="status"></p>
 </section>
-
-<details id="advanced"><summary>Settings &amp; troubleshooting</summary><div class="advanced-content"><p class="qualification">Development build · Use disposable projects for testing.</p>
+<section class="settings-checkpoints" aria-label="Restore project checkpoint">
+<button id="chat-checkpoints-toggle" type="button" aria-expanded="false" aria-controls="chat-checkpoints">Restore checkpoint…</button>
+<section id="chat-checkpoints" aria-label="Project checkpoints" hidden>
+<label for="chat-checkpoint-picker">Saved project state</label>
+<select id="chat-checkpoint-picker" aria-describedby="chat-checkpoint-help"></select>
+<p id="chat-checkpoint-help" role="status"></p>
+<button id="chat-checkpoint-review" type="button" disabled>Review restore…</button>
+</section>
+</section><div class="settings-card"><h3>Build qualification</h3><p class="qualification">Development build · Use disposable projects for testing.</p>
 
 <p>Targets AE 25/26. No point versions certified. Use disposable projects until the qualification matrix is supplied.</p>
 
-<section aria-labelledby="status-heading">
+</div>
+</section>
+<section id="settings-connection" class="settings-page" aria-labelledby="status-heading" hidden>
+<div class="settings-page-header"><p>Settings</p><h2>Connection</h2><span>CookieMonster, bridge, project, and session status.</span></div>
+<section class="settings-card" aria-labelledby="status-heading">
 
 <h2 id="status-heading">Connection</h2>
 
 <p id="status" role="status" aria-live="polite">Starting panel...</p>
 
-<dl><dt>Versions</dt><dd id="versions">Panel 0.2.2</dd><dt>Project</dt><dd id="project">Unknown</dd><dt>Following</dt><dd id="active-comp">No active composition</dd><dt>Session</dt><dd id="binding">Connecting automatically</dd><dt>Lock</dt><dd id="lock">Unknown</dd></dl>
+<dl><dt>Versions</dt><dd id="versions">Panel 0.2.3</dd><dt>Project</dt><dd id="project">Unknown</dd><dt>Following</dt><dd id="active-comp">No active composition</dd><dt>Session</dt><dd id="binding">Connecting automatically</dd><dt>Lock</dt><dd id="lock">Unknown</dd></dl>
 
 <p id="error" role="alert"></p>
 
@@ -84,7 +81,7 @@
 
 <p>Connects automatically to CookieMonster on this computer. Ask CookieMonster to inspect AE to start working. If several AE instances are open, select the target in chat.</p>
 
-<details>
+<details class="settings-card">
 
 <summary id="pair-heading">Connection recovery &amp; advanced settings</summary>
 
@@ -112,7 +109,10 @@
 
 </details>
 
-<section aria-labelledby="capture-heading">
+</section>
+<section id="settings-capture" class="settings-page" aria-labelledby="capture-heading" hidden>
+<div class="settings-page-header"><p>Settings</p><h2>Capture &amp; recovery</h2><span>Frame capture and interrupted-action safeguards.</span></div>
+<section class="settings-card">
 
 <h2 id="capture-heading">Capture &amp; Recovery</h2>
 
@@ -122,11 +122,13 @@
 
 <p>Timed-out scripts are never retried. Wait for AE to return, inspect the project and queue, then clear the local latch. Rebind and reconcile the durable lock in chat separately.</p>
 
-
+</section>
 
 </section>
 
-<section aria-labelledby="preference-heading">
+<section id="settings-permissions" class="settings-page" aria-labelledby="preference-heading" hidden>
+<div class="settings-page-header"><p>Settings</p><h2>Permissions</h2><span>After Effects file and network access required by the bridge.</span></div>
+<section class="settings-card">
 
 <h2 id="preference-heading">File &amp; Network Permission</h2>
 
@@ -135,8 +137,11 @@
 <p>Windows: Edit &gt; Preferences &gt; Scripting &amp; Expressions. macOS: After Effects &gt; Settings (Preferences) &gt; Scripting &amp; Expressions. Enable &quot;Allow Scripts to Write Files and Access Network&quot; yourself. This panel never changes that preference.</p>
 
 </section>
+</section>
 
-<section aria-labelledby="services-heading">
+<section id="settings-services" class="settings-page" aria-labelledby="services-heading" hidden>
+<div class="settings-page-header"><p>Settings</p><h2>Bridge services</h2><span>Checkpoints, render jobs, diagnostics, and compatibility.</span></div>
+<section class="settings-card settings-services-card">
 
 <h2 id="services-heading">Bridge Services</h2>
 
@@ -179,6 +184,20 @@
 </div>
 
 <h3>Render Jobs</h3>
+<section id="render-dashboard" aria-label="Render dashboard">
+<p>Render a saved checkpoint separately. Each operation is reviewed before it proceeds.</p>
+<label for="render-comp">Composition</label><select id="render-comp"></select>
+<button id="render-templates" type="button">Discover templates…</button>
+<label for="render-settings">Render settings</label><select id="render-settings"></select>
+<label for="render-output">Output module</label><select id="render-output"></select>
+<label for="render-start">First frame (inclusive)</label><input id="render-start" type="number" min="0" step="1" value="0">
+<label for="render-end">Last frame (inclusive)</label><input id="render-end" type="number" min="0" step="1" value="0">
+<label for="render-path">Output file (absolute path)</label><input id="render-path" type="text" placeholder="D:\Renders\title.mov">
+<button id="render-submit" type="button">Review render…</button><button id="render-refresh" type="button">Refresh jobs</button>
+<p id="render-status" role="status" aria-live="polite"></p>
+<section id="render-review" aria-label="Render operation review" hidden><pre id="render-review-text"></pre><button id="render-approve" type="button">Approve once</button><button id="render-deny" type="button">Cancel operation</button></section>
+<div id="render-job-list"></div>
+</section>
 
 <ul id="renders"><li>Not requested</li></ul>
 
@@ -207,12 +226,133 @@
 <p><a id="release-source" target="_blank" rel="noopener noreferrer" hidden>Public Release Source</a> Release source is not an approved internal installer. Ask your administrator when updates are not configured.</p>
 
 </section>
+</section>
 
+</div></div></details></div></header>
+
+<section class="chat" aria-label="Project chat">
+
+
+<section id="chat-conversations" role="dialog" aria-modal="true" aria-label="Project conversations" hidden>
+<div class="chat-heading"><h2>Conversations</h2><button id="chat-conversations-close" type="button" aria-label="Close conversations">×</button></div>
+<p id="conversation-project"></p><button id="chat-new" type="button" aria-label="New chat">+ New chat</button><p id="conversation-switch-status" role="status"></p><label for="chat-conversations-search">Search conversations</label>
+<input id="chat-conversations-search" type="search" maxlength="256" placeholder="Search by title">
+<button id="chat-conversations-search-button" type="button">Search</button>
+<p id="chat-conversations-status" role="status"></p>
+<div id="chat-conversations-list"></div>
+<div class="buttons"><button id="chat-conversations-prev" type="button">Previous</button><button id="chat-conversations-next" type="button">Next</button></div>
+<form id="chat-conversation-rename" hidden>
+<label for="chat-conversation-title">Conversation title</label><input id="chat-conversation-title" maxlength="200" required>
+<div class="buttons"><button id="chat-conversation-save" type="submit">Save title</button><button id="chat-conversation-cancel" type="button">Cancel rename</button></div>
+</form>
+</section>
+
+
+
+
+
+<section id="recovery-notice" class="notice" aria-label="Recovery needed" hidden><h2>Check After Effects before continuing</h2><p id="recovery-message"></p><button id="reconcile" type="button">I checked AE — continue</button></section>
+
+<p id="connection-notice" class="notice" role="status" hidden></p>
+
+<p id="capture" class="capture" role="status" aria-live="assertive" hidden></p>
+
+<select id="chat-workspace" aria-label="CookieMonster workspace" hidden></select>
+
+<button id="chat-takeover" type="button" hidden>Take control for this chat</button>
+
+<button id="chat-history" type="button" hidden>Load earlier messages</button>
+<div id="chat-messages" role="log" aria-label="Conversation"></div>
+
+<div id="chat-approvals" aria-live="polite"></div>
+
+<p id="chat-error" role="alert"></p>
+
+<p id="chat-restore-status" class="notice" role="status" hidden></p>
+<section id="chat-restore-review" class="chat-approval" hidden aria-label="Review project restore">
+<h3>Restore the project to before this edit?</h3>
+<p>Your current work will be saved and backed up first. This restores the whole project, not just this composition. Chat history stays visible as history; previous edits will not run again.</p>
+<pre id="chat-restore-operation"></pre>
+<button id="chat-restore-confirm" type="button">Save current work and restore</button>
+<button id="chat-restore-cancel" type="button">Cancel</button>
+</section>
+
+<section id="chat-technique" class="chat-approval" role="dialog" aria-modal="true" hidden aria-label="Save technique">
+<h3>Save technique</h3>
+<p>Edit the completed reply into reusable instructions. Remove project-specific details and secrets. Only these reviewed fields will be saved.</p>
+<label for="technique-name">Name</label><input id="technique-name" maxlength="64" placeholder="brand-title-motion">
+<label for="technique-description">Description</label><input id="technique-description" maxlength="1024">
+<label for="technique-instructions">Instructions</label><textarea id="technique-instructions" rows="8" maxlength="64000"></textarea>
+<label for="technique-scope">Scope</label><select id="technique-scope"><option value="workspace">This CM workspace</option><option value="global">Global CM skills</option></select>
+<p id="technique-workspace"></p>
+<p>Workspace skills are shared by conversations using that CM directory, not isolated to this .aep file.</p>
+<pre id="technique-review"></pre>
+<p id="technique-status" role="status"></p>
+<button id="technique-review-button" type="button">Review save</button>
+<button id="technique-confirm" type="button" hidden>Save skill</button>
+<button id="technique-cancel" type="button">Cancel</button>
+</section>
+
+<section id="skill-manager" class="chat-approval" role="dialog" aria-modal="true" aria-label="Manage skill" hidden>
+<h3>Manage skill</h3>
+<p id="skill-manager-location"></p>
+<label for="skill-manager-name">Skill name</label><input id="skill-manager-name" maxlength="64">
+<label for="skill-manager-description">Skill description</label><input id="skill-manager-description" maxlength="1024">
+<label for="skill-manager-content">Skill instructions</label><textarea id="skill-manager-content" rows="6" maxlength="64000"></textarea>
+<p id="skill-manager-status" role="status"></p><pre id="skill-manager-review"></pre>
+<button id="skill-manager-copy" type="button">Copy skill</button>
+<button id="skill-manager-edit" type="button">Review changes</button>
+<button id="skill-manager-delete" type="button">Review deletion</button>
+<button id="skill-manager-confirm" type="button" hidden>Confirm change</button>
+<button id="skill-manager-close" type="button">Close</button>
+</section>
+<form id="chat-form">
+<div id="chat-retry-note" class="notice" role="status" hidden>New attempt from the current AE state. Previous messages and edits remain. Use Restore first to undo earlier edits. Review the target, references and skill before sending. <button id="chat-retry-cancel" type="button">Cancel retry</button></div>
+<section id="chat-target-picker" role="dialog" aria-modal="true" aria-label="Composition and layer references" hidden>
+<div class="chat-heading"><h2>Reference a composition or layer</h2><button id="target-close" type="button" aria-label="Close references">×</button></div>
+<label for="target-scope">Search in</label><select id="target-scope"></select>
+<label for="target-search">Name or ID</label><input id="target-search" type="search" maxlength="256">
+<button id="target-find" type="button">Search</button><p id="target-status" role="status"></p><div id="target-results"></div>
+<button id="target-next" type="button" disabled>Next page</button>
+</section>
+<div id="chat-references" aria-live="polite"></div>
+
+<p id="chat-skill-status" role="status"></p>
+
+<label class="sr-only" for="chat-input">Message CookieMonster</label>
+
+<div id="chat-attachments" aria-live="polite"></div>
+<input id="chat-files" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,.txt,.md,.csv,.json,.jsx,.js,.ts,.tsx,.xml,.yaml,.yml,.toml,.html,.css,.py,.sql,.log,.ini,.conf,.c,.cc,.cjs,.cpp,.cts,.env,.go,.gql,.graphql,.h,.hh,.hpp,.htm,.java,.jsonld,.mdx,.mjs,.mts,.rb,.rs,.sass,.scss,.sh,.zsh" multiple hidden>
+<textarea id="chat-input" rows="2" maxlength="16000" placeholder="Ask anything about your composition…"></textarea>
+
+<div class="chat-actions"><details id="chat-skills"><summary title="Reusable skills">Skills⌄</summary><div class="skills-popup">
+<label for="chat-skill-search">Search skills</label><input id="chat-skill-search" type="search" maxlength="256" placeholder="Name or description">
+<select id="chat-skill-picker" aria-label="Reusable skill"><option value="">No skill selected</option></select>
+<button id="chat-skills-refresh" type="button">Refresh skills</button>
+<button id="chat-skill-manage" type="button" disabled>Manage selected skill</button>
+<p id="chat-skill-workspace"></p>
 </div></details>
+<button id="chat-attach" class="composer-icon" type="button" aria-label="Attach references" title="Attach references · Up to 4 files, 10 MB total">+</button>
+<button id="chat-capture" class="composer-icon" type="button" aria-label="Attach current frame" title="Attach current composition frame with alpha">▣</button>
+<div class="chat-model-controls"><span class="composer-model-mark" aria-hidden="true">✧</span><label><span class="sr-only">Model</span><select id="chat-model" title="Model"><option value="">CookieMonster default</option></select></label><label class="composer-reasoning"><span class="sr-only">Reasoning</span><select id="chat-reasoning" title="Reasoning effort"><option value="default">Default</option></select></label></div>
+<button id="chat-mention" class="composer-icon" type="button" aria-label="Reference a composition or layer" title="Reference a composition or layer">@</button>
+<button id="chat-stop" class="composer-icon" type="button" aria-label="Stop generation" title="Stop generation" disabled>■</button>
+<button id="chat-send" class="composer-icon" type="submit" aria-label="Send message" title="Send message" disabled>↑</button>
+</div>
+<p id="chat-model-status" role="status"></p>
+<span id="chat-progress" class="sr-only" role="status">Connecting…</span>
+
+</form>
+
+</section>
+
+
 
 </main>
 
 <script src="chat.js"></script>
+<script src="preferences.js"></script>
+<script src="render.js"></script>
 
 <script src="ui.js"></script>
 

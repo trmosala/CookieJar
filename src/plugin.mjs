@@ -9,8 +9,9 @@ import { createWorkflow } from "./workflow.mjs"
 import { createRenderer } from "./render.mjs"
 import { createDiagnostics } from "./diagnostics.mjs"
 import { createChat } from "./chat.mjs"
+import { createPanelRender } from "./panel-render.mjs"
 import { capture, captureArgs, safeRefusals } from "./capture.mjs"
-import { AE_PERMISSIONS } from "./config.mjs"
+import { AE_PERMISSIONS, CLIENT_BUILD } from "./config.mjs"
 import { fail, hash, PROPOSAL_TTL, releaseMetadata } from "./protocol.mjs"
 
 const text = z.string().min(1).max(256)
@@ -40,11 +41,19 @@ function policyRules(policy, name) {
   return values
 }
 
-export function checkPermissionConfig(config, name, { configure = false } = {}) {
+export function checkPermissionConfig(config, name, { configure = false, requireReview = CLIENT_BUILD } = {}) {
   if (!object(config)) fail("permission_policy_required", "The CookieMonster config hook must run before privileged tools")
   const agents = [...Object.values(config.agent || {}), ...Object.values(config.mode || {})]
   for (const tool of name ? [name] : privileged) {
     const policies = [config.permission, ...agents.map(agent => agent?.permission)]
+    if (tool === "ae_execute" && !requireReview) {
+      const rules = policies.flatMap(policy => policyRules(policy, tool))
+      if (!configure) {
+        if (!rules.length || rules.includes("deny")) fail("permission_denied", "Script execution is denied by policy")
+        return rules.includes("ask") ? "ask" : "allow"
+      }
+      continue
+    }
     // Conservatively reject ANY matching allow, including wildcard and agent overrides.
     // The SDK has no force-once flag; always:[] cannot override a configured allow.
     if (policies.some(policy => policyRules(policy, tool).includes("allow")))
@@ -68,7 +77,10 @@ function current(r, c, expected, options = {}) {
 async function approval(r, c, name, summary, metadata = {}) {
   c.check()
   if (typeof r.permissionPolicy !== "function") fail("permission_policy_required", "A checked permission policy is required")
-  r.permissionPolicy(name)
+  const policy = r.permissionPolicy(name)
+  // Only this tool's workflow unconditionally saves and verifies a checkpoint
+  // before dispatch. Restore and other privileged operations still require review.
+  if (name === "ae_execute" && policy === "allow") { c.check(); return }
   if (typeof c.ask !== "function") fail("permission_required", "Explicit permission callback required")
   let listener
   const signals = [c.abort, c.lifetime].filter(Boolean)
@@ -96,6 +108,13 @@ async function snapshot(r, c, b, expected) {
   const inspected = await r.workflow.inspect(c.sessionID)
   current(r, c, b, { allowLocked: true })
   if (expected && inspected.fingerprint !== expected) fail("stale_fingerprint", "Project changed since review")
+  return inspected
+}
+async function restoreSnapshot(r, c, b, expected) {
+  current(r, c, b, { allowLocked: true })
+  const inspected = await r.workflow.inspectRestore(c.sessionID)
+  current(r, c, b, { allowLocked: true })
+  if (expected && inspected.fingerprint !== expected) fail("stale_fingerprint", "Project changed since restore review")
   return inspected
 }
 async function checkpoint(r, c, b, checkpointId) {
@@ -297,6 +316,11 @@ export function createTools(runtime) {
             check()
           }
           const result = await execute(parsed, c, askFor(r, c, name))
+          if (name === "ae_reconcile") await r.chat?.recordReconciliation(c.sessionID, c.deliveryReview)
+          if (name === "ae_restore") await r.chat?.recordRestore(c.sessionID, { status: "completed",
+            checkpointId: result.checkpointId, currentCheckpointId: result.currentCheckpointId,
+            previousCheckpointId: result.previousCheckpointId,
+            recoveryCopy: result.recoveryCopy, path: result.path, emergencyPath: result.emergencyPath, warning: result.warning })
           if (name !== "ae_release" && name !== "ae_bind") check()
           if (name !== "ae_release" && !lifetime?.aborted) r.diagnostics?.record(c.sessionID, name.slice(3), "ok", { durationMs: performance.now() - started })
           return name === "ae_capture" ? result : JSON.stringify(result ?? null)
@@ -349,7 +373,7 @@ export function createTools(runtime) {
     }).strict()).max(32).optional(),
     depth: z.number().int().min(0).max(8).optional(), cursor: z.string().min(1).max(8192).optional(),
   }, (a, c) => r.workflow.inspectQuery(c.sessionID, a))
-  tool("ae_execute", "Review exact ExtendScript source and execute against expectedRevision from ae_inspect after a verified checkpoint. Unsandboxed: external effects cannot be rolled back; partial changes may remain. No automatic rollback or retry.", {
+  tool("ae_execute", "Execute ExtendScript against expectedRevision from ae_inspect after saving and verifying a checkpoint. Runs without a permission prompt by default; explicit ask or deny policy is respected. Unsandboxed: external effects cannot be rolled back; partial changes may remain. No automatic rollback or retry.", {
     source: z.string().min(1).max(262144).regex(/^[^\u0000]*$/),
     expectedRevision: z.string().regex(/^[a-f0-9]{64}$/), label: z.string().min(1).max(128).regex(/^[^\u0000-\u001f]*$/),
   }, (a, c, ask) => r.workflow.executeScript(c.sessionID, a, ask))
@@ -460,7 +484,10 @@ export function createTools(runtime) {
       compatibility: r.bridge.compatibility(c.sessionID) })
   })
   tool("ae_reconcile", "Review uncertain outcome evidence before unlocking; never retries a command.", {},
-    (_, c, ask) => r.workflow.reconcile(c.sessionID, ask))
+    (_, c, ask) => {
+      c.deliveryReview = r.chat?.deliveryReview(c.sessionID) ?? null
+      return r.workflow.reconcile(c.sessionID, ask, { reviewRequired: c.deliveryReview !== null })
+    })
   return tools
 }
 
@@ -548,7 +575,11 @@ export async function createRuntime(options = {}) {
         return closePromise
       },
     }
+    r.panelRender = createPanelRender({ now: r.now, execute(tool, args, context) {
+      return createTools({ ...r, permissionPolicy: name => r.chat.permissionPolicy(context.sessionID, name) })[tool].execute(args, context)
+    } })
     function cleanup(sessionID) {
+      r.panelRender.release(sessionID)
       diagnostics.release(sessionID); tokens.delete(sessionID)
       for (const [jobId, owner] of jobs) if (owner.sessionID === sessionID) {
         recovered.add(jobId)
@@ -576,19 +607,39 @@ async function panel(r, input) {
   const schemas = {
     checkpoints: {}, "checkpoint.pin": { id: text, pinned: z.boolean() }, "checkpoint.delete": { id: text },
     "checkpoint.restore.propose": { id: text }, "checkpoint.restore.confirm": { token: text },
-    renders: {}, diagnostics: {},
+    renders: {}, diagnostics: {}, "frame.capture": { compId: captureArgs.compId, time: captureArgs.time },
+    "render.start": { tool: text, args: z.record(z.string(), z.unknown()) },
+    "render.poll": { token: text }, "render.reply": { token: text, approvalID: text, allow: z.boolean() },
   }
   if (!Object.hasOwn(schemas, body?.action)) fail("invalid_payload", "Unknown panel action")
   const a = z.object({ action: z.literal(body.action), ...schemas[body.action] }).strict().parse(body)
   const consent = async () => { current(r, c, b); return true }
+  if (a.action === "render.start") {
+    await r.chat?.assertRestorable(sessionID)
+    return r.panelRender.start(sessionID, b.id, a.tool, a.args, () => current(r, c, b, { allowLocked: true }))
+  }
+  if (a.action === "render.poll") return r.panelRender.poll(sessionID, b.id, a.token)
+  if (a.action === "render.reply") return r.panelRender.reply(sessionID, b.id, a.token, a.approvalID, a.allow)
+  if (a.action === "frame.capture") {
+    await r.chat?.assertRestorable(sessionID)
+    current(r, c, b, { write: true })
+    // The explicit panel click approves only this frozen composition/time.
+    // Reuse the tool's capture guards, lock, PNG validation and uncertainty path.
+    const result = await capture(r, sessionID, { compId: a.compId, time: a.time, alpha: true, maxWidth: 1200 }, consent, c.check)
+    const attachment = result.attachments[0]
+    if (Buffer.from(attachment.url.slice(attachment.url.indexOf(",") + 1), "base64").length > 2 * 1024 * 1024)
+      fail("payload_too_large", "Captured frame exceeds the 2 MB attachment limit. Nothing was attached")
+    return { attachment, ...JSON.parse(result.output) }
+  }
   if (a.action === "checkpoints") return (await checkpointList(r, c)).map(record => ({
     id: record.id, createdAt: Date.parse(record.createdAt), pinned: record.pinned, storageMode: record.storageMode, size: record.size,
   }))
   if (a.action === "checkpoint.pin" || a.action === "checkpoint.delete")
     return mutateCheckpoint(r, c, { ...a, action: a.action.slice(11) }, consent)
   if (a.action === "checkpoint.restore.propose") {
+    await r.chat?.assertRestorable(sessionID)
     current(r, c, b, { write: true })
-    const before = await snapshot(r, c, b), record = await checkpoint(r, c, b, a.id)
+    const before = await restoreSnapshot(r, c, b), record = await checkpoint(r, c, b, a.id)
     let review
     const stop = new Error("Review only")
     try {
@@ -618,18 +669,34 @@ async function panel(r, input) {
     r.tokens.delete(sessionID)
     if (!plan || plan.token !== a.token || r.now() >= plan.expiresAt) fail("invalid_token", "Restore approval expired or was already consumed")
     current(r, c, plan.binding, { write: true })
-    await snapshot(r, c, plan.binding, plan.fingerprint)
+    await restoreSnapshot(r, c, plan.binding, plan.fingerprint)
     const record = await checkpoint(r, c, b, plan.checkpointId)
     if (record.hash !== plan.checkpointHash || (await stat(b.project.path)).mtimeMs !== plan.destinationTimestamp)
       fail("stale_fingerprint", "Reviewed source or destination changed")
-    return r.workflow.restore(sessionID, plan.checkpointId, async (operation, metadata) => {
-      if (operation !== plan.operation || hash(metadata) !== plan.reviewHash)
-        fail("stale_fingerprint", "Restore operation changed; review it again")
-      if (r.now() >= plan.expiresAt) fail("invalid_token", "Restore approval expired")
-      await snapshot(r, c, plan.binding, plan.fingerprint)
-      if ((await stat(b.project.path)).mtimeMs !== plan.destinationTimestamp) fail("stale_fingerprint", "Destination changed")
-      return true
-    })
+    await r.chat?.assertRestorable(sessionID)
+    let started = false
+    try {
+      const restored = await r.workflow.restore(sessionID, plan.checkpointId, async (operation, metadata) => {
+        if (operation !== plan.operation || hash(metadata) !== plan.reviewHash)
+          fail("stale_fingerprint", "Restore operation changed; review it again")
+        if (r.now() >= plan.expiresAt) fail("invalid_token", "Restore approval expired")
+        await restoreSnapshot(r, c, plan.binding, plan.fingerprint)
+        if ((await stat(b.project.path)).mtimeMs !== plan.destinationTimestamp) fail("stale_fingerprint", "Destination changed")
+        await r.chat?.recordRestore(sessionID, { status: "pending", checkpointId: plan.checkpointId })
+        started = true
+        return true
+      })
+      await r.chat?.recordRestore(sessionID, { status: "completed", checkpointId: restored.checkpointId,
+        currentCheckpointId: restored.currentCheckpointId, previousCheckpointId: restored.previousCheckpointId, recoveryCopy: restored.recoveryCopy,
+        path: restored.path, emergencyPath: restored.emergencyPath, warning: restored.warning })
+      return restored
+    } catch (error) {
+      if (started) await r.chat?.recordRestore(sessionID, { status: "unconfirmed", checkpointId: plan.checkpointId,
+        emergencyPath: error.details?.emergencyPath || null, currentCheckpointId: error.details?.currentCheckpointId || null,
+        previousCheckpointId: error.details?.previousCheckpointId || null,
+        message: "Restore was not confirmed. Inspect After Effects and retain the recovery files before continuing." })
+      throw error
+    }
   }
   if (a.action === "renders") return jobList(r, c)
   const all = await r.renderer.list()
@@ -662,7 +729,8 @@ export async function server(_input, options = {}) {
   try { runtime = await entry.promise } catch (error) { entry.refs--; throw error }
   if (!entry.chat) entry.chat = createChat(runtime)
   const chat = await entry.chat
-  const unregisterChat = chat.register(_input)
+  runtime.chat = chat
+  const unregisterChat = chat.register({ ..._input, permissionPolicy: name => checkPermissionConfig(config, name) })
   runtime.bridge.setChatHandler(chat.handle)
   const owned = new Set(), owner = Symbol("plugin-instance")
   let disposed = false, disposePromise, config

@@ -10,6 +10,8 @@ Project changes switch project conversations and pause outstanding work. They mu
 
 ## Current implementation — 0.2.2
 
+Completed edits show a **Before this edit** checkpoint card. Restore reviews the exact saved project state, preserves current unsaved work first, and records the outcome in the conversation. Earlier messages remain history and cannot replay edits automatically. The panel reconnects the existing conversation when reviewing a checkpoint.
+
 Model and reasoning controls sit above the composer. The plugin reads CM's connected provider catalog and persists changes through CM's existing session model endpoint. Reopening AE restores the session selection; new messages explicitly carry that choice. Busy conversations and uncertain delivery block changes, and unavailable models or reasoning levels are rejected before dispatch. Providers that encode reasoning in separate model presets retain those names; separate reasoning options appear only when CM advertises variants.
 
 The CEP panel now contains project chat backed by the CM plugin's authenticated SDK client. It creates and resumes CM conversations per project, displays incremental replies and captured frames, and offers inline approve-once/reject controls. A composition picker follows the active viewer by default; selecting an explicit composition pins it. The mention button inserts its name and persistent ID. Duplicate names remain distinguishable by ID. Each submitted message carries a fixed target that is validated against AE before submission.
@@ -22,4 +24,4 @@ The CM workspace/model configuration remains authoritative. The panel selects a 
 
 Replies update through one-second snapshots of CM's messages rather than a separate model runtime. The panel shows the most recent 60 messages and a bounded set of captured images; full history stays in CM. Pin preferences retain the most recent 20 projects. Clarifying questions arrive as normal chat replies. Very large approval details require review in CM rather than approval from a truncated preview. The extension remains a development build pending native CEP/browser qualification across supported AE versions.
 
-The AE composer now supports image and brief references: browse, drop or paste, review/remove before sending, and carry the files through CM’s normal model-capability handling. Limits are four files and 2 MiB combined; supported formats are PNG, JPEG, WebP, PDF, TXT and Markdown. Drafts clear on project changes, and attachment bytes are included in delivery deduplication.
+The AE composer now supports image and brief references: browse, drop or paste, review/remove before sending, and carry the files through CM’s normal model-capability handling. Limits are four files and 10 MiB combined; supported formats are PNG, JPEG, GIF, WebP, PDF and text/code files such as TXT, Markdown, CSV, JSON, JSX and YAML. Drafts clear on project changes, and attachment bytes are included in delivery deduplication.

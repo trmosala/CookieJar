@@ -28,7 +28,7 @@ try {
   if (!pkg || typeof pkg !== "object" || Array.isArray(pkg) ||
       pkg.type !== "module" || pkg.engines?.node !== ">=22" ||
       pkg.dependencies?.zod !== "4.1.8" ||
-      pkg.scripts?.test !== "node --test test/*.test.mjs" ||
+      pkg.scripts?.test !== "node scripts/test.mjs" ||
       pkg.scripts?.check !== "node scripts/check.mjs" ||
       pkg.scripts?.build !== "node scripts/build.mjs" ||
       lock.packages?.[""]?.name !== pkg.name ||

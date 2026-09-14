@@ -8,6 +8,8 @@ import { randomUUID } from "node:crypto"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { fileURLToPath, pathToFileURL } from "node:url"
+import { createServer } from "node:net"
+import { hash } from "../src/protocol.mjs"
 
 const exec = promisify(execFile)
 import { setTimeout as delay } from "node:timers/promises"
@@ -26,6 +28,44 @@ async function until(check) {
   }
   assert.fail("Timed out waiting for render state")
 }
+
+test("new job gates avoid the outbound port pool while legacy gates keep their identity", async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cm-gate-pool-"))
+  t.after(() => fs.rm(root, { recursive: true, force: true }))
+  for (const prefix of ["g2-", "G2-", ""]) {
+    const jobDir = path.join(await fs.realpath(root), prefix + randomUUID())
+    const oldPort = 49152 + parseInt(hash(jobDir.toLowerCase()).slice(0, 8), 16) % 16384
+    const occupant = createServer()
+    await new Promise((resolve, reject) => { occupant.once("error", reject); occupant.listen({ host: "127.0.0.1", port: oldPort, exclusive: true }, resolve) })
+    let entered = false
+    const pending = withJobLock(jobDir, async () => { entered = true })
+    try {
+      await delay(150)
+      assert.equal(entered, prefix.toLowerCase() === "g2-", "new gates must ignore outbound-pool occupancy; old jobs must retain their gate")
+    } finally {
+      await new Promise(resolve => occupant.close(resolve))
+      await pending
+    }
+  }
+})
+
+test("completed render cleanup recovers crash artifacts without stranding its output folder", async t => {
+  for (const crashPoint of ["legacy-lock", "owner-removed"]) await t.test(crashPoint, async t => {
+    const f = await setup(t)
+    const submitted = await f.service.submit(f.input)
+    const job = await f.finish(submitted.jobId)
+    if (crashPoint === "legacy-lock")
+      await fs.mkdir(path.join(f.base, "render", "jobs", "." + job.jobId + ".release-lock"))
+    else await fs.unlink(path.join(job.reservationPath, "owner.json"))
+    const reopened = await f.open()
+    assert.equal((await reopened.status(job.jobId)).state, "completed")
+    assert.equal(await fs.readFile(f.input.outputPath, "utf8"), "rendered bytes")
+    const next = await reopened.submit({ ...f.input, outputPath: path.join(f.output, "second.mov") })
+    assert.notEqual(next.jobId, job.jobId)
+    assert.equal((await reopened.status(job.jobId)).state, "completed", "observing the old job must preserve the new reservation")
+    await f.finish(next.jobId)
+  })
+})
 
 async function setup(t, platform = "win32") {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "cm-ae-render-"))
