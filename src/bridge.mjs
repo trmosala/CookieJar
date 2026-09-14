@@ -633,7 +633,7 @@ async function startBridge({
         protocol: PROTOCOL, version: VERSION, ...peer, updateUrl: UPDATE_URL, compatibility: metadata,
       })
   }
-  async function route(req) {
+  function requestContext(req, admission = false) {
     healthy()
     if (req.socket.remoteAddress !== "127.0.0.1" || Object.hasOwn(req.headers, "origin") ||
         req.headers.host !== `127.0.0.1:${server.address().port}` ||
@@ -650,7 +650,7 @@ async function startBridge({
       const match = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(req.headers.authorization || "")
       credential = match && state.credentials.find(c => c.hash === digest(match[1]))
       if (!credential) fail("unauthorized", "Invalid credential")
-    } else {
+    } else if (admission) {
       attempts = attempts.filter(time => now() - time < 60000)
       if (attempts.length >= 10) fail("rate_limited", "Pairing attempt limit reached")
       attempts.push(now())
@@ -658,18 +658,34 @@ async function startBridge({
     const captureReply = endpoint === "/reply" &&
       live.get(credential?.connectionId)?.pending?.command.method === "capture"
     const limit = endpoint === "/chat" ? 16 * 1024 * 1024 : endpoint === "/panel" ? 65536 : captureReply ? CAPTURE_BYTES : MAX_BYTES
+    return { endpoint, credential, limit }
+  }
+  async function receive(req) {
+    const { endpoint, limit } = requestContext(req, true)
     const chunks = []
     let bytes = 0
-    for await (const chunk of req) {
-      bytes += chunk.length
-      if (bytes > limit) fail("payload_too_large", "Request exceeds method transport limit")
-      chunks.push(chunk)
-    }
+    // Node's HTTP timeout sweep is coarser than the heartbeat lifetime. Bound
+    // body reception directly, without occupying the shared transition queue.
+    const deadline = setTimeout(() => req.destroy(new AEError("request_timeout", "Request body deadline exceeded")), 5000)
+    deadline.unref()
+    try {
+      for await (const chunk of req) {
+        bytes += chunk.length
+        if (bytes > limit) fail("payload_too_large", "Request exceeds method transport limit")
+        chunks.push(chunk)
+      }
+    } finally { clearTimeout(deadline) }
     let body = {}
     if (bytes) {
       try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")) } catch { fail("invalid_payload", "Invalid JSON") }
     } else if (endpoint !== "/poll") fail("invalid_payload", "JSON body required")
     if (endpoint === "/poll" && bytes) fail("invalid_payload", "Poll must not have a body")
+    return { body, bytes }
+  }
+  async function route(req, { body, bytes }) {
+    // Credentials, capture budgets and ownership can change while receiving.
+    const { endpoint, credential, limit } = requestContext(req)
+    if (bytes > limit) fail("payload_too_large", "Request exceeds current method transport limit")
     const info = { protocol: PROTOCOL, version: VERSION, updateUrl: UPDATE_URL, compatibility: compatibility() }
     if (endpoint === "/pair") {
       schema(body, ["code", "protocol", "version", "panelId"])
@@ -987,12 +1003,16 @@ async function startBridge({
   // Serialize transport transitions; host calls wait outside this queue.
   let requests = Promise.resolve()
   const server = http.createServer({ maxHeaderSize: 8192, requestTimeout: 5000, headersTimeout: 5000 }, (req, res) => {
-    const task = requests.then(() => route(req))
-    requests = task.catch(() => {})
+    const task = receive(req).then(received => {
+      const transition = requests.then(() => route(req, received))
+      requests = transition.catch(() => {})
+      return transition
+    })
     task.then(result => typeof result === "function" ? result() : result).then(result => {
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" })
       res.end(JSON.stringify(result))
     }, error => {
+      if (res.destroyed) return
       const status = { forbidden: 403, unauthorized: 401, not_found: 404, rate_limited: 429, payload_too_large: 413 }[error.code] || 400
       res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store", Connection: "close" })
       res.end(JSON.stringify({ error: { code: error instanceof AEError ? error.code : "bridge_error",

@@ -17,10 +17,10 @@ import { createCheckpoints } from "../src/storage.mjs";
 import fsp from "node:fs/promises";
 import { releaseMetadata } from "../src/protocol.mjs";
 import { createRequire } from "node:module";
-const compatibility=()=>({status:"compatible",pluginVersion:"0.2.2",protocol:1,panelVersion:"0.2.2",panelProtocol:1,...releaseMetadata()});
+const compatibility=()=>({status:"compatible",pluginVersion:"0.2.3",protocol:1,panelVersion:"0.2.3",panelProtocol:1,...releaseMetadata()});
 const { Client, HostRPC, Store, request, normalizeCapture } = transport;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const descriptor = {port:12345,instanceId:"instance",protocol:1,version:"0.2.2",updateUrl:"https://github.com/trmosala/CookieJar/releases"};
+const descriptor = {port:12345,instanceId:"instance",protocol:1,version:"0.2.3",updateUrl:"https://github.com/trmosala/CookieJar/releases"};
 const project = {id:"path:c:/test.aep",path:"c:/test.aep",saved:true};
 test("Windows reveal verifies content and accepts Explorer handoff without trusting its exit code",async t=>{
     const dir=await fsp.mkdtemp(path.join(os.tmpdir(),"reveal-test-"));t.after(()=>fsp.rm(dir,{recursive:true,force:true}));
@@ -51,7 +51,7 @@ function fixture(overrides={}) {
         normalize:async r=>({mime:"image/png",data:"AAAA",width:1,height:1}),
         request:async(d,c,endpoint,body)=>{
             events.push([endpoint,body,c]);
-            if(endpoint==="/connect" || endpoint==="/compatibility")return {connectionId:"connection",protocol:1,version:"0.2.2",updateUrl:descriptor.updateUrl,compatibility:compatibility()};
+            if(endpoint==="/connect" || endpoint==="/compatibility")return {connectionId:"connection",protocol:1,version:"0.2.3",updateUrl:descriptor.updateUrl,compatibility:compatibility()};
             if(endpoint==="/heartbeat")return {binding,lock:{state:"executing"}};
             if(endpoint==="/poll"){const c=command;command=null;return {command:c};}
             return {ok:true};
@@ -80,7 +80,7 @@ test("panel management sends exact authenticated schemas and requires an explici
         assert.equal(timeout,body.action.startsWith("checkpoint.restore.") ? 300000 : 15000);assert.equal(endpoint,"/panel");assert.equal(credential,f.store.state.credential);f.events.push([endpoint,structuredClone(body)]);
         if(body.action==="checkpoints")return {result:rows};
         if(body.action==="checkpoint.restore.propose")return {result:{token:"opaque-token",sourceTimestamp:1000,destinationTimestamp:2000,operation:"Save edits and restore checkpoint."}};
-        if(body.action==="diagnostics")return {result:{version:"0.2.2",counts:{jobs:0}}};
+        if(body.action==="diagnostics")return {result:{version:"0.2.3",counts:{jobs:0}}};
         if(body.action==="renders")return {result:[{id:"job",state:"completed"}]};
         if(body.action==="checkpoint.restore.confirm")return {result:{checkpointId:"cp",currentCheckpointId:"backup",path:project.path,
             canonicalPath:project.path,emergencyPath:"c:/private/emergency.aep",originalPath:"c:/private/original.aep",recoveryCopy:false,
@@ -96,7 +96,7 @@ test("panel management sends exact authenticated schemas and requires an explici
     await f.client.confirmRestore();
     assert.deepEqual(f.events.find(e=>e[0]==="/panel" && e[1].action==="checkpoint.restore.confirm")[1],{action:"checkpoint.restore.confirm",token:"opaque-token"});
     await assert.rejects(f.client.confirmRestore(),{code:"invalid_token"});
-    assert.deepEqual(await f.client.panel("diagnostics",{}),{version:"0.2.2",counts:{jobs:0}});
+    assert.deepEqual(await f.client.panel("diagnostics",{}),{version:"0.2.3",counts:{jobs:0}});
     assert.deepEqual(await f.client.panel("renders",{}),[{id:"job",state:"completed"}]);
     assert.equal(f.events.some(e=>e[0]==="host"),false,"services do not collect host content");
     assert.equal(JSON.stringify(f.store.state).includes("opaque-token"),false);
@@ -322,12 +322,12 @@ test("compatibility real bridge reports authenticated mismatches without host di
     let bridge;
     const source=fs.readFileSync(new URL("../panel/transport.cjs",import.meta.url),"utf8");
     const exports={exports:{}};
-    vm.runInNewContext(source.replace('var VERSION = "0.2.2", PROTOCOL = 1','var VERSION = "0.3.0", PROTOCOL = 2'),
+    vm.runInNewContext(source.replace('var VERSION = "0.2.3", PROTOCOL = 1','var VERSION = "0.3.0", PROTOCOL = 2'),
         {module:exports,require:createRequire(import.meta.url),Buffer,process,setTimeout,clearTimeout});
     const FutureClient=exports.exports.Client;
     const releases={cookieMonsterVersion:"2.4.1",updates:{
-        plugin:{version:"0.2.2",protocol:1,url:"https://releases.example.test/plugin"},
-        panel:{version:"0.2.2",protocol:1,url:"https://releases.example.test/panel"},
+        plugin:{version:"0.2.3",protocol:1,url:"https://releases.example.test/plugin"},
+        panel:{version:"0.2.3",protocol:1,url:"https://releases.example.test/panel"},
         cookieMonster:{version:"2.4.1",protocol:1,url:"https://releases.example.test/desktop"}
     }};
     try{
@@ -350,21 +350,21 @@ test("compatibility real bridge reports authenticated mismatches without host di
         await assert.rejects(future.management("/rotate"),{code:"incompatible_version"});
         assert.deepEqual(rotations,[],"mismatched rotation must be refused before dispatch");
         assert.deepEqual(store.state,before);
-        assert.equal((await request(d,before.credential,"/compatibility",{panelId:before.panelId,protocol:1,version:"0.2.2"})).connectionId,current.connectionId);
+        assert.equal((await request(d,before.credential,"/compatibility",{panelId:before.panelId,protocol:1,version:"0.2.3"})).connectionId,current.connectionId);
         await assert.rejects(future.connect(),{code:"incompatible_version"});
         future.start();
         for(let i=0;future.inFlight && i<200;i++)await sleep(10);
         assert.equal(future.state.connection,"incompatible");assert.equal(future.running,false);
         assert.equal(future.state.compatibility.panelVersion,"0.3.0");
         assert.equal(future.state.compatibility.panelProtocol,2);
-        assert.equal(future.state.compatibility.updates.panel.version,"0.2.2");
+        assert.equal(future.state.compatibility.updates.panel.version,"0.2.3");
         assert.deepEqual(calls,[]);assert.deepEqual(store.state,before);
         await future.tick();future.start();assert.deepEqual(calls,[]);
         await assert.rejects(future.status(),{code:"incompatible_version"});
         await assert.rejects(future.command({}),{code:"incompatible_version"});
         const live=(await bridge.connections())[0];
         assert.equal(live.connected,false);assert.equal(live.binding.state,"suspended");assert.ok(live.lock);
-        await assert.rejects(request(d,null,"/compatibility",{panelId:"compat-panel",protocol:2,version:"0.2.2"}),{code:"unauthorized"});
+        await assert.rejects(request(d,null,"/compatibility",{panelId:"compat-panel",protocol:2,version:"0.2.3"}),{code:"unauthorized"});
 
         const unpairedStore={...store,automaticCode:()=>JSON.parse(fs.readFileSync(path.join(dataDir,"automatic-connection.json"),"utf8")).code,state:{panelId:"new-panel",credential:null,uncertain:false}};
         const unpaired=new FutureClient({store:unpairedStore,host});
@@ -383,7 +383,7 @@ test("compatibility real bridge reports authenticated mismatches without host di
         rejectedConnect.discover();
         await assert.rejects(rejectedConnect.negotiate("/connect",{panelId:"compat-panel",protocol:2,version:"0.3.0",
             project,activeCompId:1,aeVersion:"25.3",capabilities:{fileNetwork:true}}),{code:"incompatible_version"});
-        assert.equal(rejectedConnect.state.compatibility.pluginVersion,"0.2.2");
+        assert.equal(rejectedConnect.state.compatibility.pluginVersion,"0.2.3");
         assert.deepEqual(calls,[]);
     }finally{await bridge?.close();fs.rmSync(root,{recursive:true,force:true});}
 });
@@ -432,8 +432,8 @@ test("explicit invalid credential recovery revokes the server secret and retains
         assert.deepEqual(JSON.parse(fs.readFileSync(store.file,"utf8")),store.state);
         assert.equal(JSON.stringify(store.state).includes(code),false);
         for(const secret of [original,lost.credential])
-            await assert.rejects(request(d,secret,"/compatibility",{panelId:identity.panelId,protocol:1,version:"0.2.2"}),{code:"unauthorized"});
-        await assert.rejects(request(d,null,"/pair",{panelId:identity.panelId,protocol:1,version:"0.2.2",code}),{code:"invalid_pairing_code"});
+            await assert.rejects(request(d,secret,"/compatibility",{panelId:identity.panelId,protocol:1,version:"0.2.3"}),{code:"unauthorized"});
+        await assert.rejects(request(d,null,"/pair",{panelId:identity.panelId,protocol:1,version:"0.2.3",code}),{code:"invalid_pairing_code"});
         await client.tick();
         await assert.rejects(client.connect(),{code:"outcome_uncertain"});
         assert.deepEqual(calls,[],"credential recovery never dispatches AE work");
@@ -447,7 +447,7 @@ test("explicit invalid credential recovery revokes the server secret and retains
         assert.equal((await bridge.connections()).length,0);assert.deepEqual(calls,[]);
         assert.equal(disk().locks[0].id,lock.id);assert.equal(disk().locks[0].connectionId,identity.connectionId);
         assert.equal(disk().locks[0].state,"uncertain");
-        const verified=await request(store.descriptor(),saved.credential,"/compatibility",{panelId:identity.panelId,protocol:1,version:"0.2.2"});
+        const verified=await request(store.descriptor(),saved.credential,"/compatibility",{panelId:identity.panelId,protocol:1,version:"0.2.3"});
         assert.equal(verified.connectionId,identity.connectionId);
         assert.equal((await bridge.connections())[0].lock.id,lock.id);
         // Local reconciliation and rebinding remain separate, explicit actions.
@@ -468,7 +468,7 @@ test("credential recovery fails closed for transport, scope, persistence and con
             requests.push(e);
             if(e==="/compatibility"){
                 if(mode==="disconnected")throw Object.assign(new Error("offline"),{code:"disconnected"});
-                if(mode==="valid")return {connectionId:"connection",protocol:1,version:"0.2.2",updateUrl:descriptor.updateUrl,compatibility:compatibility()};
+                if(mode==="valid")return {connectionId:"connection",protocol:1,version:"0.2.3",updateUrl:descriptor.updateUrl,compatibility:compatibility()};
                 if(mode==="stale-probe")f.client.connectionGeneration++;
                 throw Object.assign(new Error("invalid credential"),{code:"unauthorized"});
             }
@@ -476,7 +476,7 @@ test("credential recovery fails closed for transport, scope, persistence and con
             assert.equal(f.store.state.credential,before.credential,"never clear credential before server replacement");
             if(mode==="stale-pair")f.client.connectionGeneration++;
             if(mode==="save-failed")f.store.save=()=>{throw Object.assign(new Error("disk full"),{code:"ENOSPC"});};
-            return mode==="malformed" ? {} : {connectionId:"connection",credential:"b".repeat(43),protocol:1,version:"0.2.2",updateUrl:descriptor.updateUrl,compatibility:compatibility()};
+            return mode==="malformed" ? {} : {connectionId:"connection",credential:"b".repeat(43),protocol:1,version:"0.2.3",updateUrl:descriptor.updateUrl,compatibility:compatibility()};
         };
         const expected={disconnected:"disconnected",malformed:"invalid_response","stale-probe":"stale_binding","stale-pair":"stale_binding","save-failed":"ENOSPC",pending:"host_busy","panel-pending":"host_busy",valid:"credential_valid"}[mode];
         await assert.rejects(f.client.recoverCredential("FRESH"),{code:expected},mode);
@@ -493,7 +493,7 @@ test("compatibility validation rejects injected URLs, inconsistent fields and un
     assert.deepEqual(validate(good),good);
     assert.equal(good.cookieMonsterVersion,null);
     const configured=()=>({...compatibility(),...releaseMetadata({cookieMonsterVersion:"2.4.1",updates:{
-        panel:{version:"0.2.2",protocol:1,url:"https://releases.example.test/panel"}
+        panel:{version:"0.2.3",protocol:1,url:"https://releases.example.test/panel"}
     }})});
     assert.equal(validate(configured()).updates.panel.status,"configured");
     for(const url of ["javascript:alert(1)","http://example.test/a","file:///C:/secret","//example.test/a",
@@ -503,7 +503,7 @@ test("compatibility validation rejects injected URLs, inconsistent fields and un
         assert.throws(()=>validate(m),{code:"invalid_response"});
     }
     for(const change of [
-        m=>{m.pluginVersion="<script>";},m=>{m.panelVersion="0.2.2\n";},m=>{m.cookieMonsterVersion="1".repeat(65);},
+        m=>{m.pluginVersion="<script>";},m=>{m.panelVersion="0.2.3\n";},m=>{m.cookieMonsterVersion="1".repeat(65);},
         m=>{m.status="incompatible";},m=>{m.protocol="1";},m=>{m.panelProtocol=null;},
         m=>{m.cookieMonsterVersionStatus="not_configured";},m=>{m.releaseSourceUrl="https://evil.test";},
         m=>{m.updates.panel.version="9.0.0";},m=>{m.updates.panel.protocol=2;},m=>{m.updates.panel.status="approved";},
@@ -520,12 +520,12 @@ test("compatibility negotiation discards malformed and stale metadata without al
         f.client.request=async()=>{
             const m=compatibility();
             if(mode==="missing")return {};
-            if(mode==="unsafe-url")m.updates.panel={status:"configured",version:"0.2.2",protocol:1,url:"javascript:alert(1)"};
-            if(mode==="foreign-peer"){m.panelVersion="0.2.2";m.status="incompatible";}
+            if(mode==="unsafe-url")m.updates.panel={status:"configured",version:"0.2.3",protocol:1,url:"javascript:alert(1)"};
+            if(mode==="foreign-peer"){m.panelVersion="0.2.3";m.status="incompatible";}
             if(mode==="stale-credential")f.store.state.credential="b".repeat(43);
             if(mode==="stale-descriptor")f.client.descriptor.port++;
             if(mode==="rejected-invalid")throw Object.assign(new Error("mismatch"),{code:"incompatible_version",details:{compatibility:{secret:"NO"}}});
-            return {connectionId:"connection",protocol:1,version:mode==="outer-version" ? "9.0" : "0.2.2",updateUrl:descriptor.updateUrl,compatibility:m};
+            return {connectionId:"connection",protocol:1,version:mode==="outer-version" ? "9.0" : "0.2.3",updateUrl:descriptor.updateUrl,compatibility:m};
         };
         await assert.rejects(f.client.connect(),{code:mode.startsWith("stale-") ? "stale_binding" : "invalid_response"},mode);
         assert.equal(f.client.state.compatibility,null,mode);
@@ -536,7 +536,7 @@ test("compatibility negotiation discards malformed and stale metadata without al
     }
 });
 test("compatibility HTTP errors retain only validated negotiation metadata",async t=>{
-    let metadata={...compatibility(),status:"incompatible",panelVersion:"0.2.2",panelProtocol:2},code="incompatible_version";
+    let metadata={...compatibility(),status:"incompatible",panelVersion:"0.2.3",panelProtocol:2},code="incompatible_version";
     const server=http.createServer((req,res)=>{
         res.writeHead(409,{"Content-Type":"application/json"});
         res.end(JSON.stringify({error:{code,message:"DO NOT DISPLAY",details:{compatibility:metadata,secret:"DO NOT RETAIN"}}}));
@@ -560,7 +560,7 @@ test("compatibility descriptor mismatch probes with credentials and stops before
     };
     f.client.running=true;
     await f.client.tick();
-    assert.deepEqual(f.events.filter(e=>e[0]==="/compatibility"),[["/compatibility",{panelId:"panel",protocol:1,version:"0.2.2"},f.store.state.credential]]);
+    assert.deepEqual(f.events.filter(e=>e[0]==="/compatibility"),[["/compatibility",{panelId:"panel",protocol:1,version:"0.2.3"},f.store.state.credential]]);
     assert.equal(f.events.some(e=>e[0]==="host"),false);
     assert.equal(f.client.state.connection,"incompatible");assert.equal(f.client.running,false);
 });
@@ -572,8 +572,8 @@ test("descriptor mismatch hard-stops; reconnect drops binding until fresh heartb
 });
 test("pair, rotate, unpair use frozen schemas and do not persist pairing code",async()=>{
     const f=fixture();f.store.state.credential=null;
-    f.client.request=async(d,c,endpoint,body)=>{f.events.push([endpoint,body,c]);return endpoint==="/unpair" ? {ok:true} : {credential:"b".repeat(43),connectionId:"conn",protocol:1,version:"0.2.2",updateUrl:descriptor.updateUrl,compatibility:compatibility()};};
-    await f.client.pair("ABCD");assert.deepEqual(f.events.find(e=>e[0]==="/pair")[1],{code:"ABCD",protocol:1,version:"0.2.2",panelId:"panel"});
+    f.client.request=async(d,c,endpoint,body)=>{f.events.push([endpoint,body,c]);return endpoint==="/unpair" ? {ok:true} : {credential:"b".repeat(43),connectionId:"conn",protocol:1,version:"0.2.3",updateUrl:descriptor.updateUrl,compatibility:compatibility()};};
+    await f.client.pair("ABCD");assert.deepEqual(f.events.find(e=>e[0]==="/pair")[1],{code:"ABCD",protocol:1,version:"0.2.3",panelId:"panel"});
     assert.equal(JSON.stringify(f.store.state).includes("ABCD"),false);
     await assert.rejects(f.client.pair("OTHER"),{code:"already_paired"});
     assert.equal(f.events.filter(e=>e[0]==="/pair").length,1);

@@ -22,6 +22,7 @@ async function fixture(t, options = {}) {
   const manifests = new Map()
   const events = []
   const checkpoints = options.realStorage ? createCheckpoints({ dataDir: p.dataDir }) : {
+    async preflight() {},
     async create(input) {
       const id = `checkpoint-${manifests.size + 1}`
       const file = path.join(p.dataDir, id + ".aep")
@@ -155,7 +156,7 @@ test("production manual restore traverses bridge transport host source and real 
     assert.deepEqual(await readFile((await checkpoints.verify(result.previousCheckpointId)).path), original)
     const backup = await checkpoints.verify(result.currentCheckpointId)
     assert.equal(JSON.parse(await readFile(backup.path)).props[0].value, 42)
-    assert.equal(backup.pinned, true)
+    assert.equal(backup.pinned, false)
     const phases = f.commands.filter(c => c.params.phase?.startsWith("restore_"))
     assert.deepEqual(phases.map(c => c.params.phase), ["restore_prepare", "restore_finish"])
     const lock = p.bridge.binding(sessionID, { allowLocked: true }).lock
@@ -438,7 +439,7 @@ test("manual canonical restore saves dirty state and verifies current backup bef
   assert.equal(JSON.parse(await readFile(result.originalPath)).props[0].value, 42)
   assert.deepEqual(await readFile((await f.checkpoints.verify(result.previousCheckpointId)).path), before)
   const backup = await f.checkpoints.verify(result.currentCheckpointId)
-  assert.equal(backup.pinned, true)
+  assert.equal(backup.pinned, false)
   assert.equal(JSON.parse(await readFile(backup.path)).props[0].value, 42)
   assert.equal(f.bridge.state.lock, null)
   assert.equal(f.actual.closes, 1)

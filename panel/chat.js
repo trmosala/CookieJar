@@ -332,7 +332,7 @@
             checkpointButtons.forEach(function(item){
                 var available=checkpointList.some(function(c){return c.id===item.id;});
                 item.button.disabled=!available || !connected || !!busy || !!restoring || !!client.panelPending || state.busy || state.uncertain || !!state.lock || !!(snapshot && snapshot.owned) || !!(state.binding && state.binding.sessionID!==(snapshot && snapshot.sessionID));
-                item.status.textContent=available ? "Saved state before this edit. Verified again when you review Restore." : "Checkpoint unavailable or not loaded for this project.";
+                item.status.textContent=available ? "Saved state before this edit. Verified again when you review Restore." : "Checkpoint expired, was removed, or is not loaded for this project.";
                 item.button.title=available ? "Restore project to before this request" : "No checkpoint available for this request";
             });
             el("chat-model").disabled=!connected || !!busy || deliveryUnknown || !catalog.length;
@@ -595,6 +595,7 @@
                 data.restore.status==="pending" ? "Restore is in progress or was interrupted. Wait for After Effects; it will not retry automatically." :
                 "The last restore was not confirmed. Inspect AE and retain its backups before starting a new chat. No edits will replay automatically."+(data.restore.emergencyPath ? " Backup: "+data.restore.emergencyPath : ""));
             if(!sending && (data.delivery==="unknown" || data.delivery==="sending"))deliveryUnknown=true;
+            if(!sending && data.delivery==="reconciled")deliveryUnknown=false;
             el("chat-progress").textContent=data.status==="idle" ? "Ready" : "CookieMonster is working…";
             if(data.error || el("chat-error").textContent===serverError)el("chat-error").textContent=data.error || "";
             serverError=data.error || "";

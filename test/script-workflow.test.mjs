@@ -2,6 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import path from "node:path"
 import { readFile } from "node:fs/promises"
+import fs from "node:fs/promises"
 import { createWorkflow } from "../src/workflow.mjs"
 import { createCheckpoints, createGrants } from "../src/storage.mjs"
 import { hash, PROPOSAL_TTL } from "../src/protocol.mjs"
@@ -40,6 +41,96 @@ async function fixture(t, options = {}) {
 }
 
 const input = expectedRevision => ({ source: "return { changed: true };", label: "Script change", expectedRevision })
+
+test("insufficient free space refuses a script before saving or changing the project", async t => {
+  const f = await fixture(t)
+  const before = await readFile(f.p.state.project.path)
+  const inspected = await f.workflow.inspectQuery("session")
+  t.mock.method(fs, "statfs", async () => ({ bsize: 4096n, bavail: 0n }))
+  await assert.rejects(f.workflow.executeScript("session", input(inspected.expectedRevision), async () => {}), { code: "storage_space" })
+  assert.equal(f.events.includes("save"), false)
+  assert.equal(f.events.includes("raw"), false)
+  assert.deepEqual(await readFile(f.p.state.project.path), before)
+  assert.equal(f.p.bridge.binding("session").lock, null)
+})
+
+test("script protection survives uncertainty and does not erase an explicit user pin", async t => {
+  for (const outcome of ["confirmed", "uncertain"]) await t.test(outcome, async t => {
+    const f = await fixture(t, { handler: async (command, p, host) => {
+      if (command.method === "raw" && outcome === "uncertain") throw new Error("Partial script failure")
+      return host(command)
+    } })
+    const create = f.checkpoints.create
+    let id
+    f.checkpoints.create = async args => {
+      const record = await create(args); id = record.id
+      await assert.rejects(f.checkpoints.remove(id), { code: "checkpoint_in_use" })
+      if (outcome === "confirmed") await f.checkpoints.pin(id, true)
+      return record
+    }
+    const inspected = await f.workflow.inspectQuery("session")
+    const running = f.workflow.executeScript("session", input(inspected.expectedRevision), async () => {})
+    if (outcome === "uncertain") await assert.rejects(running, { code: "outcome_uncertain" })
+    else await running
+    const restarted = createCheckpoints({ dataDir: f.p.dataDir })
+    const record = await restarted.verify(id)
+    assert.equal(record.pinned, outcome === "confirmed")
+    assert.equal(record.inUse, outcome === "uncertain")
+    await assert.rejects(restarted.remove(id), { code: "checkpoint_in_use" })
+  })
+})
+
+test("safe pre-dispatch expiry and explicit reconciliation release only script protection", async t => {
+  for (const mode of ["expiry", "verification", "reconcile"]) await t.test(mode, async t => {
+    const f = await fixture(t, { handler: async (command, p, host) => {
+      if (mode === "reconcile" && command.method === "raw") throw new Error("Unknown partial outcome")
+      return host(command)
+    } })
+    const create = f.checkpoints.create
+    let id
+    f.checkpoints.create = async args => {
+      const record = await create(args); id = record.id
+      if (mode === "expiry") f.advance(PROPOSAL_TTL + 1)
+      else if (mode === "reconcile") { await f.checkpoints.pin(id, true); await f.checkpoints.protect(id, "other-owner", true) }
+      return record
+    }
+    const verify = f.checkpoints.verify
+    if (mode === "verification") f.checkpoints.verify = async () => ({ verified: false })
+    const before = await f.workflow.inspectQuery("session")
+    await assert.rejects(f.workflow.executeScript("session", input(before.expectedRevision), async () => {}))
+    if (mode === "reconcile") {
+      await assert.rejects(f.workflow.reconcile("session", async () => { throw new Error("Denied") }))
+      assert.equal((await f.checkpoints.verify(id)).protectionOwners.length, 2)
+      let reviews = 0
+      await f.workflow.reconcile("session", async () => { reviews++ })
+      assert.equal(reviews, 1)
+    }
+    f.checkpoints.verify = verify
+    const record = await f.checkpoints.verify(id)
+    assert.deepEqual(record.protectionOwners, mode === "reconcile" ? ["other-owner"] : [])
+    assert.equal(record.pinned, mode === "reconcile")
+    assert.equal(f.p.bridge.binding("session").lock, null)
+  })
+})
+
+test("low disk space stops restore before saving dirty work or opening a project", async t => {
+  const f = await restoreFixture(t)
+  const checkpoints = createCheckpoints({ dataDir: f.p.dataDir })
+  const workflow = createWorkflow({ bridge: f.p.bridge, checkpoints, grants: createGrants() })
+  const inspected = await workflow.inspectRestore(f.sessionID)
+  const saved = await checkpoints.create({ projectPath: inspected.project.path, projectId: inspected.project.id, planHash: "low-space-restore" })
+  f.h.props[0].setValue(42)
+  const before = await readFile(inspected.project.path)
+  t.mock.method(fs, "statfs", async () => ({ bsize: 4096n, bavail: 0n }))
+  await assert.rejects(workflow.restore(f.sessionID, saved.id, async () => {}), { code: "storage_space" })
+  assert.equal(f.h.props[0].value, 42)
+  assert.equal(f.h.project.dirty, true)
+  assert.equal(f.h.closes, 0)
+  assert.deepEqual(await readFile(inspected.project.path), before)
+  assert.equal(f.commands.some(c => c.params.phase?.startsWith("restore_")), false)
+  assert.equal(f.p.bridge.binding(f.sessionID).lock, null)
+  await f.stop()
+})
 
 test("query inspection dispatches only the query and tokens are independent of target and page", async t => {
   const f = await fixture(t)
@@ -104,7 +195,8 @@ test("script exact approval precedes verified checkpoint and raw, then returns f
   assert.equal(evidence.expectedFingerprint, hash({ kind: "script-overview-v1",
     connectionId: f.p.connectionId, data, hasMore: nextCursor !== null }))
   const checkpoint = await f.checkpoints.verify(result.checkpointId)
-  assert.equal(checkpoint.pinned, true)
+  assert.equal(checkpoint.pinned, false, "successful scripts must not create permanent user pins")
+  assert.equal(checkpoint.inUse, false, "confirmed execution releases temporary protection")
   assert.equal(JSON.parse(await readFile(checkpoint.path)).revision, 1)
   for (const [before, after] of [["approval", "save"], ["save", "checkpoint"], ["checkpoint", "verify"], ["verify", "raw"]])
     assert.ok(f.events.indexOf(before) < f.events.indexOf(after), `${before} before ${after}`)
@@ -290,7 +382,7 @@ test("raw partial errors, timeouts, stale host checks and invalid results retain
       assert.equal(error.details.rolledBack, false)
       return true
     })
-    assert.equal((await f.checkpoints.verify(failure.details.checkpointId)).pinned, true)
+    assert.equal((await f.checkpoints.verify(failure.details.checkpointId)).inUse, true)
     assert.equal(f.p.log.filter(c => c.method === "raw").length, 1)
     assert.equal(f.p.log.some(c => ["execute", "open"].includes(c.method)), false)
     assert.equal(f.p.bridge.binding("session", { allowLocked: true }).lock.state, "uncertain")

@@ -192,8 +192,9 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
     return checkpoint?.verified && checkpoint.projectId === b.project.id &&
       checkpoint.projectPath === await realpath(b.project.path)
   }
-  async function saveCheckpoint(sessionID, inspected, planHash) {
+  async function saveCheckpoint(sessionID, inspected, planHash, protectionOwner) {
     const b = inspected.binding
+    await checkpoints.preflight({ projectPath: b.project.path, projectId: b.project.id })
     await revision(sessionID, inspected, true)
     const saved = await bridge.call(sessionID, "save", {}, { allowLocked: true })
     if (!saved?.project?.saved || !sameProject(saved.project, b.project))
@@ -202,9 +203,12 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
     // revision also guards opaque/mixed-style state that cannot be compared directly.
     await revision(sessionID, inspected, true)
     const checkpoint = await checkpoints.create({
-      projectPath: b.project.path, projectId: b.project.id, planHash, pinned: true,
+      projectPath: b.project.path, projectId: b.project.id, planHash,
+      pinned: protectionOwner === undefined, ...(protectionOwner === undefined ? {} : { protectionOwner }),
     })
     try {
+      if (protectionOwner !== undefined)
+        await bridge.recordOutcome(sessionID, { outcome: "prepared", planHash, checkpointId: checkpoint.id })
       const verified = await checkpoints.verify(checkpoint.id)
       if (verified?.id !== checkpoint.id || !await checkpointMatches(verified, b) || verified.planHash !== planHash)
         fail("checkpoint_invalid", "Checkpoint verification or plan identity failed")
@@ -323,6 +327,8 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
           fail("unsaved_project", "Save the project before executing scripts")
         const expiresAt = now() + PROPOSAL_TTL
         const planHash = hash({ payload, bindingID: b.id })
+        const protectionOwner = "script:" + planHash
+        await checkpoints.preflight({ projectPath: b.project.path, projectId: b.project.id })
         await permit(ask, `Run UNSANDBOXED ExtendScript body: ${payload.label}\nProject: ${b.project.path}\nFile, network, process, preference and other external effects cannot be rolled back. Partial project changes may remain on failure. A verified checkpoint will be retained; no automatic rollback or retry.\nExact source:\n${payload.source}`, {
           kind: "script", ...payload, hash: planHash, binding: b, nonTransactional: true,
         })
@@ -332,7 +338,7 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
         await bridge.lock(sessionID, { kind: "script", proof: SCRIPT_PROOF, planHash, nonTransactional: true })
         let checkpoint = null, dispatched = false
         try {
-          checkpoint = await saveCheckpoint(sessionID, initial, planHash)
+          checkpoint = await saveCheckpoint(sessionID, initial, planHash, protectionOwner)
           await bridge.recordOutcome(sessionID, { outcome: "prepared", planHash, checkpointId: checkpoint.id })
           alive({ expiresAt })
           await revision(sessionID, initial, true)
@@ -356,7 +362,10 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
           const overview = { ...after.data, binding: { ...current(sessionID, b, { allowLocked: true }), lock: null },
             expectedRevision: after.fingerprint }
           await bridge.unlock(sessionID)
-          return { result: result.value, checkpointId: checkpoint.id, expectedRevision: after.fingerprint, overview }
+          const cleanup = await checkpoints.protect(checkpoint.id, protectionOwner, false)
+            .then(() => null, () => "Checkpoint remains protected; review retention before further edits")
+          return { result: result.value, checkpointId: checkpoint.id, expectedRevision: after.fingerprint, overview,
+            ...(cleanup ? { cleanup } : {}) }
         } catch (error) {
           if (dispatched || uncertain(error)) {
             await bridge.markUncertain(sessionID, "Script outcome was not confirmed; retain checkpoint and partial changes").catch(() => {})
@@ -366,6 +375,8 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
               warning: "Partial changes may remain; the checkpoint does not undo external effects.",
             })
           }
+          const checkpointId = checkpoint?.id || error.details?.checkpointId
+          if (checkpointId) await checkpoints.protect(checkpointId, protectionOwner, false)
           await bridge.unlock(sessionID)
           throw new AEError(error.code || "execution_failed", error.message, {
             ...error.details, checkpointId: checkpoint?.id || error.details?.checkpointId || null, rolledBack: false,
@@ -612,7 +623,7 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
     // Adapter contract: ask(summary, metadata) must explicitly review the immutable
     // inspected snapshot when no durable confirmed outcome matches. Compact receipts
     // require review of the actual project, not scene-equivalence inference. Never auto-approve.
-    async reconcile(sessionID, ask) {
+    async reconcile(sessionID, ask, { reviewRequired = false } = {}) {
       return exclusive(sessionID, async () => {
         const b = current(sessionID, null, { allowLocked: true })
         const script = b.lock?.reason?.kind === "script" && b.lock.reason.proof === SCRIPT_PROOF
@@ -627,7 +638,7 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
         // A bounded overview is not a complete scene/external-effects proof, even after confirmation.
         const proven = !script && !compact && evidence?.outcome === "confirmed" && evidence.expectedFingerprint === fingerprint
         const expiresAt = now() + PROPOSAL_TTL
-        if (b.lock && !proven) {
+        if (b.lock && !proven || reviewRequired) {
           const scope = compact
             ? "Compact native guards only, NOT full scene proof. Review the actual AE project and retained recovery files, including external effects, before explicitly confirming."
             : script
@@ -651,7 +662,12 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
           restoreReview: fingerprint,
           authorizeRestoreReview: () => { alive({ expiresAt }); return true },
         } : undefined)
+        const cleanup = script && evidence?.checkpointId && evidence.planHash === b.lock.reason.planHash
+          ? await checkpoints.protect(evidence.checkpointId, "script:" + evidence.planHash, false)
+            .then(() => null, () => "Reconciled, but checkpoint protection cleanup failed; the recovery copy remains held")
+          : null
         return { ...inspected.data, fingerprint, reconciled: true,
+          ...(cleanup ? { cleanup } : {}),
           proof: proven ? "confirmed_outcome" : "explicit_review", previousLock: b.lock,
           warning: "No command was retried. Inspection does not undo external or raw-script side effects." }
       })
@@ -686,6 +702,8 @@ export function createWorkflow({ bridge, checkpoints, grants, now = Date.now, lo
             fail("outcome_uncertain", "Restore lock changed; preserve recovery files without opening or retrying")
         }
         current(sessionID, b, { write: true })
+        await checkpoints.preflight({ projectPath: b.project.path, projectId: b.project.id,
+          copies: 2, restoreBytes: checkpoint.size, protectedIds: [checkpointId] })
         await permit(ask, `Restore checkpoint ${checkpointId}.
 Source: ${checkpoint.createdAt}
 Destination file: ${destination.mtime.toISOString()} (${b.project.path})
@@ -696,6 +714,8 @@ Preserve the existing disk file first, save current edits in place, and verify a
           fingerprint: initial.fingerprint, protocol: RESTORE_PROOF, receipt: initial.data, recoveryCopy: false,
         })
         await checkApproval(b, initial.fingerprint)
+        await checkpoints.preflight({ projectPath: b.project.path, projectId: b.project.id,
+          copies: 2, restoreBytes: checkpoint.size, protectedIds: [checkpointId] })
         const unchanged = await lstat(b.project.path)
         if (["dev", "ino", "size", "mtimeMs", "ctimeMs"].some(key => unchanged[key] !== destination[key]) ||
             await fileHash(b.project.path) !== destinationHash)
@@ -712,7 +732,8 @@ Preserve the existing disk file first, save current edits in place, and verify a
           await checkpoints.protect(checkpointId, transaction.id)
           await checkApproval(b, initial.fingerprint)
           // In-place saving must never destroy the prior on-disk version.
-          const previous = await checkpoints.create({ projectPath: b.project.path, projectId: b.project.id, planHash, pinned: true })
+          const previous = await checkpoints.create({ projectPath: b.project.path, projectId: b.project.id, planHash,
+            protectionOwner: transaction.id })
           previousCheckpoint = await checkpoints.verify(previous.id)
           if (!await checkpointMatches(previousCheckpoint, b) || previousCheckpoint.hash !== destinationHash)
             fail("stale_project", "Destination changed before saving current work")
@@ -736,7 +757,8 @@ Preserve the existing disk file first, save current edits in place, and verify a
             fail("invalid_host_result", "Current state changed while saving")
           const savedFingerprint = restoreFingerprint(saved.receipt, b.connectionId)
           const savedDestination = await lstat(b.project.path)
-          const created = await checkpoints.create({ projectPath: b.project.path, projectId: saved.project.id, planHash, pinned: true })
+          const created = await checkpoints.create({ projectPath: b.project.path, projectId: saved.project.id, planHash,
+            protectionOwner: transaction.id })
           currentCheckpoint = await checkpoints.verify(created.id)
           if (!await checkpointMatches(currentCheckpoint, recoveryBinding) || currentCheckpoint.planHash !== planHash ||
               await fileHash(emergencyPath) !== currentCheckpoint.hash ||

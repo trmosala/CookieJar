@@ -51,6 +51,36 @@ async function rewriteManifest(file, changes) {
   await fs.writeFile(file, JSON.stringify({ ...manifest, manifestHash: hash(manifest) }))
 }
 
+test("automatic checkpoints retain only the recent window after temporary protection is released", async t => {
+  const f = await fixture(t), ids = []
+  for (let i = 0; i < 12; i++) {
+    const owner = "script-" + i
+    const checkpoint = await f.store.create({ ...f.args, protectionOwner: owner })
+    ids.push(checkpoint.id)
+    await f.store.protect(checkpoint.id, owner, false)
+  }
+  const restarted = createCheckpoints({ dataDir: f.dataDir })
+  const remaining = await restarted.list(f.args.projectId)
+  assert.deepEqual(remaining.map(c => c.id), ids.slice(-10))
+  assert.ok(remaining.every(c => !c.pinned && !c.inUse))
+  await assert.rejects(restarted.verify(ids[0]), { code: "checkpoint_not_found" })
+})
+
+test("restore capacity preflight reserves both backups without pruning or saving anything", async t => {
+  const f = await fixture(t)
+  const checkpoint = await f.store.create(f.args)
+  const original = await fs.readFile(f.projectPath)
+  const lstat = fs.lstat.bind(fs)
+  t.mock.method(fs, "lstat", async (file, options) => {
+    const value = await lstat(file, options)
+    if (file === f.projectPath) value.size = 3 * 1024 ** 3
+    return value
+  })
+  await assert.rejects(f.store.preflight({ ...f.args, copies: 2, restoreBytes: checkpoint.size, protectedIds: [checkpoint.id] }), { code: "checkpoint_capacity" })
+  assert.deepEqual(await fs.readFile(f.projectPath), original)
+  assert.equal((await f.store.verify(checkpoint.id)).hash, checkpoint.hash)
+})
+
 test("exact and recursive grants, read/write distinction, missing leaf and source immutability", async t => {
   const f = await fixture(t)
   const asset = path.join(f.projects, "asset.png")
@@ -917,6 +947,16 @@ test("project-side manifest publication failure falls back with a verified copy"
   assert.equal((await f.store.verify(manifest.id)).hash, manifest.hash)
   assert.deepEqual(await fs.readdir(directory), [".cookiemonster-storage-owner.json"])
   assert.equal(await fs.readFile(f.projectPath, "utf8"), "original project bytes" + String.fromCharCode(0, 10))
+})
+
+test("preflight counts every protected incoming copy before saving", async t => {
+  const f = await fixture(t)
+  for (let i = 0; i < 9; i++) await f.store.create({ ...f.args, protectionOwner: "pending-" + i })
+  await f.store.preflight(f.args)
+  await assert.rejects(f.store.preflight({ ...f.args, copies: 2 }), typed("checkpoint_capacity"))
+  await f.store.create({ ...f.args, protectionOwner: "pending-9" })
+  await assert.rejects(f.store.preflight(f.args), typed("checkpoint_capacity"))
+  assert.equal((await f.store.list(f.args.projectId)).length, 10)
 })
 
 test("size cap rejects before reading or pruning existing checkpoints", async t => {

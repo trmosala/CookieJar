@@ -8,13 +8,15 @@ const exec = promisify(execFile);
 const policyValues = new Set(["allow", "ask", "deny"]);
 const record = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 
+// Replaced only by the client bundler; unbundled development remains unchanged.
+export const CLIENT_BUILD = typeof COOKIEJAR_CLIENT_BUILD !== "undefined" && COOKIEJAR_CLIENT_BUILD === true;
 export const AE_PERMISSIONS = Object.freeze({
   ae_pair: "ask",
   ae_connections: "allow",
   ae_bind: "ask",
   ae_release: "ask",
   ae_inspect: "allow",
-  ae_execute: "allow",
+  ae_execute: CLIENT_BUILD ? "ask" : "allow",
   ae_grant: "ask",
   ae_capture: "ask",
   ae_checkpoints: "ask",

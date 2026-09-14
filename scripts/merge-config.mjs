@@ -1,16 +1,23 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { AE_PERMISSIONS, mergeBundledPlugins } from "../src/config.mjs";
+import { checkPermissionConfig } from "../src/plugin.mjs";
 
 const [input, artifact, output, ...extra] = process.argv.slice(2);
 try {
-  if (!input || !artifact || !output || extra.length) {
-    throw new Error("Usage: node scripts/merge-config.mjs INPUT.json PLUGIN.mjs OUTPUT.json (new file only)");
+  if (!input || !artifact || !output || extra.length > 1 || extra.length && extra[0] !== "--client") {
+    throw new Error("Usage: node scripts/merge-config.mjs INPUT.json PLUGIN.mjs OUTPUT.json [--client] (new file only)");
   }
+  const client = extra[0] === "--client";
   const config = JSON.parse(await readFile(resolve(input), "utf8"));
   const result = await mergeBundledPlugins(config, [
-    { id: "cm-ae", path: resolve(artifact), permissions: AE_PERMISSIONS },
+    { id: "cm-ae", path: resolve(artifact), permissions: { ...AE_PERMISSIONS, ...(client ? { ae_execute: "ask" } : {}) } },
   ]);
+  if (client) {
+    try {
+      checkPermissionConfig(result.config, "ae_execute", { requireReview: true });
+    } catch (error) { if (error.code !== "permission_denied") throw error; }
+  }
   for (const diagnostic of result.diagnostics) console.error(JSON.stringify(diagnostic));
   if (result.diagnostics.some((item) => item.severity === "error")) process.exitCode = 1;
   else {

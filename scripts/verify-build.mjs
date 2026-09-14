@@ -12,6 +12,7 @@ export async function verifyBuild(directory = root) {
   const manifest = JSON.parse(await readFile(join(dist, "manifest.json"), "utf8"));
   assert.equal(manifest.schemaVersion, 1);
   assert.equal(manifest.signed, false, "Build manifest must not claim signing");
+  assert.ok(["development", "client"].includes(manifest.profile), "Unknown build profile");
   assert.ok(Array.isArray(manifest.artifacts));
   const inventory = (await files(dist)).filter((path) => path !== "manifest.json");
   assert.deepEqual(manifest.artifacts.map((item) => item.path), inventory, "Unexpected, missing or reordered artifact");
@@ -20,6 +21,8 @@ export async function verifyBuild(directory = root) {
     assert.equal(data.length, item.bytes, `Size mismatch: ${item.path}`);
     assert.equal(createHash("sha256").update(data).digest("hex"), item.sha256, `Hash mismatch: ${item.path}`);
   }
+  const permissions = JSON.parse(await readFile(join(dist, "cm-ae", "permissions.json"), "utf8"));
+  assert.equal(permissions.ae_execute, manifest.profile === "client" ? "ask" : "allow", "Script policy does not match build profile");
   return manifest;
 }
 
@@ -28,7 +31,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
     if (process.argv.slice(2).some((arg) => arg !== "--rebuild")) throw new Error("Usage: node scripts/verify-build.mjs [--rebuild]");
     const before = await verifyBuild();
     if (process.argv.includes("--rebuild")) {
-      await build();
+      await build(root, before.profile);
       assert.deepEqual(await verifyBuild(), before, "Rebuild was not byte-for-byte deterministic");
     }
     console.log("Artifact inventory and SHA256 verified. No signature or AE certification implied.");
