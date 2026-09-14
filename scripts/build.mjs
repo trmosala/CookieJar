@@ -47,6 +47,12 @@ export async function build(directory = root, profile = "development") {
   if (!sourceFiles.includes("plugin.mjs")) throw new Error("Missing src/plugin.mjs");
   const panel = await files(join(directory, "panel"));
   if (!panel.includes("CSXS/manifest.xml") || !panel.includes("index.html")) throw new Error("Incomplete CEP panel");
+  const releaseInstructions = join(directory, "release", "AGENTS.md");
+  if (!(await files(join(directory, "release"))).includes("AGENTS.md")) throw new Error("Missing release instructions");
+  const instructions = await readFile(releaseInstructions, "utf8");
+  if (!instructions.includes("CookieJar AE release installation") || !instructions.includes("SHA256SUMS.txt")) {
+    throw new Error("Incomplete release AGENTS.md");
+  }
   for (const path of panel) {
     if (!allowedPanelTypes.has(extname(path).toLowerCase())) throw new Error(`Unapproved panel asset: ${path}`);
     if (extname(path) === ".jsx") new Script(await readFile(join(directory, "panel", path), "utf8"), { filename: path });
@@ -77,6 +83,7 @@ export async function build(directory = root, profile = "development") {
       await mkdir(dirname(dest), { recursive: true });
       await copyFile(join(directory, "panel", path), dest);
     }
+    await copyFile(releaseInstructions, join(stage, "AGENTS.md"));
     await copyFile(join(directory, "compatibility.json"), join(stage, "compatibility.json"));
     await copyFile(join(dirname(zodPackage), "LICENSE"), join(stage, "cm-ae", "ZOD-LICENSE.txt"));
     if (pkg.dependencies?.marked) {
@@ -96,7 +103,7 @@ export async function build(directory = root, profile = "development") {
       artifacts,
     }, null, 2) + "\n");
     // ponytail: single-writer build; CI uses isolated workspaces, not concurrent builds.
-    for (const name of ["cm-ae", "panel", "compatibility.json", "manifest.json"]) {
+    for (const name of ["AGENTS.md", "cm-ae", "panel", "compatibility.json", "manifest.json"]) {
       await rm(join(dist, name), { force: true, recursive: true });
       for (let attempt = 0; ; attempt++) {
         try {

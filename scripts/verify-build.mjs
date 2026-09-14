@@ -21,6 +21,10 @@ export async function verifyBuild(directory = root) {
     assert.equal(data.length, item.bytes, `Size mismatch: ${item.path}`);
     assert.equal(createHash("sha256").update(data).digest("hex"), item.sha256, `Hash mismatch: ${item.path}`);
   }
+  assert.ok(manifest.artifacts.some((item) => item.path === "AGENTS.md"), "Release AGENTS.md missing from build inventory");
+  const instructions = await readFile(join(dist, "AGENTS.md"), "utf8");
+  assert.match(instructions, /SHA256SUMS\.txt/, "Release instructions must require checksum verification");
+  assert.match(instructions, /plugins\/cookiejar-ae\/VERSION|plugins\\cookiejar-ae\\VERSION/, "Release instructions must document the versioned backend location");
   const permissions = JSON.parse(await readFile(join(dist, "cm-ae", "permissions.json"), "utf8"));
   assert.equal(permissions.ae_execute, manifest.profile === "client" ? "ask" : "allow", "Script policy does not match build profile");
   return manifest;

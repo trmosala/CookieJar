@@ -158,12 +158,15 @@ test("packaging verifies inventory and hashes, rejects unsafe inputs, and signin
   await mkdir(dist);
   const data = "export default {};\n";
   await writeFile(join(dist, "plugin.mjs"), data);
+  const instructions = await readFile(new URL("../release/AGENTS.md", import.meta.url), "utf8");
+  await writeFile(join(dist, "AGENTS.md"), instructions);
   await mkdir(join(dist, "cm-ae"));
   const policy = JSON.stringify({ ae_execute: "allow" });
   await writeFile(join(dist, "cm-ae", "permissions.json"), policy);
   await writeFile(join(dist, "manifest.json"), JSON.stringify({
     schemaVersion: 1, signed: false, profile: "development",
     artifacts: [
+      { path: "AGENTS.md", bytes: Buffer.byteLength(instructions), sha256: createHash("sha256").update(instructions).digest("hex") },
       { path: "cm-ae/permissions.json", bytes: Buffer.byteLength(policy), sha256: createHash("sha256").update(policy).digest("hex") },
       { path: "plugin.mjs", bytes: Buffer.byteLength(data), sha256: createHash("sha256").update(data).digest("hex") },
     ],
@@ -195,12 +198,14 @@ test("build bundles dependencies but preserves the real worker URL and reproduci
   const root = fileURLToPath(new URL("../", import.meta.url));
   await mkdir(join(fixture, "src"), { recursive: true });
   await mkdir(join(fixture, "panel", "CSXS"), { recursive: true });
+  await mkdir(join(fixture, "release"), { recursive: true });
   await mkdir(join(fixture, "node_modules"), { recursive: true });
   const require = createRequire(import.meta.url);
   await cp(dirname(require.resolve("zod/package.json")), join(fixture, "node_modules", "zod"), { recursive: true });
   await cp(dirname(require.resolve("marked/package.json")), join(fixture, "node_modules", "marked"), { recursive: true });
   await copyFile(join(root, "package.json"), join(fixture, "package.json"));
   await copyFile(join(root, "compatibility.json"), join(fixture, "compatibility.json"));
+  await copyFile(join(root, "release", "AGENTS.md"), join(fixture, "release", "AGENTS.md"));
   for (const name of ["render-worker.mjs", "protocol.mjs"]) {
     await copyFile(join(root, "src", name), join(fixture, "src", name));
   }
@@ -230,6 +235,9 @@ test("build bundles dependencies but preserves the real worker URL and reproduci
   await build(fixture);
   if (process.platform === "win32") assert.ok(publicationFailures >= 2);
   const before = await verifyBuild(fixture);
+  assert.ok(before.artifacts.some((item) => item.path === "AGENTS.md"));
+  assert.equal(await readFile(join(fixture, "dist", "AGENTS.md"), "utf8"), await readFile(join(root, "release", "AGENTS.md"), "utf8"));
+  assert.ok(!before.artifacts.some((item) => item.path === "panel/AGENTS.md"));
   assert.deepEqual(JSON.parse(await readFile(join(fixture, "dist", "cm-ae", "permissions.json"), "utf8")), AE_PERMISSIONS);
   assert.ok(before.artifacts.some((item) => item.path === "cm-ae/render-worker.mjs"));
   assert.deepEqual(
