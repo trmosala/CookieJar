@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { lstat, open, realpath, rm } from "node:fs/promises";
+import { copyFile, lstat, mkdtemp, realpath, rm } from "node:fs/promises";
+import { constants } from "node:fs";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { verifyBuild } from "./verify-build.mjs";
@@ -8,6 +9,8 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const [action, output, ...extra] = process.argv.slice(2);
 let reserved = false;
 let destination;
+let staging;
+let published;
 try {
   if (!["sign", "verify"].includes(action) || !output || extra.length || !output.toLowerCase().endsWith(".zxp")) {
     throw new Error("Usage: node scripts/sign-zxp.mjs sign|verify OUTPUT.zxp");
@@ -35,13 +38,15 @@ try {
   if (!zipTool) throw new Error("Install 7z or unzip for ZIP integrity verification before signing");
   if (action === "sign") {
     await verifyBuild();
-    const handle = await open(destination, "wx", 0o600);
-    await handle.close();
+    published = destination;
+    staging = await mkdtemp(resolve(dirname(destination), ".zxp-sign-"));
+    destination = resolve(staging, basename(destination));
     reserved = true;
     // ZXPSignCmd requires the password as argv. Use only on an isolated signing runner.
     const result = spawnSync(tool, [
       "-sign", resolve(root, "dist/panel"), destination,
       process.env.ZXP_CERTIFICATE, process.env.ZXP_CERT_PASSWORD,
+      ...(process.env.ZXP_TIMESTAMP_URL ? ["-tsa", process.env.ZXP_TIMESTAMP_URL] : []),
     ], { stdio: "pipe", timeout: 120_000 });
     if (result.error || result.status !== 0) throw new Error("ZXP signing failed; tool output suppressed to protect signing credentials");
   }
@@ -51,10 +56,13 @@ try {
   if (archive.error || archive.status !== 0) throw new Error("ZXP archive integrity verification failed");
   const signature = spawnSync(tool, ["-verify", destination, "-certinfo"], { stdio: "pipe", timeout: 120_000 });
   if (signature.error || signature.status !== 0) throw new Error("ZXP signature verification failed");
+  if (published) await copyFile(destination, published, constants.COPYFILE_EXCL);
   reserved = false;
   console.log("ZIP integrity and signature tool verification passed. Release owner must validate publisher trust and record the signed artifact hash.");
 } catch (error) {
   if (reserved) await rm(destination, { force: true });
   console.error(error.code === "EEXIST" ? "Output exists; refusing to overwrite." : error.message);
   process.exitCode = 1;
+} finally {
+  if (staging) await rm(staging, { recursive: true, force: true });
 }

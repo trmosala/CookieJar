@@ -397,7 +397,7 @@ function Client(options) {
     this.store=options.store;this.host=options.host;this.normalize=options.normalize;this.changed=options.changed || function(){};
     this.beforeCapture=options.beforeCapture || function(){return Promise.reject(error("unsafe_state","Visible capture indicator could not be confirmed"));};
     this.request=options.request || request;this.descriptor=null;this.running=false;this.timer=null;this.inFlight=false;
-    this.connectionGeneration=0;this.connectionId=null;this.connectionEpoch=null;
+    this.connectionGeneration=0;this.connectionId=null;this.connectionEpoch=null;this.latchGeneration=0;
     this.state={connection:this.store.state.credential ? "paired" : "unpaired",project:null,activeCompId:null,capabilities:{fileNetwork:false},binding:null,lock:null,busy:false,capture:null,uncertain:this.store.state.uncertain,aeVersion:"",bridgeVersion:"",compatibility:null,lastError:""};
 }
 Client.prototype.scope=function(){
@@ -517,7 +517,29 @@ Client.prototype.confirmRestore=function(){
     if(!this.restoreApproval)return Promise.reject(error("invalid_token","Review a checkpoint restore first"));
     return this.panel("checkpoint.restore.confirm",{token:this.restoreApproval.token});
 };
-Client.prototype.mark=function(value){this.store.state.uncertain=value;this.store.save();this.state.uncertain=value;};
+Client.prototype.mark=function(value){
+    this.latchGeneration++;
+    this.store.state.uncertain=value;
+    try { this.store.save(); } catch(e) {
+        // Never advertise a cleared recovery latch before its atomic publication.
+        this.store.state.uncertain=true;this.state.uncertain=true;this.state.busy=true;
+        throw e;
+    }
+    this.state.uncertain=value;
+};
+Client.prototype.persistMark=function(value){
+    var self=this,attempt=0,generation=self.latchGeneration;
+    function save(){
+        if(generation!==self.latchGeneration)return Promise.reject(error("outcome_uncertain","Recovery state changed during metadata publication"));
+        try { self.mark(value); generation=self.latchGeneration; return Promise.resolve(); } catch(e) {
+            generation=self.latchGeneration;
+            // Only repeat local metadata publication, never a host command or reply.
+            if(process.platform!=="win32" || ["EPERM","EACCES","EBUSY"].indexOf(e.code)<0 || attempt===9)return Promise.reject(e);
+            return new Promise(function(resolve){setTimeout(resolve,20*(++attempt));}).then(save);
+        }
+    }
+    return save();
+};
 Client.prototype.discover=function(){
     var d=this.store.descriptor(),prior=this.descriptor;
     if(!prior || prior.instanceId!==d.instanceId || prior.port!==d.port || prior.version!==d.version || prior.protocol!==d.protocol)this.state.compatibility=null;
@@ -705,7 +727,7 @@ Client.prototype.connect=function(){
     });
 };
 Client.prototype.command=function(cmd){
-    var self=this, reply, beatTimer, beat=Promise.resolve(), beatError, finished=false, dispatched=false;
+    var self=this, reply, beatTimer, beat=Promise.resolve(), beatError, finished=false, dispatched=false, persisted=false;
     if(self.state.connection==="incompatible")return Promise.reject(error("incompatible_version","Host automation is stopped until versions match"));
     if(!record(cmd) || Object.keys(cmd).sort().join(",")!=="id,method,params,sessionID" || !text(cmd.id,256) || !text(cmd.sessionID,256) || !record(cmd.params) || ["inspect","preflight","save","execute","open","raw","capture","templates"].indexOf(cmd.method)<0) return Promise.reject(error("invalid_command","Malformed or unsupported command"));
     var b=self.state.binding, writes=["save","execute","open","raw","capture"].indexOf(cmd.method)>=0;
@@ -716,7 +738,7 @@ Client.prototype.command=function(cmd){
     if(!b || !self.state.project || !bound()) return self.send("/reply",{id:cmd.id,error:{code:"binding_suspended",message:"Rebind to the current project"}});
     if(writes && (!self.state.project.saved || !self.state.lock || self.state.lock.state!=="executing")) return self.send("/reply",{id:cmd.id,error:{code:"lock_required",message:"Saved project and executing lock required"}});
     if(self.state.uncertain)return Promise.reject(error("outcome_uncertain","Panel requires reconciliation"));
-    self.mark(true);self.state.busy=true;self.state.capture=cmd.method==="capture" ? cmd.sessionID : null;self.emit();
+    self.state.busy=true;self.state.capture=cmd.method==="capture" ? cmd.sessionID : null;self.emit();
     function keepAlive(){
         beatTimer=setTimeout(function(){
             beat=self.heartbeat().then(function(){if(!bound())throw error("binding_suspended","Binding changed during host call");},function(e){throw e;}).catch(function(e){beatError=e;});
@@ -724,13 +746,14 @@ Client.prototype.command=function(cmd){
         },2000);
     }
     // UI supplies a two-frame paint barrier. A hidden panel must refuse capture, not produce invisible pixels.
-    var painted=cmd.method==="capture" ? self.beforeCapture() : Promise.resolve();
+    var painted=self.persistMark(true).then(function(){persisted=true;return cmd.method==="capture" ? self.beforeCapture() : undefined;});
     return painted.then(function(){return self.heartbeat();}).then(function(){
         if(!bound())throw error("binding_suspended","Binding changed before host dispatch");
         if(writes && (!self.state.lock || self.state.lock.state!=="executing"))throw error("lock_required","Execution lock changed before dispatch");
         keepAlive();dispatched=true;
         return self.host.call(cmd.method,cmd.params,b.project);
     }).then(function(result){return cmd.method==="capture" ? self.normalize(result) : result;}).then(function(result){reply={id:cmd.id,result:result};},function(e){
+        if(!persisted)throw e;
         reply={id:cmd.id,error:{code:e.code || "host_error",message:e.message || "Host failed"}};
     }).then(function(){
         finished=true;clearTimeout(beatTimer);return beat;
@@ -742,7 +765,9 @@ Client.prototype.command=function(cmd){
         // Server must observe idle before it resolves reply and attempts unlock.
         return self.heartbeat();
     }).then(function(){return self.send("/reply",reply);}).then(function(){
-        if(!self.state.uncertain)self.mark(false);
+        if(!self.state.uncertain)return self.persistMark(false);
+    }).then(function(){
+        self.state.busy=self.state.uncertain;
         if(!self.host.pending)self.state.capture=null;
         self.emit();
         if(self.state.uncertain)throw error("outcome_uncertain","Host outcome requires explicit reconciliation");

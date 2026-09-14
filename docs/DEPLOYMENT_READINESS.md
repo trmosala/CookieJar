@@ -34,18 +34,18 @@ Local validation uses Windows 11 Enterprise 10.0.26200, Node 26.8.1 and Bun 1.3.
 
 The first full hardening run reported 369/375 passing: five outdated permanent-pin expectations and one intermittent restore abort. The pin expectations were updated to assert protection and retention behavior. Focused review regressions cover delayed deletion, immutable delivery review, capacity counts, safe abort cleanup and reviewed cleanup. Later validation results are recorded in the final evidence below.
 
-An earlier canonical restore `binding_suspended` failure and subsequent `aborted` restore require an explained cause. Isolated passing reruns are insufficient proof of resolution. Preserve the logs and investigate under representative load before client sign-off. Gate failures now retain the original OS error code and port for diagnosis while continuing to fail closed.
+The restore interruption was traced to Windows `EPERM` while publishing the panel recovery latch. A real file-sharing regression reproduced `aborted`; the panel now retries only local metadata publication and stays locked if it cannot persist the latch. See the follow-up investigation for causal evidence and validation. Gate failures retain the original OS error code and port for diagnosis while continuing to fail closed.
 
-The instrumented run did not reproduce the intermittent failures. A transient polling failure followed by reconnect is a plausible restore-suspension path: the fixture polls every 5 ms with fresh sockets, while the normal panel polls every second. No initial transport error was captured, so this is a hypothesis, not a diagnosed cause.
+The initial instrumented run did not reproduce the failure. A later run captured the local publication error before reconnection, distinguishing it from a network failure. The final correction targets the recovery latch; descriptor-read handling remains unchanged.
 
 Subsequent full runs failed render startup on a gate that was unavailable or occupied. The old gate range exactly overlapped this machine's dynamic outbound range, 49152–65535. A deterministic occupied-port regression reproduced that conflict and passes with new jobs using 16384–32767. This removes the demonstrated conflict with the observed outbound pool; availability still needs checking on client machines with custom ranges, exclusions or other listeners. The old logs did not capture the specific competing socket. A separate excluded-port probe acquired successfully, so port exclusion was not established as the cause.
 
-Native qualification was attempted once with `scripts/verify-native-restore.mjs --run-live`. AE refused the read-only preflight: the open project must be clean, saved and idle. No disposable project was created and no project mutation was issued. Save or close the current work deliberately before rerunning; do not bypass this guard. This runner exercises real AE through the CLI bridge; it still does not qualify installed CEP chat with a live CM/model.
+After initial preflight refusals, the user authorized saving the open project. Native canonical restore with the final latch fix passed on AE 26.3x87 in 42.345 seconds. It verified the 96-layer scene, checkpoint bytes, preservation of the unsaved test edit in recovery storage, lock release and return to the user's original project with its post-save hash unchanged. Evidence is `coverage/native-restore-wgX5Lu/report.json`. This source-tree CLI run does not qualify native fallback restore or installed CEP chat with a live CM/model.
 
 Release requires:
 
-1. Explain the intermittent restore abort/suspension and qualify the revised render gate under client load.
-2. Complete native disposable-project tests and installed CEP/live CM tests against the exact candidate pair. Verify inspection, approval/denial, editing, reconnect, uncertainty, restore, capture and render recovery.
+1. Qualify the revised recovery-latch publication and render gate under client load.
+2. Complete remaining native disposable-project tests and installed CEP/live CM tests against the exact candidate pair. Verify inspection, approval/denial, editing, reconnect, uncertainty, fallback restore, capture and render recovery.
 3. Confirm the client's exact Windows/AE/CM versions and storage topology; test cloud or network storage separately if used.
 4. Sign with the organization's real certificate, verify the installed signature and hashes, and retain the previous matched pair for rollback. Signing tooling/certificate credentials are not configured in this environment.
 5. Complete the named pilot and release approval. The candidate receipt must remain blocked until those records exist.
@@ -54,8 +54,13 @@ Rollback means restoring the previous matched panel/plugin package and consumer 
 
 ## Final evidence
 
-Final full-suite run: **386/386 passed**, zero failures, 383.08 seconds, recorded in `coverage/deployment-release-check.log`. The additional case-folded gate check passed in `coverage/gate-case-final.log`. Earlier failures remain preserved in `deployment-full.log`, `deployment-final.log` and `deployment-acceptance.log`; the instrumented rerun is `deployment-trace.log`. A green run does not establish the cause of the earlier restore interruption.
+Follow-up restore investigation: [RESTORE_INVESTIGATION.md](RESTORE_INVESTIGATION.md).
+The recovery-latch fix passed **393/393 tests**, zero failures, in 392.58 seconds
+in `coverage/restore-final-acceptance.log`. Seven regressions cover real Windows
+file sharing, durable-latch failures, bounded retries and newer recovery warnings.
 
-`npm run check` parsed 45 scripts successfully. `node scripts/build.mjs --client` and `node scripts/verify-build.mjs --rebuild` verified 14 hashed artifacts and a byte-for-byte reproducible client build. The actual compiled client policy rejected wildcard, agent and legacy auto-allow, and retained denial; the persistent compiled-plugin regression also passes. `npm audit --omit=dev --json` reported zero known vulnerabilities in the installed dependency graph.
+Earlier hardening full-suite run: **386/386 passed**, zero failures, 383.08 seconds, recorded in `coverage/deployment-release-check.log`. The additional case-folded gate check passed in `coverage/gate-case-final.log`. Earlier failures remain preserved in `deployment-full.log`, `deployment-final.log` and `deployment-acceptance.log`; the instrumented rerun is `deployment-trace.log`. The later investigation established the recovery-latch cause using a spontaneous causal trace and a failing filesystem regression.
 
-Changes are isolated on `codex/deployment-hardening` in `D:/Workarea/CookieJar-deployment`. The live source checkout, installed panel, consumer configuration and open AE project were not changed. Raw local evidence remains under `coverage/`; the unsigned candidate receipt records the source commit, exact input hashes, artifact hashes, observed consumer binaries and outstanding gates. No client deployment has been performed.
+`npm run check` parsed 48 scripts successfully. `node scripts/build.mjs --client` and `node scripts/verify-build.mjs --rebuild` verified 14 hashed artifacts and a byte-for-byte reproducible client build. The actual compiled client policy rejected wildcard, agent and legacy auto-allow, and retained denial; the persistent compiled-plugin regression also passes. `npm audit --omit=dev --json` reported zero known vulnerabilities in the installed dependency graph.
+
+Changes are isolated on `codex/deployment-hardening` in `D:/Workarea/CookieJar-deployment`. The live source checkout, installed panel and consumer configuration were not changed. With user authorization, the open AE project was saved before native qualification and reopened afterward. Raw local evidence remains under `coverage/`; the unchanged unsigned candidate receipt records the earlier source commit, exact input hashes, artifact hashes, observed consumer binaries and outstanding gates. The later native evidence is recorded separately above. No client deployment has been performed.
