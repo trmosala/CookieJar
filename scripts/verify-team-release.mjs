@@ -39,7 +39,7 @@ export async function verifyTeamRelease(directory) {
   assert.equal(built.size, manifest.artifacts.length, "Duplicate build artifact");
   assert.deepEqual(inventory.filter(path => path.startsWith("cm-ae/")).sort(), [...built.keys()].filter(path => path.startsWith("cm-ae/")).sort(), "Backend inventory differs from build manifest");
   for (const required of ["cm-ae/plugin.mjs", "cm-ae/render-worker.mjs", "cm-ae/permissions.json", "panel/CSXS/manifest.xml"]) assert.ok(built.has(required), `Missing build artifact: ${required}`);
-  for (const path of ["AGENTS.md", "compatibility.json", ...manifest.artifacts.map((item) => item.path).filter((path) => path.startsWith("cm-ae/"))]) {
+  for (const path of ["AGENTS.md", "Install.ps1", "install.command", "install.mjs", "compatibility.json", ...manifest.artifacts.map((item) => item.path).filter((path) => path.startsWith("cm-ae/"))]) {
     const item = built.get(path);
     assert.ok(item, `Build manifest is missing ${path}`);
     const data = await readFile(join(directory, path));

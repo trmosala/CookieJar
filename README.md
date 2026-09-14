@@ -50,6 +50,8 @@ Read tools and checkpoint-backed script execution default to allow; capture, fil
 
 ## Internal setup: ask CookieMonster
 
+Team releases include `AGENTS.md`, a standalone `install.mjs`, and Windows/macOS launchers. Ask the agent to read the extracted folder's `AGENTS.md` and run the installer against the configuration this instance actually loads. Node 22+ is required; npm and a source checkout are not. The installer previews by default, then `--apply` copies the backend into the per-user version directory, backs up and merges configuration, and verifies repeat installations. Install the matching signed ZXP separately. Application activation and AE connection are verified after restart.
+
 Extract the trusted team release, then ask CookieMonster:
 
 > Install the CookieJar AE plugin from this release folder: [absolute folder path]. Follow the internal installation instructions in docs/INTEGRATION.md. Copy the complete cm-ae package to the documented location and register it in the configuration this CookieMonster instance actually loads. Preserve my existing plugins and permissions. Tell me when to restart, then verify bridge startup and report AE connection and pairing status separately.

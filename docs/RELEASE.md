@@ -22,6 +22,8 @@ The detached render supervisor is bundled separately as `dist/cm-ae/render-worke
 
 ## Explicit Signing
 
+Stage `dist/install.mjs`, `dist/Install.ps1`, and `dist/install.command` beside `dist/AGENTS.md` in each team release before calculating checksums. The release verifier requires these files and compares them to the build manifest. The installer is bundled for Node 22+ with its configuration helpers and dependencies; extracted packages need no npm install. Use `sh install.command` on macOS so executable-bit preservation by ZIP tools is not required. Installer tests use temporary profiles and configuration files; native macOS installation and live application activation remain separate checks.
+
 An authorized release engineer must provision the approved executable and certificate outside the checkout, with secrets injected by the secure signing environment:
 
 - `ZXPSIGNCMD`: absolute approved ZXPSignCmd executable path.

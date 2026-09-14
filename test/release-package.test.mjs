@@ -25,6 +25,9 @@ test("team release requires checksummed agent instructions outside the signed ZX
   const instructions = await readFile(new URL("../release/AGENTS.md", import.meta.url));
   const content = new Map([
     ["AGENTS.md", instructions],
+    ["Install.ps1", Buffer.from("# fixture")],
+    ["install.command", Buffer.from("# fixture")],
+    ["install.mjs", Buffer.from("export {};")],
     ["README.md", Buffer.from("Team test\n")],
     ["compatibility.json", Buffer.from("{}\n")],
     ["cm-ae/plugin.mjs", Buffer.from("export default {};\n")],
@@ -33,7 +36,7 @@ test("team release requires checksummed agent instructions outside the signed ZX
     ["CookieJar-AE-0.2.3-team-test.zxp", await readFile(zxpPath)],
     ["signature-verification.txt", Buffer.from("verified fixture\n")],
   ]);
-  const artifacts = ["AGENTS.md", "cm-ae/permissions.json", "cm-ae/plugin.mjs", "cm-ae/render-worker.mjs", "compatibility.json"]
+  const artifacts = ["AGENTS.md", "Install.ps1", "install.command", "install.mjs", "cm-ae/permissions.json", "cm-ae/plugin.mjs", "cm-ae/render-worker.mjs", "compatibility.json"]
     .map((path) => ({ path, bytes: content.get(path).length, sha256: hash(content.get(path)) }));
   artifacts.push({ path: "panel/CSXS/manifest.xml", bytes: panelXml.length, sha256: hash(panelXml) });
   const manifest = Buffer.from(JSON.stringify({ schemaVersion: 1, version: "0.2.3", signed: false, profile: "client", artifacts }) + "\n");

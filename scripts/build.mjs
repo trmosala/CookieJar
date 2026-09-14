@@ -84,6 +84,9 @@ export async function build(directory = root, profile = "development") {
       await copyFile(join(directory, "panel", path), dest);
     }
     await copyFile(releaseInstructions, join(stage, "AGENTS.md"));
+    for (const name of ["Install.ps1", "install.command"]) await copyFile(join(directory, "release", name), join(stage, name));
+    execFileSync("bun", ["build", "./src/install.mjs", "--target=node", "--format=esm", "--packages=bundle", "--env=disable", "--reject-unresolved", "--define", "COOKIEJAR_CLIENT_BUILD=true", "--outfile", join(stage, "install.mjs")], { cwd: directory, stdio: "pipe" });
+    execFileSync(process.execPath, ["--check", join(stage, "install.mjs")], { stdio: "pipe" });
     await copyFile(join(directory, "compatibility.json"), join(stage, "compatibility.json"));
     await copyFile(join(dirname(zodPackage), "LICENSE"), join(stage, "cm-ae", "ZOD-LICENSE.txt"));
     if (pkg.dependencies?.marked) {
@@ -103,7 +106,7 @@ export async function build(directory = root, profile = "development") {
       artifacts,
     }, null, 2) + "\n");
     // ponytail: single-writer build; CI uses isolated workspaces, not concurrent builds.
-    for (const name of ["AGENTS.md", "cm-ae", "panel", "compatibility.json", "manifest.json"]) {
+    for (const name of ["AGENTS.md", "Install.ps1", "install.command", "install.mjs", "cm-ae", "panel", "compatibility.json", "manifest.json"]) {
       await rm(join(dist, name), { force: true, recursive: true });
       for (let attempt = 0; ; attempt++) {
         try {

@@ -206,6 +206,8 @@ test("build bundles dependencies but preserves the real worker URL and reproduci
   await copyFile(join(root, "package.json"), join(fixture, "package.json"));
   await copyFile(join(root, "compatibility.json"), join(fixture, "compatibility.json"));
   await copyFile(join(root, "release", "AGENTS.md"), join(fixture, "release", "AGENTS.md"));
+  for (const name of ["Install.ps1", "install.command"]) await copyFile(join(root, "release", name), join(fixture, "release", name));
+  await writeFile(join(fixture, "src", "install.mjs"), "export {};\n");
   for (const name of ["render-worker.mjs", "protocol.mjs"]) {
     await copyFile(join(root, "src", name), join(fixture, "src", name));
   }

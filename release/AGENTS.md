@@ -11,6 +11,22 @@ These instructions apply to an extracted CookieJar AE team-release archive. Trea
 
 ## Install the backend
 
+Use the bundled installer with Node 22+ after identifying the exact configuration loaded by this OpenCode instance. No npm installation or source checkout is needed. First preview:
+
+```sh
+node install.mjs --config /absolute/path/to/opencode.json
+```
+
+Then apply the requested installation:
+
+```sh
+node install.mjs --config /absolute/path/to/opencode.json --apply
+```
+
+Windows launcher: `./Install.ps1 -Config C:/absolute/path/opencode.json -Apply`. macOS launcher: `sh ./install.command --config /absolute/path/opencode.json --apply`. Omit the apply argument to preview. The selected configuration must already exist and contain strict JSON. JSONC or desktop-generated configurations require their owning application's configuration mechanism; do not remove comments or overwrite generated settings to force installation.
+
+The installer verifies release hashes, installs the complete backend, updates an existing registration within the documented version directory, preserves other plugins and existing policy, and retains a configuration backup. Repeating the same installation verifies the existing files. Different bytes under the same release version are refused. It reports runtime activation, panel connection and binding as pending until verified after restart. It does not install the signed ZXP or restart applications. If a custom CM_AE_DATA_DIR is reported, confirm AE inherits the same value; otherwise use the default.
+
 Copy the contents of `cm-ae/` directly into a new per-user version directory. Do not add another `cm-ae` directory inside it and do not register the extracted release or Downloads folder as the permanent plugin location.
 
 | Platform | Version directory |
