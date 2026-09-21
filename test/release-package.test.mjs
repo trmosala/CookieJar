@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verifyTeamRelease } from "../scripts/verify-team-release.mjs";
@@ -26,8 +26,9 @@ test("team release requires checksummed agent instructions outside the signed ZX
   const content = new Map([
     ["AGENTS.md", instructions],
     ["Install.ps1", Buffer.from("# fixture")],
-    ["install.command", Buffer.from("# fixture")],
-    ["install.mjs", Buffer.from("export {};")],
+    ["install.command", await readFile(new URL("../release/install.command", import.meta.url))],
+    // Exercise the real launcher without running an installer or accessing user configuration.
+    ["install.mjs", Buffer.from("console.log(JSON.stringify(process.argv.slice(2)));")],
     ["README.md", Buffer.from("Team test\n")],
     ["compatibility.json", Buffer.from("{}\n")],
     ["cm-ae/plugin.mjs", Buffer.from("export default {};\n")],
@@ -44,13 +45,36 @@ test("team release requires checksummed agent instructions outside the signed ZX
   const receipt = Buffer.from(JSON.stringify({ zxpSha256: hash(content.get("CookieJar-AE-0.2.3-team-test.zxp")), productionApproved: false }) + "\n");
   content.set("signing-receipt.json", receipt);
   for (const [path, data] of content) await writeFile(join(directory, path), data);
+  // Reproduce a checkout/staging filesystem that has no executable launcher bit.
+  await chmod(join(directory, "install.command"), 0o644);
   const sums = [...content].map(([path, data]) => `${hash(data)}  ${path}`).join("\n") + "\n";
   await writeFile(join(directory, "SHA256SUMS.txt"), sums);
 
   assert.deepEqual(await verifyTeamRelease(directory), { version: "0.2.3", files: content.size, zxp: "CookieJar-AE-0.2.3-team-test.zxp" });
   const output = join(panelDir, "release.zip");
   await packageTeamRelease(directory, output);
-  assert.deepEqual(archiveFiles(output).get("AGENTS.md"), instructions);
+  const archived = archiveFiles(output);
+  for (const [path, bytes] of content) assert.deepEqual(archived.get(path), bytes, path);
+  assert.equal(archived.get("SHA256SUMS.txt").toString(), sums);
+  await t.test("ZIP records executable Unix launcher mode and non-executable data modes on every host", () => {
+    const listing = execFileSync("tar", ["-tvf", output], { encoding: "utf8" }).split(/\r?\n/);
+    for (const path of archived.keys()) {
+      const entry = listing.find(line => line.endsWith(` ${path}`) || line.endsWith(` ./${path}`));
+      assert.ok(entry, `Missing ZIP listing for ${path}`);
+      assert.equal(entry.slice(0, 10), path === "install.command" ? "-rwxr-xr-x" : "-rw-r--r--", path);
+    }
+  });
+  await t.test("macOS extracted launcher executes directly and forwards arguments", { skip: process.platform !== "darwin" }, async () => {
+    const extracted = join(panelDir, "extracted release");
+    await mkdir(extracted);
+    execFileSync("tar", ["-xpf", output, "-C", extracted]);
+    const launcher = join(extracted, "install.command");
+    assert.equal((await stat(launcher)).mode & 0o777, 0o755);
+    assert.equal((await stat(join(extracted, "install.mjs"))).mode & 0o777, 0o644);
+    const args = ["--config", join(extracted, "not a real config.json")];
+    assert.deepEqual(JSON.parse(execFileSync(launcher, args, { cwd: panelDir, encoding: "utf8" })), args);
+    await verifyTeamRelease(extracted);
+  });
   await assert.rejects(packageTeamRelease(directory, output), { code: "EEXIST" });
   await writeFile(join(directory, "cm-ae", "extra.mjs"), "extra");
   await writeFile(join(directory, "SHA256SUMS.txt"), sums + `${hash("extra")}  cm-ae/extra.mjs\n`);

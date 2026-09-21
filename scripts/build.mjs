@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -85,6 +85,7 @@ export async function build(directory = root, profile = "development") {
     }
     await copyFile(releaseInstructions, join(stage, "AGENTS.md"));
     for (const name of ["Install.ps1", "install.command"]) await copyFile(join(directory, "release", name), join(stage, name));
+    await chmod(join(stage, "install.command"), 0o755);
     execFileSync("bun", ["build", "./src/install.mjs", "--target=node", "--format=esm", "--packages=bundle", "--env=disable", "--reject-unresolved", "--define", "COOKIEJAR_CLIENT_BUILD=true", "--outfile", join(stage, "install.mjs")], { cwd: directory, stdio: "pipe" });
     execFileSync(process.execPath, ["--check", join(stage, "install.mjs")], { stdio: "pipe" });
     await copyFile(join(directory, "compatibility.json"), join(stage, "compatibility.json"));

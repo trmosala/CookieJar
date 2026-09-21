@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { copyFile, cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, cp, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import fsp from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { createRequire, syncBuiltinESMExports } from "node:module";
@@ -190,6 +190,10 @@ test("packaging verifies inventory and hashes, rejects unsafe inputs, and signin
   await assert.rejects(readFile(output), { code: "ENOENT" });
 });
 
+test("repository macOS launcher is executable", { skip: process.platform === "win32" }, async () => {
+  assert.equal((await stat(new URL("../release/install.command", import.meta.url))).mode & 0o777, 0o755);
+});
+
 test("build bundles dependencies but preserves the real worker URL and reproducible inventory", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "cm-ae-build-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -207,6 +211,7 @@ test("build bundles dependencies but preserves the real worker URL and reproduci
   await copyFile(join(root, "compatibility.json"), join(fixture, "compatibility.json"));
   await copyFile(join(root, "release", "AGENTS.md"), join(fixture, "release", "AGENTS.md"));
   for (const name of ["Install.ps1", "install.command"]) await copyFile(join(root, "release", name), join(fixture, "release", name));
+  await chmod(join(fixture, "release", "install.command"), 0o644);
   await writeFile(join(fixture, "src", "install.mjs"), "export {};\n");
   for (const name of ["render-worker.mjs", "protocol.mjs"]) {
     await copyFile(join(root, "src", name), join(fixture, "src", name));
@@ -236,6 +241,14 @@ test("build bundles dependencies but preserves the real worker URL and reproduci
   }
   await build(fixture);
   if (process.platform === "win32") assert.ok(publicationFailures >= 2);
+  await t.test("build makes the macOS launcher executable without changing its bytes or data-file modes", { skip: process.platform === "win32" }, async () => {
+    const launcher = join(fixture, "dist", "install.command");
+    assert.equal((await stat(launcher)).mode & 0o777, 0o755);
+    assert.deepEqual(await readFile(launcher), await readFile(join(root, "release", "install.command")));
+    assert.equal((await stat(join(fixture, "dist", "AGENTS.md"))).mode & 0o111, 0);
+    assert.equal((await stat(join(fixture, "dist", "Install.ps1"))).mode & 0o111, 0);
+    await exec(launcher, [], { cwd: dir, timeout: 15000 });
+  });
   const before = await verifyBuild(fixture);
   assert.ok(before.artifacts.some((item) => item.path === "AGENTS.md"));
   assert.equal(await readFile(join(fixture, "dist", "AGENTS.md"), "utf8"), await readFile(join(root, "release", "AGENTS.md"), "utf8"));

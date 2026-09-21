@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -26,6 +26,8 @@ async function regularTree(directory, prefix = "") {
   for (const name of (await readdir(directory)).sort()) {
     const file = path.join(directory, name), info = await lstat(file);
     assert.ok(!info.isSymbolicLink(), `Symlink in installation input: ${name}`);
+    // Finder may add this metadata after extraction or when viewing an installed version.
+    if (name === ".DS_Store") { assert.ok(info.isFile(), "Expected regular file"); continue; }
     if (info.isDirectory()) entries.push(...await regularTree(file, prefix + name + "/"));
     else { assert.ok(info.isFile(), "Expected regular file"); entries.push(prefix + name); }
   }
@@ -82,7 +84,7 @@ export async function install({ release, config, apply = false, platform = proce
   // Validate using the verified source package before creating the destination.
   const merged = await mergeBundledPlugins(parsed, [{ id: "cm-ae", path: path.join(release, "cm-ae", "plugin.mjs"), permissions }]);
   assert.ok(!merged.diagnostics.some(item => item.severity === "error"), "Plugin syntax or policy validation failed");
-  const sourceUrl = pathToFileURL(path.join(release, "cm-ae", "plugin.mjs")).href;
+  const sourceUrl = pathToFileURL(await realpath(path.join(release, "cm-ae", "plugin.mjs"))).href;
   const targetUrl = pathToFileURL(path.join(target, "plugin.mjs")).href;
   const ownedRoot = path.dirname(target);
   const isOwned = value => {
@@ -97,14 +99,13 @@ export async function install({ release, config, apply = false, platform = proce
   let installed = false;
   for (const entry of merged.config.plugin) {
     const value = Array.isArray(entry) ? entry[0] : entry;
-    if (value === sourceUrl && hasInstalled) continue;
-    let owned = value === sourceUrl;
+    let source = value === sourceUrl;
     try {
       const candidate = value.startsWith("file:") ? fileURLToPath(value) : value;
-      const relative = path.relative(ownedRoot, candidate).split(path.sep);
-      owned ||= path.isAbsolute(candidate) && relative.length === 2 && relative[0] !== ".." && relative[1] === "plugin.mjs";
-    } catch { /* Preserve unrelated plugin specifiers. */ }
-    if (!owned) plugin.push(entry);
+      if (path.isAbsolute(candidate)) source ||= pathToFileURL(await realpath(candidate)).href === sourceUrl;
+    } catch { /* Preserve unrelated or unavailable plugin specifiers. */ }
+    if (source && hasInstalled) continue;
+    if (!source && !isOwned(value)) plugin.push(entry);
     else {
       assert.ok(!installed, "Multiple CookieJar registrations found; resolve them before installation");
       plugin.push(Array.isArray(entry) ? [targetUrl, entry[1]] : targetUrl);
@@ -156,7 +157,7 @@ export async function install({ release, config, apply = false, platform = proce
   }
 }
 
-if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+if (process.argv[1] && pathToFileURL(await realpath(process.argv[1]).catch(() => path.resolve(process.argv[1]))).href === import.meta.url) {
   try {
     const args = process.argv.slice(2);
     assert.ok(args[0] === "--config" && args[1] && (args.length === 2 || args.length === 3 && args[2] === "--apply"), "Usage: node install.mjs --config ABSOLUTE_CONFIG.json [--apply]");

@@ -23,7 +23,16 @@ export async function packageTeamRelease(directory, output) {
     }
     await verifyTeamRelease(snapshot);
     const archive = join(staging, "release.zip");
-    execFileSync("tar", ["--format=zip", "-cf", archive, "-C", snapshot, ...inventory]);
+    // mtree supplies Unix modes even on Windows, where chmod cannot set executable bits.
+    const mtree = "#mtree\n" + inventory.map(path => {
+      const name = Array.from(Buffer.from(path), byte =>
+        /[A-Za-z0-9_./-]/.test(String.fromCharCode(byte)) ? String.fromCharCode(byte) : `\\${byte.toString(8).padStart(3, "0")}`
+      ).join("");
+      return `./${name} type=file mode=${path === "install.command" ? "0755" : "0644"} contents=./${name}`;
+    }).join("\n") + "\n";
+    execFileSync("tar", ["--format=zip", "-cf", archive, "@-"], { cwd: snapshot, input: mtree });
+    assert.match(execFileSync("tar", ["-tvf", archive, "install.command"], { encoding: "utf8" }),
+      /^-rwxr-xr-x\s/, "ZIP install.command must have Unix mode 0755");
     const actual = archiveFiles(archive);
     assert.deepEqual([...actual.keys()].sort(), inventory, "ZIP inventory differs from verified release");
     for (const [path, bytes] of expected) assert.deepEqual(actual.get(path), bytes, `ZIP content changed: ${path}`);
