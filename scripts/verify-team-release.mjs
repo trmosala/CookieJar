@@ -56,7 +56,8 @@ export async function verifyTeamRelease(directory) {
   assert.equal(receipt.zxpSha256?.toLowerCase(), digest(await readFile(join(directory, zxp[0]))), "Signed ZXP does not match signing receipt");
   const panel = archiveFiles(join(directory, zxp[0]));
   const panelPaths = [...built.keys()].filter(path => path.startsWith("panel/"));
-  assert.deepEqual([...panel.keys()].filter(path => path !== "META-INF/signatures.xml").sort(), panelPaths.map(path => path.slice(6)).sort(), "ZXP panel inventory differs from build manifest");
+  if (panel.has("mimetype")) assert.equal(panel.get("mimetype").toString("utf8"), "application/vnd.adobe.air-ucf-package+zip", "Unexpected ZXP mimetype");
+  assert.deepEqual([...panel.keys()].filter(path => path !== "META-INF/signatures.xml" && path !== "mimetype").sort(), panelPaths.map(path => path.slice(6)).sort(), "ZXP panel inventory differs from build manifest");
   for (const path of panelPaths) assert.equal(digest(panel.get(path.slice(6))), built.get(path).sha256, `ZXP build hash mismatch: ${path}`);
   const xml = panel.get("CSXS/manifest.xml").toString("utf8");
   const version = /\bExtensionBundleVersion\s*=\s*["']([^"']+)["']/.exec(xml)?.[1];

@@ -20,8 +20,9 @@ test("team release requires checksummed agent instructions outside the signed ZX
   await mkdir(join(panelDir, "CSXS"));
   const panelXml = Buffer.from('<ExtensionManifest ExtensionBundleVersion="0.2.3"/>');
   await writeFile(join(panelDir, "CSXS", "manifest.xml"), panelXml);
+  await writeFile(join(panelDir, "mimetype"), "application/vnd.adobe.air-ucf-package+zip");
   const zxpPath = join(directory, "CookieJar-AE-0.2.3-team-test.zxp");
-  execFileSync("tar", ["--format=zip", "-cf", zxpPath, "-C", panelDir, "CSXS/manifest.xml"]);
+  execFileSync("tar", ["--format=zip", "-cf", zxpPath, "-C", panelDir, "CSXS/manifest.xml", "mimetype"]);
   const instructions = await readFile(new URL("../release/AGENTS.md", import.meta.url));
   const content = new Map([
     ["AGENTS.md", instructions],
