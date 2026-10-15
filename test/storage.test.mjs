@@ -520,6 +520,29 @@ test("corrupt manifest content and forged deletion paths fail closed on restart"
   assert.deepEqual(await fs.readFile(manifest.path), await fs.readFile(f.projectPath))
 })
 
+test("unavailable checkpoints from another project do not block the current project's lifecycle", async t => {
+  const f = await fixture(t)
+  const old = await f.store.create(f.args)
+  const index = path.join(f.dataDir, "checkpoints", old.id + ".json")
+  const original = await fs.readFile(index)
+  await fs.rename(path.dirname(old.path), path.join(f.projects, "Offline checkpoints"))
+  const projectPath = path.join(f.projects, "Current.aep")
+  await fs.writeFile(projectPath, "current project bytes")
+  const args = { projectPath, projectId: "current", planHash: "current-plan" }
+  const store = createCheckpoints({ dataDir: f.dataDir })
+  await store.preflight(args)
+  const current = await store.create(args)
+  assert.deepEqual((await store.list(args.projectId)).map(entry => entry.id), [current.id])
+  assert.equal((await store.pin(current.id, true)).pinned, true)
+  assert.equal((await store.protect(current.id, "render-job")).inUse, true)
+  assert.equal((await store.protect(current.id, "render-job", false)).inUse, false)
+  assert.equal((await store.verify(current.id)).hash, current.hash)
+  await assert.rejects(store.preflight(f.args), typed("checkpoint_corrupt"))
+  await assert.rejects(store.verify(old.id), typed("checkpoint_corrupt"))
+  assert.deepEqual(await fs.readFile(index), original)
+  assert.deepEqual(await fs.readFile(path.join(f.projects, "Offline checkpoints", path.basename(old.path))), await fs.readFile(f.projectPath))
+})
+
 test("checkpoint byte corruption blocks verify and restore without touching canonical source", async t => {
   const f = await fixture(t)
   const manifest = await f.store.create(f.args)

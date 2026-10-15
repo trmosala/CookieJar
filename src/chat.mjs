@@ -414,7 +414,7 @@ export async function createChat(runtime) {
       return { ...workspace, sessionID: r.sessionID, title: info.title, targetCompId: r.targetCompId ?? null, directory: r.directory, workspaceConfirmed: !!r.workspaceConfirmed || !!matchingWorkspace(r.directory), workspaces, owned, model: info.model || null,
         ...messages, restore: r.restore || null, permissions: [...(permissions.get(r.sessionID)?.values() || [])].slice(0, 1),
         status: statuses?.[r.sessionID]?.type || "idle", error: errors.get(r.sessionID) || null,
-        delivery: r.requests.at(-1)?.status || null }
+        delivery: r.requests.at(-1)?.status || null, deliveryID: r.requests.at(-1)?.id || null }
     }
     if (body.action === "stop") { if (r) await pause(r.sessionID); return { stopped: true } }
     if (body.action === "permission") {
@@ -533,8 +533,14 @@ export async function createChat(runtime) {
     r.connectionId = connectionId
     r.targetCompId = body.compId
     r.requests = [...r.requests.slice(-99), request]
-    await save()
-    check()
+    try {
+      await save()
+      check()
+    } catch (e) {
+      request.status = "not_submitted"
+      await save()
+      throw e
+    }
     errors.delete(r.sessionID)
     try {
       await result(client.session.promptAsync({ ...options(r), body: {
